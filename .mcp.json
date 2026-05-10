@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "android-use": {
+      "command": "python3",
+      "args": [
+        "./scripts/android_use_mcp.py"
+      ],
+      "cwd": "."
+    }
+  }
+}

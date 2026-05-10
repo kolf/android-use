@@ -1,0 +1,47 @@
+{
+  "name": "android-use",
+  "version": "0.1.0",
+  "description": "Control attached Android devices from Codex through adb, scrcpy, screenshots, and optional vision-model planning.",
+  "author": {
+    "name": "kolf",
+    "email": "kolf@live.cn",
+    "url": "https://github.com/kolf/android-use"
+  },
+  "homepage": "https://github.com/kolf/android-use",
+  "repository": "https://github.com/kolf/android-use",
+  "license": "Apache-2.0",
+  "keywords": [
+    "android",
+    "adb",
+    "scrcpy",
+    "computer-use",
+    "gui-agent",
+    "vision-language-model"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Android",
+    "shortDescription": "Control Android devices from Codex",
+    "longDescription": "Android Use lets Codex inspect and control an attached Android device through adb, scrcpy, screenshots, input events, and an optional OpenAI-compatible vision-model planner inspired by Agent TARS and UI-TARS Desktop.",
+    "developerName": "kolf",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Android device control",
+      "ADB shell",
+      "scrcpy mirroring",
+      "Screenshot observation",
+      "Vision-model action planning"
+    ],
+    "websiteURL": "https://github.com/kolf/android-use",
+    "privacyPolicyURL": "https://github.com/kolf/android-use",
+    "termsOfServiceURL": "https://github.com/kolf/android-use",
+    "defaultPrompt": [
+      "Show the connected Android device state",
+      "Take a screenshot and suggest the next action",
+      "Open scrcpy for my attached phone"
+    ],
+    "brandColor": "#16A34A",
+    "screenshots": []
+  }
+}
