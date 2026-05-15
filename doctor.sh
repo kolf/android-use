@@ -44,6 +44,7 @@ import json
 from pathlib import Path
 plugin = json.loads(Path(".codex-plugin/plugin.json").read_text())
 assert plugin["name"] == "android-use-plugins", plugin["name"]
+assert plugin["interface"]["displayName"] == "Android Use Plugins", plugin["interface"]["displayName"]
 mcp = json.loads(Path(".mcp.json").read_text())
 assert "android-use" in mcp["mcpServers"], mcp
 print("ok   plugin manifest and mcp config")
@@ -60,6 +61,8 @@ from pathlib import Path
 path = Path(os.environ["MARKETPLACE_PATH"]).expanduser()
 name = os.environ["PLUGIN_NAME"]
 payload = json.loads(path.read_text())
+assert payload.get("name") == name, payload.get("name")
+assert payload.get("interface", {}).get("displayName") == "Android Use Plugins", payload.get("interface")
 plugins = payload.get("plugins", [])
 assert any(isinstance(item, dict) and item.get("name") == name for item in plugins), f"{name} not found in {path}"
 print(f"ok   marketplace entry: {path}")

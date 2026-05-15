@@ -73,13 +73,16 @@ if path.exists():
         raise SystemExit(f"Invalid JSON in {path}")
 else:
     payload = {
-        "name": "xiaoluxue-codex-plugins",
-        "interface": {"displayName": "Xiaoluxue Codex Plugins"},
+        "name": "android-use-plugins",
+        "interface": {"displayName": "Android Use Plugins"},
         "plugins": [],
     }
 
-payload.setdefault("name", "xiaoluxue-codex-plugins")
-payload.setdefault("interface", {}).setdefault("displayName", "Xiaoluxue Codex Plugins")
+if payload.get("name") in (None, "", "xiaoluxue-codex-plugins", "[TODO: marketplace-name]"):
+    payload["name"] = "android-use-plugins"
+interface = payload.setdefault("interface", {})
+if interface.get("displayName") in (None, "", "Xiaoluxue Codex Plugins", "[TODO: Marketplace Display Name]"):
+    interface["displayName"] = "Android Use Plugins"
 plugins = payload.setdefault("plugins", [])
 if not isinstance(plugins, list):
     raise SystemExit(f"{path}: plugins must be a list")
@@ -108,7 +111,7 @@ main() {
   marketplace="$(write_marketplace)"
   info "Marketplace updated: $marketplace"
   info "Plugin path: $INSTALL_DIR"
-  info "Restart Codex, then enable Android Use from the Xiaoluxue plugin marketplace."
+  info "Restart Codex, then enable Android Use Plugins from the local plugin marketplace."
   info "Run ./doctor.sh after restart if the plugin does not appear or cannot control a device."
 }
 

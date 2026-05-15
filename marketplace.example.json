@@ -1,7 +1,7 @@
 {
-  "name": "xiaoluxue-codex-plugins",
+  "name": "android-use-plugins",
   "interface": {
-    "displayName": "Xiaoluxue Codex Plugins"
+    "displayName": "Android Use Plugins"
   },
   "plugins": [
     {

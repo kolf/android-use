@@ -21,7 +21,7 @@
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {
-    "displayName": "Android Use",
+    "displayName": "Android Use Plugins",
     "shortDescription": "Control Android devices from Codex",
     "longDescription": "Android Use lets Codex inspect and control an attached Android device through adb, scrcpy, screenshots, input events, and an optional OpenAI-compatible vision-model planner inspired by Agent TARS and UI-TARS Desktop.",
     "developerName": "Xiaoluxue",

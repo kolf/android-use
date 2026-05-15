@@ -16,7 +16,7 @@ cd ~/.agents/plugins/android-use-plugins
 ~/.agents/plugins/marketplace.json
 ```
 
-完成后重启 Codex，在插件列表里启用 `Android Use`。
+完成后重启 Codex，在插件列表里启用 `Android Use Plugins`。
 
 ## 依赖
 
