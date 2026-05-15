@@ -9,20 +9,26 @@ from __future__ import annotations
 
 import base64
 import ast
+import contextlib
+import fcntl
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
+import uuid
 import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 
 SERVER_NAME = "android-use"
@@ -31,6 +37,10 @@ DEFAULT_TIMEOUT = 30
 TMP_DIR = Path(os.environ.get("ANDROID_USE_TMP_DIR", "/tmp/android-use"))
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 LOCAL_PLATFORM_TOOLS = PLUGIN_ROOT / "tools" / "android-platform-tools" / "platform-tools"
+ANDROID_USE_DIR = PLUGIN_ROOT / ".android-use"
+RECORDINGS_DIR = ANDROID_USE_DIR / "recordings"
+RECIPES_DIR = ANDROID_USE_DIR / "recipes"
+SOURCE_MAP_DIR = ANDROID_USE_DIR / "app-maps"
 SCREEN_DIR = PLUGIN_ROOT / ".screen"
 OPENAI_BASE_URL = "https://api.openai.com/v1"
 
@@ -38,12 +48,62 @@ SCRCPY_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
 SCRCPY_LOCK_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
 SCREEN_VIEWER_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
 WEBRTC_VIEWER_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
+ACTIVE_RECORDINGS: dict[str, dict[str, Any]] = {}
+SCRCPY_RESIDENT_THREAD: threading.Thread | None = None
+SCRCPY_RESIDENT_LOCK = threading.Lock()
+SCRCPY_RESIDENT_LOCK_HANDLE: Any | None = None
+SCRCPY_RESIDENT_STATUS: dict[str, Any] = {
+    "enabled": False,
+    "running": False,
+    "serials": [],
+    "last_check_at": None,
+    "last_error": None,
+}
 
 REMOTE_UI_DUMP_PATH = "/sdcard/android-use-window.xml"
+USER_ENV_FILE = Path(os.environ.get("ANDROID_USE_ENV_FILE", "~/.config/android-use/env")).expanduser()
 
 
 class AndroidUseError(Exception):
     """User-facing plugin error."""
+
+
+def parse_env_assignment(line: str) -> tuple[str, str] | None:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+    if stripped.startswith("export "):
+        stripped = stripped[len("export ") :].strip()
+    if "=" not in stripped:
+        return None
+    key, value = stripped.split("=", 1)
+    key = key.strip()
+    value = value.strip()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+        return None
+    if key != "OPENAI_API_KEY" and not key.startswith("ANDROID_USE_"):
+        return None
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1]
+    return key, value
+
+
+def load_user_env_file(path: Path = USER_ENV_FILE) -> None:
+    try:
+        lines = path.read_text().splitlines()
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+    for line in lines:
+        assignment = parse_env_assignment(line)
+        if not assignment:
+            continue
+        key, value = assignment
+        os.environ.setdefault(key, value)
+
+
+load_user_env_file()
 
 
 def adb_binary() -> str:
@@ -58,6 +118,23 @@ def adb_binary() -> str:
 
 def scrcpy_binary() -> str:
     return os.environ.get("ANDROID_USE_SCRCPY", "scrcpy")
+
+
+def env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().casefold() not in {"0", "false", "no", "off", "disabled"}
+
+
+def env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
 
 
 def tool_env() -> dict[str, str]:
@@ -159,6 +236,301 @@ def choose_serial(serial: str | None = None) -> str:
 
 def shell(serial: str, command: str, timeout: int | float = DEFAULT_TIMEOUT) -> str:
     return decode_bytes(adb(["shell", command], serial=serial, timeout=timeout))
+
+
+WEBVIEW_SOCKET_PATTERN = re.compile(r"@?([A-Za-z0-9_.-]*webview_devtools_remote[^\s]*)")
+WEBVIEW_FORWARD_CACHE: dict[tuple[str, str], int] = {}
+XIAOLUXUE_PAGE_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
+
+
+def parse_webview_devtools_sockets(proc_net_unix: str) -> list[str]:
+    sockets: list[str] = []
+    seen: set[str] = set()
+    for line in proc_net_unix.splitlines():
+        match = WEBVIEW_SOCKET_PATTERN.search(line)
+        if not match:
+            continue
+        socket_name = match.group(1).lstrip("@")
+        if socket_name and socket_name not in seen:
+            sockets.append(socket_name)
+            seen.add(socket_name)
+    return sockets
+
+
+def webview_devtools_sockets(serial: str) -> list[str]:
+    raw = shell(serial, "cat /proc/net/unix", timeout=8)
+    return parse_webview_devtools_sockets(raw)
+
+
+def webview_forward_alive(port: int) -> bool:
+    try:
+        read_json_url(local_json_url(port), timeout=0.2)
+        return True
+    except Exception:
+        return False
+
+
+def adb_forward_webview(serial: str, socket_name: str, port: int | None = None) -> int:
+    normalized = socket_name.lstrip("@")
+    cache_key = (serial, normalized)
+    if port is None:
+        cached_port = WEBVIEW_FORWARD_CACHE.get(cache_key)
+        if cached_port and webview_forward_alive(cached_port):
+            return cached_port
+    local_port = int(port or pick_free_port("127.0.0.1"))
+    adb(["forward", f"tcp:{local_port}", f"localabstract:{normalized}"], serial=serial, timeout=10)
+    if port is None:
+        WEBVIEW_FORWARD_CACHE[cache_key] = local_port
+    return local_port
+
+
+def local_json_url(port: int, path: str = "/json") -> str:
+    return f"http://127.0.0.1:{port}{path}"
+
+
+def read_json_url(url: str, timeout: int | float = 5) -> Any:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise AndroidUseError(f"HTTP {exc.code} from {url}\n{body}") from exc
+    except urllib.error.URLError as exc:
+        raise AndroidUseError(f"Could not read {url}: {exc}") from exc
+
+
+def parse_devtools_description(description: Any) -> dict[str, Any]:
+    if not isinstance(description, str) or not description.strip():
+        return {}
+    try:
+        value = json.loads(description)
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def discover_webview_pages(serial: str, *, port: int | None = None) -> list[dict[str, Any]]:
+    pages: list[dict[str, Any]] = []
+    sockets = webview_devtools_sockets(serial)
+    for index, socket_name in enumerate(sockets):
+        try:
+            local_port = adb_forward_webview(serial, socket_name, port if len(sockets) == 1 else None)
+            targets = read_json_url(local_json_url(local_port), timeout=5)
+            if not isinstance(targets, list):
+                raise AndroidUseError(f"Unexpected /json payload for {socket_name}: {targets!r}")
+            for target in targets:
+                if not isinstance(target, dict):
+                    continue
+                description = parse_devtools_description(target.get("description"))
+                pages.append(
+                    {
+                        **target,
+                        "serial": serial,
+                        "socket": socket_name,
+                        "forward": {
+                            "host": "127.0.0.1",
+                            "port": local_port,
+                            "jsonUrl": local_json_url(local_port),
+                        },
+                        "descriptionParsed": description,
+                    }
+                )
+        except Exception as exc:
+            pages.append({"serial": serial, "socket": socket_name, "socketIndex": index, "error": str(exc)})
+    return pages
+
+
+def webview_page_score(page: dict[str, Any]) -> tuple[int, int, int, int]:
+    description = page.get("descriptionParsed") if isinstance(page.get("descriptionParsed"), dict) else {}
+    return (
+        1 if page.get("type") == "page" else 0,
+        1 if description.get("visible") is True else 0,
+        1 if description.get("attached") is True else 0,
+        0 if description.get("empty") is True else 1,
+    )
+
+
+def select_webview_page(
+    pages: list[dict[str, Any]],
+    *,
+    page_id: str | None = None,
+    url_contains: str | None = None,
+    title_contains: str | None = None,
+) -> dict[str, Any]:
+    candidates = [page for page in pages if not page.get("error")]
+    if page_id:
+        candidates = [page for page in candidates if str(page.get("id", "")) == page_id]
+    if url_contains:
+        candidates = [page for page in candidates if url_contains in str(page.get("url", ""))]
+    if title_contains:
+        candidates = [page for page in candidates if title_contains in str(page.get("title", ""))]
+    if not candidates:
+        errors = [page for page in pages if page.get("error")]
+        detail = {"page_id": page_id, "url_contains": url_contains, "title_contains": title_contains, "errors": errors}
+        raise AndroidUseError(f"No matching WebView page found: {json.dumps(detail, ensure_ascii=False)[:1200]}")
+    candidates.sort(key=webview_page_score, reverse=True)
+    page = candidates[0]
+    if not page.get("webSocketDebuggerUrl"):
+        raise AndroidUseError(f"Matched WebView page has no webSocketDebuggerUrl: {page}")
+    return page
+
+
+def recv_exact(sock: socket.socket, byte_count: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = byte_count
+    while remaining > 0:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            raise AndroidUseError("WebSocket closed while reading data.")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def websocket_frame(opcode: int, payload: bytes = b"") -> bytes:
+    first = 0x80 | (opcode & 0x0F)
+    mask_key = os.urandom(4)
+    length = len(payload)
+    if length < 126:
+        header = bytes([first, 0x80 | length])
+    elif length < 65536:
+        header = bytes([first, 0x80 | 126]) + struct.pack("!H", length)
+    else:
+        header = bytes([first, 0x80 | 127]) + struct.pack("!Q", length)
+    masked = bytes(byte ^ mask_key[index % 4] for index, byte in enumerate(payload))
+    return header + mask_key + masked
+
+
+def websocket_send_text(sock: socket.socket, text: str) -> None:
+    sock.sendall(websocket_frame(0x1, text.encode("utf-8")))
+
+
+def websocket_send_pong(sock: socket.socket, payload: bytes) -> None:
+    sock.sendall(websocket_frame(0xA, payload))
+
+
+def websocket_recv_text(sock: socket.socket) -> str:
+    fragments: list[bytes] = []
+    while True:
+        first, second = recv_exact(sock, 2)
+        fin = bool(first & 0x80)
+        opcode = first & 0x0F
+        masked = bool(second & 0x80)
+        length = second & 0x7F
+        if length == 126:
+            length = struct.unpack("!H", recv_exact(sock, 2))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", recv_exact(sock, 8))[0]
+        mask_key = recv_exact(sock, 4) if masked else b""
+        payload = recv_exact(sock, length) if length else b""
+        if masked:
+            payload = bytes(byte ^ mask_key[index % 4] for index, byte in enumerate(payload))
+        if opcode == 0x8:
+            raise AndroidUseError("WebSocket closed by remote endpoint.")
+        if opcode == 0x9:
+            websocket_send_pong(sock, payload)
+            continue
+        if opcode == 0xA:
+            continue
+        if opcode in (0x1, 0x0):
+            fragments.append(payload)
+            if fin:
+                return b"".join(fragments).decode("utf-8", errors="replace")
+
+
+def websocket_connect(ws_url: str, timeout: int | float = 10) -> socket.socket:
+    parsed = urllib.parse.urlparse(ws_url)
+    if parsed.scheme != "ws":
+        raise AndroidUseError(f"Only ws:// DevTools endpoints are supported: {ws_url}")
+    host = parsed.hostname or "127.0.0.1"
+    port = int(parsed.port or 80)
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    sock = socket.create_connection((host, port), timeout=timeout)
+    sock.settimeout(timeout)
+    key = base64.b64encode(os.urandom(16)).decode("ascii")
+    request = (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: {host}:{port}\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\n"
+        "Sec-WebSocket-Version: 13\r\n"
+        "\r\n"
+    )
+    sock.sendall(request.encode("ascii"))
+    response = b""
+    while b"\r\n\r\n" not in response:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        response += chunk
+        if len(response) > 16384:
+            break
+    status_line = response.split(b"\r\n", 1)[0].decode("ascii", errors="replace")
+    if " 101 " not in status_line:
+        sock.close()
+        raise AndroidUseError(f"WebSocket handshake failed for {ws_url}: {status_line}")
+    return sock
+
+
+def cdp_call(ws_url: str, method: str, params: dict[str, Any] | None = None, timeout: int | float = 10) -> dict[str, Any]:
+    sock = websocket_connect(ws_url, timeout=timeout)
+    request_id = 1
+    try:
+        websocket_send_text(sock, json.dumps({"id": request_id, "method": method, "params": params or {}}))
+        deadline = time.time() + float(timeout)
+        while True:
+            if time.time() > deadline:
+                raise AndroidUseError(f"Timed out waiting for CDP response: {method}")
+            message = json.loads(websocket_recv_text(sock))
+            if message.get("id") != request_id:
+                continue
+            if message.get("error"):
+                raise AndroidUseError(f"CDP {method} failed: {message['error']}")
+            result = message.get("result")
+            return result if isinstance(result, dict) else {}
+    finally:
+        try:
+            sock.sendall(websocket_frame(0x8, b""))
+        except Exception:
+            pass
+        sock.close()
+
+
+def cdp_runtime_evaluate(
+    ws_url: str,
+    expression: str,
+    *,
+    await_promise: bool = True,
+    return_by_value: bool = True,
+    timeout: int | float = 10,
+) -> dict[str, Any]:
+    result = cdp_call(
+        ws_url,
+        "Runtime.evaluate",
+        {
+            "expression": expression,
+            "awaitPromise": await_promise,
+            "returnByValue": return_by_value,
+            "userGesture": True,
+        },
+        timeout=timeout,
+    )
+    if result.get("exceptionDetails"):
+        raise AndroidUseError(f"Runtime.evaluate exception: {json.dumps(result['exceptionDetails'], ensure_ascii=False)[:1200]}")
+    remote = result.get("result")
+    if not isinstance(remote, dict):
+        return {"raw": result}
+    payload: dict[str, Any] = {"type": remote.get("type")}
+    if "value" in remote:
+        payload["value"] = remote.get("value")
+    if "unserializableValue" in remote:
+        payload["unserializableValue"] = remote.get("unserializableValue")
+    if "description" in remote:
+        payload["description"] = remote.get("description")
+    return payload
 
 
 def get_prop(serial: str, prop: str) -> str | None:
@@ -355,6 +727,14 @@ def quoted_phrases(text: str) -> list[str]:
 
 
 def fast_ui_action_from_instruction(serial: str, instruction: str) -> dict[str, Any] | None:
+    map_action = xiaoluxue_map_fast_action_from_instruction(instruction)
+    if map_action:
+        if map_action.get("subject_id"):
+            return map_action
+        focus = get_focused_window(serial) or ""
+        if XIAOLUXUE_STUDY_SUBJECT_ACTIVITY in focus:
+            return map_action
+
     observation = observe_ui(serial, limit=220)
     nodes = observation["ui"]["nodes"]
     labels: list[str] = []
@@ -451,6 +831,719 @@ def save_png(serial: str, png: bytes, save_path: str | None = None) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(png)
     return str(path)
+
+
+def timestamp_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def slugify(value: str, default: str = "android") -> str:
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", value.strip()).strip("-._")
+    return slug[:80] or default
+
+
+def lock_path(name: str) -> Path:
+    return SCREEN_DIR / f"{slugify(name, 'lock')}.lock"
+
+
+@contextlib.contextmanager
+def exclusive_file_lock(path: Path, *, blocking: bool = True) -> Iterator[bool]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+")
+    flags = fcntl.LOCK_EX
+    if not blocking:
+        flags |= fcntl.LOCK_NB
+    locked = False
+    try:
+        try:
+            fcntl.flock(handle.fileno(), flags)
+            locked = True
+            yield True
+        except BlockingIOError:
+            yield False
+    finally:
+        if locked:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        handle.close()
+
+
+def write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+    tmp_path.replace(path)
+
+
+def visible_labels(nodes: list[dict[str, Any]], limit: int = 24) -> list[str]:
+    labels: list[str] = []
+    for node in nodes:
+        for key in ("text", "content_desc", "resource_id"):
+            label = str(node.get(key) or "").strip()
+            if label and label not in labels and len(label) <= 120:
+                labels.append(label)
+            if len(labels) >= limit:
+                return labels
+    return labels
+
+
+def snapshot_fingerprint(snapshot: dict[str, Any]) -> dict[str, Any]:
+    nodes = snapshot.get("ui", {}).get("nodes", [])
+    return {
+        "focused_window": snapshot.get("state", {}).get("focused_window"),
+        "labels": visible_labels(nodes, limit=16) if isinstance(nodes, list) else [],
+    }
+
+
+def snapshot_from_observation(observation: dict[str, Any]) -> dict[str, Any]:
+    snapshot = {
+        "timestamp": timestamp_iso(),
+        "state": observation.get("state", {}),
+        "ui": observation.get("ui", {}),
+    }
+    snapshot["fingerprint"] = snapshot_fingerprint(snapshot)
+    return snapshot
+
+
+def capture_record_snapshot(
+    serial: str,
+    *,
+    include_screenshot: bool = False,
+    base_dir: Path | None = None,
+    name: str = "snapshot",
+) -> dict[str, Any]:
+    try:
+        snapshot = snapshot_from_observation(observe_ui(serial, include_xml=False, limit=320))
+    except Exception as exc:
+        snapshot = {"timestamp": timestamp_iso(), "error": str(exc)}
+        try:
+            snapshot["state"] = device_state(serial)
+        except Exception:
+            pass
+        snapshot["fingerprint"] = snapshot_fingerprint(snapshot)
+    if include_screenshot and base_dir is not None:
+        try:
+            png = screenshot_png(serial)
+            screen_dir = base_dir / "screens"
+            screen_dir.mkdir(parents=True, exist_ok=True)
+            path = screen_dir / f"{slugify(name)}.png"
+            path.write_bytes(png)
+            snapshot["screenshot_path"] = str(path)
+            snapshot["screenshot_size"] = png_size(png)
+        except Exception as exc:
+            snapshot["screenshot_error"] = str(exc)
+    return snapshot
+
+
+def compact_node(node: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not node:
+        return None
+    return {
+        key: node.get(key)
+        for key in ("index", "text", "content_desc", "resource_id", "class", "bounds", "center", "clickable")
+        if node.get(key) not in (None, "")
+    }
+
+
+def selector_candidates_for_node(node: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not node:
+        return []
+    selectors: list[dict[str, Any]] = []
+    resource_id = str(node.get("resource_id") or "").strip()
+    content_desc = str(node.get("content_desc") or "").strip()
+    text = str(node.get("text") or "").strip()
+    if resource_id:
+        selectors.append({"strategy": "resource_id", "value": resource_id})
+    if content_desc:
+        selectors.append({"strategy": "content_desc", "value": content_desc})
+    if text:
+        selectors.append({"strategy": "text", "value": text})
+    return selectors
+
+
+def point_in_bounds(bounds: dict[str, int] | None, x: int, y: int) -> bool:
+    if not bounds:
+        return False
+    return bounds["left"] <= x <= bounds["right"] and bounds["top"] <= y <= bounds["bottom"]
+
+
+def node_at_point(nodes: list[dict[str, Any]], x: int, y: int) -> dict[str, Any] | None:
+    candidates: list[tuple[int, int, dict[str, Any]]] = []
+    for node in nodes:
+        bounds = node.get("bounds")
+        if isinstance(bounds, dict) and point_in_bounds(bounds, x, y):
+            area = max(1, (bounds["right"] - bounds["left"]) * (bounds["bottom"] - bounds["top"]))
+            candidates.append((area, -int(node.get("depth", 0)), node))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return candidates[0][2]
+
+
+def find_node_by_selector(nodes: list[dict[str, Any]], selector: dict[str, Any]) -> dict[str, Any] | None:
+    strategy = str(selector.get("strategy", "")).strip()
+    value = str(selector.get("value", "")).strip()
+    if not strategy or not value:
+        return None
+    if strategy == "resource_id":
+        for node in nodes:
+            if str(node.get("resource_id") or "").strip() == value:
+                return node
+        return None
+    if strategy == "content_desc":
+        for node in nodes:
+            if str(node.get("content_desc") or "").strip() == value:
+                return node
+        return None
+    if strategy == "text":
+        for node in nodes:
+            if str(node.get("text") or "").strip() == value:
+                return node
+        return None
+    if strategy == "text_contains":
+        return find_ui_node(nodes, value, exact=False)
+    return None
+
+
+def coordinate_from_target(serial: str, target: dict[str, Any]) -> dict[str, int] | None:
+    coordinate = target.get("coordinate")
+    if not isinstance(coordinate, dict):
+        return None
+    x = coordinate.get("x")
+    y = coordinate.get("y")
+    if x is None or y is None:
+        return None
+    source_screen = coordinate.get("screen") if isinstance(coordinate.get("screen"), dict) else {}
+    source_width = int(source_screen.get("width") or 0)
+    source_height = int(source_screen.get("height") or 0)
+    current = get_screen_size(serial)
+    current_width = int(current.get("width") or 0)
+    current_height = int(current.get("height") or 0)
+    if source_width > 0 and source_height > 0 and current_width > 0 and current_height > 0:
+        return {
+            "x": round(int(x) * current_width / source_width),
+            "y": round(int(y) * current_height / source_height),
+        }
+    return {"x": int(x), "y": int(y)}
+
+
+def resolve_target_point(serial: str, target: dict[str, Any]) -> tuple[dict[str, int], dict[str, Any] | None]:
+    observation = observe_ui(serial, limit=320)
+    nodes = observation["ui"]["nodes"]
+    selectors = target.get("selectors") if isinstance(target.get("selectors"), list) else []
+    for selector in selectors:
+        if isinstance(selector, dict):
+            node = find_node_by_selector(nodes, selector)
+            point = node_click_point(node) if node else None
+            if point:
+                return point, node
+    point = coordinate_from_target(serial, target)
+    if point:
+        return point, None
+    raise AndroidUseError(f"Could not resolve recipe target: {target}")
+
+
+def action_target_from_record(record: dict[str, Any]) -> dict[str, Any]:
+    args = record.get("arguments", {}) if isinstance(record.get("arguments"), dict) else {}
+    result = record.get("result", {}) if isinstance(record.get("result"), dict) else {}
+    before = record.get("before", {}) if isinstance(record.get("before"), dict) else {}
+    nodes = before.get("ui", {}).get("nodes", [])
+    matched_node = result.get("matched_node") if isinstance(result.get("matched_node"), dict) else None
+    x = result.get("x", args.get("x"))
+    y = result.get("y", args.get("y"))
+    if matched_node is None and isinstance(nodes, list) and x is not None and y is not None:
+        matched_node = node_at_point(nodes, int(x), int(y))
+    screen = before.get("state", {}).get("screen") if isinstance(before.get("state"), dict) else {}
+    target: dict[str, Any] = {
+        "selectors": selector_candidates_for_node(matched_node),
+        "matched_node": compact_node(matched_node),
+    }
+    if x is not None and y is not None:
+        target["coordinate"] = {"x": int(x), "y": int(y), "screen": screen or {}}
+    return target
+
+
+def verify_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    fingerprint = snapshot.get("fingerprint") if isinstance(snapshot.get("fingerprint"), dict) else {}
+    focused_window = fingerprint.get("focused_window")
+    labels = fingerprint.get("labels") or []
+    human_labels = [
+        str(label)
+        for label in labels
+        if label and ":id/" not in str(label) and "/" not in str(label) and len(str(label)) <= 80
+    ]
+    return {
+        "focused_window": focused_window,
+        "labels_any": [] if focused_window else human_labels[:6],
+    }
+
+
+def recipe_from_trace(trace: dict[str, Any], recipe_name: str | None = None) -> dict[str, Any]:
+    name = recipe_name or str(trace.get("name") or "android-recipe")
+    recipe: dict[str, Any] = {
+        "schema_version": 1,
+        "name": name,
+        "created_at": timestamp_iso(),
+        "source_trace_id": trace.get("id"),
+        "serial": trace.get("serial"),
+        "steps": [],
+    }
+    for record in trace.get("steps", []):
+        if not isinstance(record, dict) or record.get("kind") != "action":
+            continue
+        action = str(record.get("action", "")).strip()
+        args = record.get("arguments", {}) if isinstance(record.get("arguments"), dict) else {}
+        step: dict[str, Any] = {"action": action}
+        if action in {"tap", "tap_text"}:
+            step["target"] = action_target_from_record(record)
+            if action == "tap_text" and args.get("text"):
+                step["text"] = args.get("text")
+        elif action == "swipe":
+            step.update({key: args[key] for key in ("start_x", "start_y", "end_x", "end_y") if key in args})
+            step["duration_ms"] = int(args.get("duration_ms", 300))
+            before = record.get("before", {}) if isinstance(record.get("before"), dict) else {}
+            step["screen"] = before.get("state", {}).get("screen", {})
+        elif action == "type_text":
+            if args.get("text_redacted"):
+                step["text_redacted"] = True
+            else:
+                step["text"] = args.get("text", "")
+            step["clear_first"] = bool(args.get("clear_first", False))
+            step["clear_count"] = int(args.get("clear_count", 80))
+            step["enter"] = bool(args.get("enter", False))
+        elif action == "press_key":
+            step["key"] = args.get("key")
+        elif action == "open_url":
+            step["url"] = args.get("url")
+        elif action == "open_app":
+            step["package"] = args.get("package")
+            if args.get("activity"):
+                step["activity"] = args.get("activity")
+        elif action == "wake_unlock":
+            step["dismiss_keyguard"] = bool(args.get("dismiss_keyguard", True))
+        elif action == "xiaoluxue_set_speed":
+            step["rate"] = float(args.get("rate", 2.0))
+        elif action == "xiaoluxue_goto_widget":
+            step["index"] = int(args.get("index", 0))
+            step["mode"] = str(args.get("mode", "reload"))
+        elif action == "xiaoluxue_course_fast_path":
+            step.update(
+                {
+                    key: args[key]
+                    for key in (
+                        "guide_index",
+                        "guide_name_contains",
+                        "set_speed",
+                        "rate",
+                        "target_index",
+                        "target_name_contains",
+                        "target_last",
+                        "target_mode",
+                    )
+                    if key in args
+                }
+            )
+        elif action == "xiaoluxue_map_fast_path":
+            step.update(
+                {
+                    key: args[key]
+                    for key in (
+                        "index",
+                        "subject_id",
+                        "subject",
+                        "action_name",
+                        "instruction",
+                        "route_if_subject",
+                        "route_wait_sec",
+                        "prefer_predicted",
+                        "open_report_when_done",
+                    )
+                    if key in args
+                }
+            )
+        elif action == "xiaoluxue_open_native_subject":
+            step.update(
+                {
+                    key: args[key]
+                    for key in (
+                        "subject_id",
+                        "subject",
+                        "textbook_id",
+                        "chapter_id",
+                        "knowledge_id",
+                        "go_next_knowledge",
+                        "route_wait_sec",
+                    )
+                    if key in args
+                }
+            )
+        elif action == "xiaoluxue_open_knowledge_guide":
+            step.update(
+                {
+                    key: args[key]
+                    for key in (
+                        "subject_id",
+                        "knowledge_index",
+                        "knowledge_id",
+                        "guide_widget_index",
+                        "rate",
+                        "prefer_client_route",
+                        "use_shortcut_url",
+                        "refresh_session",
+                    )
+                    if key in args
+                }
+            )
+        elif action == "xiaoluxue_switch_env":
+            step.update(
+                {
+                    key: args[key]
+                    for key in (
+                        "env",
+                        "open_student",
+                        "force_submit",
+                        "force_stop_student",
+                        "timeout_sec",
+                    )
+                    if key in args
+                }
+            )
+        elif action == "xiaoluxue_exercise_action":
+            step.update(
+                {
+                    key: args[key]
+                    for key in ("action_name", "option_key", "option_index", "option_text", "button_text")
+                    if key in args
+                }
+            )
+        elif action == "xiaoluxue_exercise_fast_path":
+            step.update(
+                {
+                    key: args[key]
+                    for key in (
+                        "option_key",
+                        "option_index",
+                        "option_text",
+                        "submit",
+                        "continue_after_submit",
+                        "action_name",
+                        "button_text",
+                        "after_action_wait_sec",
+                    )
+                    if key in args
+                }
+            )
+        else:
+            continue
+        after = record.get("after") if isinstance(record.get("after"), dict) else {}
+        if after:
+            step["verify"] = verify_from_snapshot(after)
+        recipe["steps"].append(step)
+    return recipe
+
+
+def replay_coordinate(step: dict[str, Any], key: str, serial: str) -> int:
+    value = int(step[key])
+    source_screen = step.get("screen") if isinstance(step.get("screen"), dict) else {}
+    source_width = int(source_screen.get("width") or 0)
+    source_height = int(source_screen.get("height") or 0)
+    current = get_screen_size(serial)
+    current_width = int(current.get("width") or 0)
+    current_height = int(current.get("height") or 0)
+    if key.endswith("_x") and source_width > 0 and current_width > 0:
+        return round(value * current_width / source_width)
+    if key.endswith("_y") and source_height > 0 and current_height > 0:
+        return round(value * current_height / source_height)
+    return value
+
+
+def execute_recipe_step(serial: str, step: dict[str, Any], *, dry_run: bool = False) -> dict[str, Any]:
+    action = str(step.get("action", "")).strip()
+    if dry_run:
+        return {"ok": True, "action": action, "dry_run": True}
+    if action in {"tap", "tap_text"}:
+        point, node = resolve_target_point(serial, step.get("target", {}))
+        adb(["shell", "input", "tap", str(point["x"]), str(point["y"])], serial=serial, timeout=10)
+        return {"ok": True, "action": action, "point": point, "matched_node": compact_node(node)}
+    if action == "swipe":
+        start_x = replay_coordinate(step, "start_x", serial)
+        start_y = replay_coordinate(step, "start_y", serial)
+        end_x = replay_coordinate(step, "end_x", serial)
+        end_y = replay_coordinate(step, "end_y", serial)
+        duration_ms = int(step.get("duration_ms", 300))
+        adb(
+            [
+                "shell",
+                "input",
+                "swipe",
+                str(start_x),
+                str(start_y),
+                str(end_x),
+                str(end_y),
+                str(duration_ms),
+            ],
+            serial=serial,
+            timeout=10,
+        )
+        return {"ok": True, "action": "swipe"}
+    if action == "type_text":
+        if step.get("text_redacted"):
+            raise AndroidUseError("Recipe text is redacted; edit the recipe and provide `text` before replay.")
+        text = str(step.get("text", ""))
+        if step.get("clear_first"):
+            adb(["shell", "input", "keyevent", "KEYCODE_MOVE_END"], serial=serial, timeout=10)
+            for _ in range(int(step.get("clear_count", 80))):
+                adb(["shell", "input", "keyevent", "KEYCODE_DEL"], serial=serial, timeout=10)
+        if text:
+            adb(["shell", "input", "text", escape_input_text(text)], serial=serial, timeout=15)
+        if step.get("enter"):
+            adb(["shell", "input", "keyevent", "KEYCODE_ENTER"], serial=serial, timeout=10)
+        return {"ok": True, "action": "type_text", "chars": len(text)}
+    if action == "press_key":
+        key = keycode(step["key"])
+        adb(["shell", "input", "keyevent", key], serial=serial, timeout=10)
+        return {"ok": True, "action": "press_key", "key": key}
+    if action == "open_url":
+        adb(["shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", str(step["url"])], serial=serial, timeout=15)
+        return {"ok": True, "action": "open_url", "url": step["url"]}
+    if action == "open_app":
+        package = str(step["package"])
+        activity = str(step.get("activity", "")).strip()
+        if activity:
+            component = activity if "/" in activity else f"{package}/{activity}"
+            adb(["shell", "am", "start", "-n", component], serial=serial, timeout=15)
+        else:
+            adb(["shell", "monkey", "-p", package, "-c", "android.intent.category.LAUNCHER", "1"], serial=serial, timeout=15)
+        return {"ok": True, "action": "open_app", "package": package, "activity": activity or None}
+    if action == "wake_unlock":
+        adb(["shell", "input", "keyevent", "KEYCODE_WAKEUP"], serial=serial, timeout=10)
+        if step.get("dismiss_keyguard", True):
+            adb(["shell", "wm", "dismiss-keyguard"], serial=serial, timeout=10)
+        return {"ok": True, "action": "wake_unlock"}
+    if action == "xiaoluxue_set_speed":
+        page = xiaoluxue_page(serial)
+        rate = float(step.get("rate", 2.0))
+        result = cdp_eval_value(page, xiaoluxue_set_speed_expression(rate), timeout=15)
+        return {"ok": True, "action": "xiaoluxue_set_speed", "rate": rate, "result": result}
+    if action == "xiaoluxue_goto_widget":
+        page = xiaoluxue_page(serial)
+        index = int(step.get("index", 0))
+        mode = str(step.get("mode", "reload"))
+        result = cdp_eval_value(page, xiaoluxue_goto_widget_expression(index, mode), timeout=15)
+        return {"ok": True, "action": "xiaoluxue_goto_widget", "index": index, "mode": mode, "result": result}
+    if action == "xiaoluxue_course_fast_path":
+        return run_xiaoluxue_course_fast_path(serial, step, record=False)
+    if action == "xiaoluxue_open_native_subject":
+        return run_xiaoluxue_open_native_subject(serial, step, record=False)
+    if action == "xiaoluxue_map_fast_path":
+        return run_xiaoluxue_map_fast_path(serial, step, record=False)
+    if action == "xiaoluxue_open_knowledge_guide":
+        return run_xiaoluxue_open_knowledge_guide(serial, step, record=False)
+    if action == "xiaoluxue_switch_env":
+        return run_xiaoluxue_switch_env(serial, step, record=False)
+    if action == "xiaoluxue_exercise_action":
+        page = xiaoluxue_exercise_page(serial)
+        result = cdp_eval_value(page, xiaoluxue_exercise_action_expression(step), timeout=15)
+        return {"ok": True, "action": "xiaoluxue_exercise_action", "result": result}
+    if action == "xiaoluxue_exercise_fast_path":
+        return run_xiaoluxue_exercise_fast_path(serial, step, record=False)
+    raise AndroidUseError(f"Unsupported recipe action: {action}")
+
+
+def verify_recipe_step(serial: str, step: dict[str, Any]) -> dict[str, Any]:
+    verify = step.get("verify") if isinstance(step.get("verify"), dict) else {}
+    if not verify:
+        return {"checked": False, "ok": True}
+    snapshot = capture_record_snapshot(serial)
+    fingerprint = snapshot.get("fingerprint", {})
+    current_labels = set(fingerprint.get("labels") or [])
+    expected_labels = [label for label in verify.get("labels_any", []) if label]
+    matched_labels = [label for label in expected_labels if label in current_labels]
+    expected_window = verify.get("focused_window")
+    current_window = fingerprint.get("focused_window")
+    window_ok = not expected_window or expected_window == current_window
+    labels_ok = not expected_labels or bool(matched_labels)
+    return {
+        "checked": True,
+        "ok": bool(window_ok and labels_ok),
+        "window_ok": window_ok,
+        "labels_ok": labels_ok,
+        "matched_labels": matched_labels,
+        "expected_window": expected_window,
+        "current_window": current_window,
+    }
+
+
+def resolve_json_path(value: str, directory: Path, suffix: str = ".json") -> Path:
+    path = Path(value).expanduser()
+    if path.exists():
+        return path
+    candidate = directory / (value if value.endswith(suffix) else f"{value}{suffix}")
+    if candidate.exists():
+        return candidate
+    raise AndroidUseError(f"JSON file not found: {value}")
+
+
+SOURCE_EXTENSIONS = {".kt", ".java", ".xml", ".tsx", ".jsx", ".ts", ".js", ".dart"}
+
+
+def extract_source_entry(path: Path, root: Path) -> dict[str, Any] | None:
+    try:
+        text = path.read_text(errors="ignore")
+    except OSError:
+        return None
+    rel = str(path.relative_to(root))
+    entry: dict[str, Any] = {"file": rel, "activities": [], "routes": [], "controls": []}
+    for match in re.finditer(r"class\s+([A-Za-z0-9_]*Activity)\b", text):
+        entry["activities"].append(match.group(1))
+    for match in re.finditer(r"<activity[^>]+android:name=[\"']([^\"']+)[\"']", text):
+        entry["activities"].append(match.group(1))
+    for pattern in (r"composable\s*\(\s*[\"']([^\"']+)[\"']", r"route\s*=\s*[\"']([^\"']+)[\"']", r"android:path(?:Prefix|Pattern)?=[\"']([^\"']+)[\"']"):
+        for match in re.finditer(pattern, text):
+            entry["routes"].append(match.group(1))
+    controls: list[dict[str, Any]] = []
+    for match in re.finditer(r"android:id=[\"']@\+?id/([^\"']+)[\"']", text):
+        controls.append({"kind": "id", "value": match.group(1)})
+    for match in re.finditer(r"\bR\.id\.([A-Za-z0-9_]+)", text):
+        controls.append({"kind": "id", "value": match.group(1)})
+    for match in re.finditer(r"android:(?:text|hint|contentDescription)=[\"']([^\"']{1,120})[\"']", text):
+        controls.append({"kind": "label", "value": match.group(1)})
+    for match in re.finditer(r"\b(?:Text|Button|ClickableText)\s*\(\s*[\"']([^\"']{1,120})[\"']", text):
+        controls.append({"kind": "label", "value": match.group(1)})
+    for match in re.finditer(r"\b(?:contentDescription|testTag)\s*=\s*[\"']([^\"']{1,120})[\"']", text):
+        controls.append({"kind": "semantic", "value": match.group(1)})
+    for match in re.finditer(r"\b(?:testTag|contentDescription)\s*\(\s*[\"']([^\"']{1,120})[\"']\s*\)", text):
+        controls.append({"kind": "semantic", "value": match.group(1)})
+    seen_controls: set[tuple[str, str]] = set()
+    for control in controls:
+        key = (control["kind"], control["value"])
+        if key not in seen_controls:
+            entry["controls"].append(control)
+            seen_controls.add(key)
+    for key in ("activities", "routes"):
+        entry[key] = sorted(set(entry[key]))
+    if entry["activities"] or entry["routes"] or entry["controls"]:
+        return entry
+    return None
+
+
+def index_source_tree(root: Path, *, max_files: int = 2000) -> dict[str, Any]:
+    root = root.expanduser().resolve()
+    if not root.exists():
+        raise AndroidUseError(f"source_path does not exist: {root}")
+    if root.is_file():
+        files = [root]
+        scan_root = root.parent
+    else:
+        scan_root = root
+        files = []
+        for path in root.rglob("*"):
+            if len(files) >= max_files:
+                break
+            if path.is_file() and path.suffix in SOURCE_EXTENSIONS:
+                if any(part in {".git", "build", ".gradle", "node_modules", "Pods"} for part in path.parts):
+                    continue
+                files.append(path)
+    entries = [entry for file_path in files if (entry := extract_source_entry(file_path, scan_root))]
+    controls: list[dict[str, Any]] = []
+    seen_controls: set[tuple[str, str]] = set()
+    for entry in entries:
+        for control in entry.get("controls", []):
+            key = (control["kind"], control["value"])
+            if key not in seen_controls:
+                controls.append(control)
+                seen_controls.add(key)
+    return {
+        "schema_version": 1,
+        "generated_at": timestamp_iso(),
+        "root": str(root),
+        "files_scanned": len(files),
+        "files_indexed": len(entries),
+        "pages": entries,
+        "controls": controls,
+    }
+
+
+def active_recording(serial: str) -> dict[str, Any] | None:
+    return ACTIVE_RECORDINGS.get(serial)
+
+
+def sanitize_action_arguments(action: str, args: dict[str, Any], recording: dict[str, Any]) -> dict[str, Any]:
+    sanitized = {key: value for key, value in args.items() if key != "serial"}
+    if action == "type_text" and recording.get("redact_text"):
+        text = str(sanitized.pop("text", ""))
+        sanitized["chars"] = len(text)
+        sanitized["text_redacted"] = True
+    return sanitized
+
+
+def append_recording_step(
+    serial: str,
+    action: str,
+    args: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    before: dict[str, Any] | None = None,
+) -> None:
+    recording = active_recording(serial)
+    if not recording:
+        return
+    try:
+        index = len(recording["steps"]) + 1
+        if before is None:
+            before = capture_record_snapshot(
+                serial,
+                include_screenshot=bool(recording.get("include_screenshots")),
+                base_dir=Path(recording["dir"]),
+                name=f"{index:03d}-before-{action}",
+            )
+        delay = float(recording.get("after_delay_sec", 0.25))
+        if delay > 0:
+            time.sleep(min(delay, 2.0))
+        after = capture_record_snapshot(
+            serial,
+            include_screenshot=bool(recording.get("include_screenshots")),
+            base_dir=Path(recording["dir"]),
+            name=f"{index:03d}-after-{action}",
+        )
+        recording["steps"].append(
+            {
+                "kind": "action",
+                "index": index,
+                "timestamp": timestamp_iso(),
+                "action": action,
+                "arguments": sanitize_action_arguments(action, args, recording),
+                "result": result,
+                "before": before,
+                "after": after,
+            }
+        )
+    except Exception as exc:
+        recording.setdefault("errors", []).append({"timestamp": timestamp_iso(), "action": action, "error": str(exc)})
+
+
+def append_recording_checkpoint(serial: str, label: str) -> dict[str, Any]:
+    recording = active_recording(serial)
+    if not recording:
+        raise AndroidUseError("No active recording for this device. Start one with android_start_recording first.")
+    index = len(recording["steps"]) + 1
+    snapshot = capture_record_snapshot(
+        serial,
+        include_screenshot=bool(recording.get("include_screenshots")),
+        base_dir=Path(recording["dir"]),
+        name=f"{index:03d}-checkpoint-{label}",
+    )
+    step = {
+        "kind": "checkpoint",
+        "index": index,
+        "timestamp": timestamp_iso(),
+        "label": label,
+        "snapshot": snapshot,
+    }
+    recording["steps"].append(step)
+    return step
 
 
 KEY_ALIASES = {
@@ -636,7 +1729,9 @@ def tool_tap_text(args: dict[str, Any]) -> list[dict[str, Any]]:
     query = str(args["text"]).strip()
     exact = bool(args.get("exact", True))
     include_resource_id = bool(args.get("include_resource_id", False))
-    nodes = observe_ui(serial, limit=300)["ui"]["nodes"]
+    observation = observe_ui(serial, limit=300)
+    before = snapshot_from_observation(observation) if active_recording(serial) else None
+    nodes = observation["ui"]["nodes"]
     node = find_ui_node(nodes, query, exact=exact, include_resource_id=include_resource_id)
     if not node and exact:
         node = find_ui_node(nodes, query, exact=False, include_resource_id=include_resource_id)
@@ -644,31 +1739,30 @@ def tool_tap_text(args: dict[str, Any]) -> list[dict[str, Any]]:
     if not point:
         raise AndroidUseError(f"Could not find a tappable UI node matching text: {query!r}")
     adb(["shell", "input", "tap", str(point["x"]), str(point["y"])], serial=serial, timeout=10)
-    return [
-        text_content(
-            action_result(
-                "tap_text",
-                serial,
-                {
-                    "text": query,
-                    "x": point["x"],
-                    "y": point["y"],
-                    "matched_node": {
-                        key: node.get(key)
-                        for key in ("index", "text", "content_desc", "resource_id", "class", "bounds", "clickable")
-                    },
-                },
-            )
-        )
-    ]
+    payload = action_result(
+        "tap_text",
+        serial,
+        {"text": query, "x": point["x"], "y": point["y"], "matched_node": compact_node(node)},
+    )
+    append_recording_step(
+        serial,
+        "tap_text",
+        {"text": query, "exact": exact, "include_resource_id": include_resource_id},
+        payload,
+        before=before,
+    )
+    return [text_content(payload)]
 
 
 def tool_tap(args: dict[str, Any]) -> list[dict[str, Any]]:
     serial = choose_serial(args.get("serial"))
     x = int(args["x"])
     y = int(args["y"])
+    before = capture_record_snapshot(serial) if active_recording(serial) else None
     adb(["shell", "input", "tap", str(x), str(y)], serial=serial, timeout=10)
-    return [text_content(action_result("tap", serial, {"x": x, "y": y}))]
+    payload = action_result("tap", serial, {"x": x, "y": y})
+    append_recording_step(serial, "tap", {"x": x, "y": y}, payload, before=before)
+    return [text_content(payload)]
 
 
 def tool_swipe(args: dict[str, Any]) -> list[dict[str, Any]]:
@@ -678,6 +1772,7 @@ def tool_swipe(args: dict[str, Any]) -> list[dict[str, Any]]:
     end_x = int(args["end_x"])
     end_y = int(args["end_y"])
     duration_ms = int(args.get("duration_ms", 300))
+    before = capture_record_snapshot(serial) if active_recording(serial) else None
     adb(
         [
             "shell",
@@ -692,26 +1787,22 @@ def tool_swipe(args: dict[str, Any]) -> list[dict[str, Any]]:
         serial=serial,
         timeout=10,
     )
-    return [
-        text_content(
-            action_result(
-                "swipe",
-                serial,
-                {
-                    "start_x": start_x,
-                    "start_y": start_y,
-                    "end_x": end_x,
-                    "end_y": end_y,
-                    "duration_ms": duration_ms,
-                },
-            )
-        )
-    ]
+    action_args = {
+        "start_x": start_x,
+        "start_y": start_y,
+        "end_x": end_x,
+        "end_y": end_y,
+        "duration_ms": duration_ms,
+    }
+    payload = action_result("swipe", serial, action_args)
+    append_recording_step(serial, "swipe", action_args, payload, before=before)
+    return [text_content(payload)]
 
 
 def tool_type_text(args: dict[str, Any]) -> list[dict[str, Any]]:
     serial = choose_serial(args.get("serial"))
     text = str(args["text"])
+    before = capture_record_snapshot(serial) if active_recording(serial) else None
     if args.get("clear_first"):
         adb(["shell", "input", "keyevent", "KEYCODE_MOVE_END"], serial=serial, timeout=10)
         for _ in range(int(args.get("clear_count", 80))):
@@ -720,38 +1811,41 @@ def tool_type_text(args: dict[str, Any]) -> list[dict[str, Any]]:
         adb(["shell", "input", "text", escape_input_text(text)], serial=serial, timeout=15)
     if args.get("enter"):
         adb(["shell", "input", "keyevent", "KEYCODE_ENTER"], serial=serial, timeout=10)
-    return [
-        text_content(
-            action_result(
-                "type_text",
-                serial,
-                {"chars": len(text), "clear_first": bool(args.get("clear_first")), "enter": bool(args.get("enter"))},
-            )
-        )
-    ]
+    action_args = {
+        "text": text,
+        "clear_first": bool(args.get("clear_first")),
+        "clear_count": int(args.get("clear_count", 80)),
+        "enter": bool(args.get("enter")),
+    }
+    payload = action_result(
+        "type_text",
+        serial,
+        {"chars": len(text), "clear_first": action_args["clear_first"], "enter": action_args["enter"]},
+    )
+    append_recording_step(serial, "type_text", action_args, payload, before=before)
+    return [text_content(payload)]
 
 
 def tool_press_key(args: dict[str, Any]) -> list[dict[str, Any]]:
     serial = choose_serial(args.get("serial"))
     key = keycode(args["key"])
+    before = capture_record_snapshot(serial) if active_recording(serial) else None
     adb(["shell", "input", "keyevent", key], serial=serial, timeout=10)
-    return [text_content(action_result("press_key", serial, {"key": key}))]
+    payload = action_result("press_key", serial, {"key": key})
+    append_recording_step(serial, "press_key", {"key": key}, payload, before=before)
+    return [text_content(payload)]
 
 
 def tool_wake_unlock(args: dict[str, Any]) -> list[dict[str, Any]]:
     serial = choose_serial(args.get("serial"))
+    before = capture_record_snapshot(serial) if active_recording(serial) else None
     adb(["shell", "input", "keyevent", "KEYCODE_WAKEUP"], serial=serial, timeout=10)
     if args.get("dismiss_keyguard", True):
         adb(["shell", "wm", "dismiss-keyguard"], serial=serial, timeout=10)
-    return [
-        text_content(
-            action_result(
-                "wake_unlock",
-                serial,
-                {"dismiss_keyguard": bool(args.get("dismiss_keyguard", True))},
-            )
-        )
-    ]
+    action_args = {"dismiss_keyguard": bool(args.get("dismiss_keyguard", True))}
+    payload = action_result("wake_unlock", serial, action_args)
+    append_recording_step(serial, "wake_unlock", action_args, payload, before=before)
+    return [text_content(payload)]
 
 
 def tool_open_url(args: dict[str, Any]) -> list[dict[str, Any]]:
@@ -759,12 +1853,20 @@ def tool_open_url(args: dict[str, Any]) -> list[dict[str, Any]]:
     url = str(args["url"]).strip()
     if not url:
         raise AndroidUseError("url must not be empty.")
+    before = capture_record_snapshot(serial) if active_recording(serial) else None
+    if is_xiaoluxue_app_only_url(url):
+        route_result = xiaoluxue_route_app_url(serial, url)
+        payload = action_result("open_url", serial, {"url": url, "routed": route_result})
+        append_recording_step(serial, "open_url", {"url": url, "xiaoluxue_app_route": True}, payload, before=before)
+        return [text_content(payload)]
     adb(
         ["shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", url],
         serial=serial,
         timeout=15,
     )
-    return [text_content(action_result("open_url", serial, {"url": url}))]
+    payload = action_result("open_url", serial, {"url": url})
+    append_recording_step(serial, "open_url", {"url": url}, payload, before=before)
+    return [text_content(payload)]
 
 
 def tool_open_app(args: dict[str, Any]) -> list[dict[str, Any]]:
@@ -773,17 +1875,22 @@ def tool_open_app(args: dict[str, Any]) -> list[dict[str, Any]]:
     activity = str(args.get("activity", "")).strip()
     if not package:
         raise AndroidUseError("package must not be empty.")
+    before = capture_record_snapshot(serial) if active_recording(serial) else None
     if activity:
         component = activity if "/" in activity else f"{package}/{activity}"
         adb(["shell", "am", "start", "-n", component], serial=serial, timeout=15)
-        return [text_content(action_result("open_app", serial, {"package": package, "activity": activity}))]
+        payload = action_result("open_app", serial, {"package": package, "activity": activity})
+        append_recording_step(serial, "open_app", {"package": package, "activity": activity}, payload, before=before)
+        return [text_content(payload)]
 
     adb(
         ["shell", "monkey", "-p", package, "-c", "android.intent.category.LAUNCHER", "1"],
         serial=serial,
         timeout=15,
     )
-    return [text_content(action_result("open_app", serial, {"package": package}))]
+    payload = action_result("open_app", serial, {"package": package})
+    append_recording_step(serial, "open_app", {"package": package}, payload, before=before)
+    return [text_content(payload)]
 
 
 def tool_shell(args: dict[str, Any]) -> list[dict[str, Any]]:
@@ -794,14 +1901,4064 @@ def tool_shell(args: dict[str, Any]) -> list[dict[str, Any]]:
     return [text_content({"serial": serial, "command": command, "stdout": stdout})]
 
 
-def tool_start_scrcpy(args: dict[str, Any]) -> list[dict[str, Any]]:
+def tool_webview_pages(args: dict[str, Any]) -> list[dict[str, Any]]:
     serial = choose_serial(args.get("serial"))
+    port = int(args["port"]) if args.get("port") is not None else None
+    pages = discover_webview_pages(serial, port=port)
+    return [text_content({"ok": True, "serial": serial, "pages": pages})]
+
+
+def tool_webview_eval(args: dict[str, Any]) -> list[dict[str, Any]]:
+    serial = choose_serial(args.get("serial"))
+    pages = discover_webview_pages(serial)
+    page = select_webview_page(
+        pages,
+        page_id=str(args.get("page_id") or "") or None,
+        url_contains=str(args.get("url_contains") or "") or None,
+        title_contains=str(args.get("title_contains") or "") or None,
+    )
+    timeout = min(float(args.get("timeout_sec", 10)), 60)
+    evaluation = cdp_runtime_evaluate(
+        str(page["webSocketDebuggerUrl"]),
+        str(args["expression"]),
+        await_promise=bool(args.get("await_promise", True)),
+        return_by_value=bool(args.get("return_by_value", True)),
+        timeout=timeout,
+    )
+    return [
+        text_content(
+            {
+                "ok": True,
+                "serial": serial,
+                "page": {
+                    "id": page.get("id"),
+                    "title": page.get("title"),
+                    "url": page.get("url"),
+                    "socket": page.get("socket"),
+                    "forward": page.get("forward"),
+                },
+                "result": evaluation,
+            }
+        )
+    ]
+
+
+XIAOLUXUE_SITE_URL_MARKER = "stu.xiaoluxue.com"
+XIAOLUXUE_COURSE_URL_MARKER = "stu.xiaoluxue.com/course"
+XIAOLUXUE_STUDENT_PACKAGE = "com.xiaoluxue.ai.student"
+XIAOLUXUE_STUDENT_LAUNCHER_COMPONENT = "com.xiaoluxue.ai.student/com.xiaoluxue.ai.student.LauncherActivity"
+XIAOLUXUE_CONFIG_PACKAGE = "com.xiaoluxue.ai.config"
+XIAOLUXUE_CONFIG_LAUNCHER_COMPONENT = "com.xiaoluxue.ai.config/com.xiaoluxue.ai.config.LauncherActivity"
+XIAOLUXUE_STUDY_SUBJECT_ACTIVITY = "com.xiaoluxue.ai.business.launcher.study.subject.StudySubjectActivity"
+XIAOLUXUE_SCHEME_PROXY_ACTIVITY = "com.xiaoluxue.ai.infra.framework.router.SchemeProxyActivity"
+XIAOLUXUE_VESSEL_WEBVIEW_ROUTE = "xlx://router/vessel/webview"
+XIAOLUXUE_STUDY_SUBJECT_ROUTE = "xlx://router/study/subject"
+XIAOLUXUE_GW_ORIGIN = "https://gw-stu.xiaoluxue.com"
+XIAOLUXUE_NATIVE_BASE_WIDTH = 2000
+XIAOLUXUE_NATIVE_BASE_HEIGHT = 1200
+XIAOLUXUE_NATIVE_MATH_CARD = (690, 280)
+XIAOLUXUE_NATIVE_GUIDE_BUBBLE = (770, 505)
+XIAOLUXUE_NATIVE_CONTINUE_BUTTON = (780, 815)
+XIAOLUXUE_NATIVE_PROGRESS_POPUP_CLOSE = (1515, 422)
+XIAOLUXUE_NATIVE_MAP_CACHE_PATH = SOURCE_MAP_DIR / "xiaoluxue-native-map-cache.json"
+XIAOLUXUE_NATIVE_MAP_CACHE: dict[str, Any] = {}
+XIAOLUXUE_SUBJECT_ALIASES: dict[str, int] = {
+    "语文": 1,
+    "中文": 1,
+    "数学": 2,
+    "英语": 3,
+    "英文": 3,
+    "物理": 4,
+    "化学": 5,
+    "生物": 6,
+}
+XIAOLUXUE_NATIVE_MAP_ROUTE_PRESETS: dict[int, dict[str, dict[str, tuple[int, int]]]] = {
+    1: {
+        "1.5": {
+            "index": (1780, 670),
+            "practise": (1000, 420),
+            "wrong": (926, 820),
+            "notebook": (1074, 820),
+            "report": (1000, 708),
+        }
+    }
+}
+XIAOLUXUE_MAP_FAST_KEYWORDS = (
+    "地图",
+    "题型突破",
+    "题型",
+    "突破",
+    "错题",
+    "笔记",
+    "笔记本",
+    "学习任务",
+    "任务",
+    "薄弱知识",
+    "薄弱",
+    "看报告",
+    "报告",
+)
+XIAOLUXUE_CONFIG_URL_PATTERN = re.compile(r"https://gw-stu[^\s，,;]+")
+XIAOLUXUE_APP_ONLY_HOSTS = {"stu.xiaoluxue.com"}
+XIAOLUXUE_APP_ONLY_SUFFIXES = (".xiaoluxue.cn",)
+XIAOLUXUE_ENV_CHOICES: dict[str, dict[str, str]] = {
+    "prod": {"label": "生产环境-com", "url": "https://gw-stu.xiaoluxue.com"},
+    "prod-com": {"label": "生产环境-com", "url": "https://gw-stu.xiaoluxue.com"},
+    "production": {"label": "生产环境-com", "url": "https://gw-stu.xiaoluxue.com"},
+    "dev": {"label": "Dev环境", "url": "https://gw-stu.dev.xiaoluxue.cn/"},
+    "test": {"label": "Test环境", "url": "https://gw-stu.test.xiaoluxue.cn/"},
+    "test2": {"label": "Test2环境", "url": "https://gw-stu.test2.xiaoluxue.cn/"},
+    "test3": {"label": "Test3环境", "url": "https://gw-stu.test3.xiaoluxue.cn/"},
+    "test4": {"label": "Test4环境", "url": "https://gw-stu.test4.xiaoluxue.cn/"},
+    "test5": {"label": "Test5环境", "url": "https://gw-stu.test5.xiaoluxue.cn/"},
+    "test6": {"label": "Test6环境", "url": "https://gw-stu.test6.xiaoluxue.cn/"},
+    "kmtest": {"label": "Kmtest环境", "url": "https://gw-stu.kmtest.xiaoluxue.cn/"},
+}
+
+
+def is_xiaoluxue_app_only_url(url: str) -> bool:
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        return False
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    host = (parsed.hostname or "").casefold()
+    return is_xiaoluxue_h5_host(host)
+
+
+def is_xiaoluxue_h5_host(host: str) -> bool:
+    normalized = host.casefold().strip()
+    return normalized in XIAOLUXUE_APP_ONLY_HOSTS or any(normalized.endswith(suffix) for suffix in XIAOLUXUE_APP_ONLY_SUFFIXES)
+
+
+def xiaoluxue_url_kind(url: str) -> str | None:
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        return None
+    host = parsed.hostname or ""
+    if not is_xiaoluxue_h5_host(host):
+        return None
+    path = parsed.path.rstrip("/") or "/"
+    if path == "/course" or path.startswith("/course/"):
+        return "course"
+    if path == "/exercise" or path.startswith("/exercise/"):
+        return "exercise"
+    return "any"
+
+
+def xiaoluxue_page_matches(page: dict[str, Any], page_kind: str) -> bool:
+    kind = xiaoluxue_url_kind(str(page.get("url") or ""))
+    if page_kind == "any":
+        return kind is not None or "小鹿爱学" in str(page.get("title") or "")
+    return kind == page_kind
+
+
+def select_xiaoluxue_webview_page(pages: list[dict[str, Any]], page_kind: str = "any") -> dict[str, Any]:
+    candidates = [page for page in pages if not page.get("error") and xiaoluxue_page_matches(page, page_kind)]
+    if not candidates:
+        detail = {
+            "page_kind": page_kind,
+            "known": [
+                {"id": page.get("id"), "title": page.get("title"), "url": page.get("url"), "error": page.get("error")}
+                for page in pages[:10]
+            ],
+        }
+        raise AndroidUseError(f"No matching Xiaoluxue WebView page found: {json.dumps(detail, ensure_ascii=False)[:1200]}")
+    candidates.sort(key=webview_page_score, reverse=True)
+    page = candidates[0]
+    if not page.get("webSocketDebuggerUrl"):
+        raise AndroidUseError(f"Matched Xiaoluxue WebView page has no webSocketDebuggerUrl: {page}")
+    return page
+
+
+def xiaoluxue_vessel_webview_url(url: str) -> str:
+    if not is_xiaoluxue_app_only_url(url):
+        raise AndroidUseError(f"Not a Xiaoluxue app-only URL: {url}")
+    return (
+        f"{XIAOLUXUE_VESSEL_WEBVIEW_ROUTE}?url={urllib.parse.quote(url, safe='')}"
+        "&full_screen=true&title_bar=false"
+    )
+
+
+def xiaoluxue_route_app_url(serial: str, url: str, *, force_stop: bool = False) -> dict[str, Any]:
+    route_url = xiaoluxue_vessel_webview_url(url)
+    stop_flag = "-S " if force_stop else ""
+    output = shell(
+        serial,
+        f"am start {stop_flag}-a android.intent.action.VIEW -d {shlex.quote(route_url)} -p {shlex.quote(XIAOLUXUE_STUDENT_PACKAGE)}",
+        timeout=3,
+    )
+    return {
+        "ok": True,
+        "mode": "xiaoluxue-vessel-webview-route",
+        "url": url,
+        "route_url": route_url,
+        "package": XIAOLUXUE_STUDENT_PACKAGE,
+        "am_start": output,
+    }
+
+
+def xiaoluxue_cache_key(serial: str, page_kind: str) -> tuple[str, str]:
+    return (serial, page_kind)
+
+
+def xiaoluxue_remember_page(serial: str, page_kind: str, page: dict[str, Any]) -> dict[str, Any]:
+    cached = dict(page)
+    cached["_cachedAt"] = time.monotonic()
+    cached["_cacheKind"] = page_kind
+    XIAOLUXUE_PAGE_CACHE[xiaoluxue_cache_key(serial, page_kind)] = cached
+    return page
+
+
+def xiaoluxue_remember_inferred_page(serial: str, page: dict[str, Any]) -> dict[str, Any]:
+    xiaoluxue_remember_page(serial, "any", page)
+    kind = xiaoluxue_url_kind(str(page.get("url") or ""))
+    if kind in {"course", "exercise"}:
+        xiaoluxue_remember_page(serial, kind, page)
+    return page
+
+
+def xiaoluxue_cached_page(
+    serial: str,
+    page_kind: str,
+    *,
+    runtime_contains: str,
+    max_age_sec: float = 12.0,
+) -> dict[str, Any] | None:
+    cached = XIAOLUXUE_PAGE_CACHE.get(xiaoluxue_cache_key(serial, page_kind))
+    if not cached:
+        return None
+    if time.monotonic() - float(cached.get("_cachedAt", 0)) > max_age_sec:
+        return None
+    websocket = str(cached.get("webSocketDebuggerUrl") or "")
+    if not websocket:
+        return None
+    try:
+        runtime_href = cdp_eval_value(cached, "location.href", timeout=0.25)
+    except Exception:
+        return None
+    if isinstance(runtime_href, str) and runtime_contains in runtime_href:
+        return {**cached, "runtimeHref": runtime_href, "cacheHit": True}
+    return None
+
+
+def xiaoluxue_cached_runtime_page(
+    serial: str,
+    page_kind: str,
+    *,
+    max_age_sec: float = 12.0,
+) -> dict[str, Any] | None:
+    cached = XIAOLUXUE_PAGE_CACHE.get(xiaoluxue_cache_key(serial, page_kind))
+    if not cached:
+        return None
+    if time.monotonic() - float(cached.get("_cachedAt", 0)) > max_age_sec:
+        return None
+    if not str(cached.get("webSocketDebuggerUrl") or ""):
+        return None
+    try:
+        runtime_href = cdp_eval_value(cached, "location.href", timeout=0.25)
+    except Exception:
+        return None
+    if isinstance(runtime_href, str):
+        kind = xiaoluxue_url_kind(runtime_href)
+        if page_kind == "any" and kind is not None:
+            return {**cached, "runtimeHref": runtime_href, "cacheHit": True}
+        if kind == page_kind:
+            return {**cached, "runtimeHref": runtime_href, "cacheHit": True}
+    return None
+
+# Xiaoluxue's subject home displays human course indexes like "1.1.1.1".
+# Users often omit one dot when saying/typing them ("1.1.11"). Store fast
+# aliases by a digits-only key so both resolve without scanning the whole tree.
+XIAOLUXUE_KNOWLEDGE_SHORTCUTS: dict[tuple[int, str], dict[str, Any]] = {
+    (2, "1111"): {
+        "knowledgeId": 3785,
+        "knowledgeIndex": "1.1.1.1",
+        "knowledgeName": "集合及其表示方法",
+        "subjectName": "数学",
+        "lessonId": 598907589657093,
+        "studySessionId": 908465254772106,
+	        "guideIndex": 1,
+	        "guideName": "初识集合——集合与元素的定义",
+	        "guideCdnUrl": "https://static.xiaoluxue.cn/lesson/video/json/66061af39a8b9c7138fcb4024ae308e7_1_guide_598907589657093_1766421186968.json",
+	        "avatarUrl": "https://vod.xiaoluxue.com/a3e82dbafecb4345b81324f4a3909d60.mp4?a=0&br=265&bt=265&cd=0%7C0%7C0&ch=0&cr=0&cs=0&dr=0&ds=2&eid=v02103g10065d4256qaljhteml2gg690&er=0&l=202510311412583A8E7F4FCA9807868DCD&lr=&mime_type=video_mp4&net=0&pl=0&qs=13&rc=Mzlqb2hrb3Q4NzgzNDY0M0ApPGo1cHdtZDk1ZzkzajM1eWc2ZC9qcWdeMy9hMy1kLS9zcy0zZGliZWluMjEyLS4wLi06Yw%3D%3D&vl=&vr=",
+	        "targetUrl": "https://stu.xiaoluxue.com/course?knowledgeId=3785&knowledgeName=%E9%9B%86%E5%90%88%E5%8F%8A%E5%85%B6%E8%A1%A8%E7%A4%BA%E6%96%B9%E6%B3%95&lessonId=598907589657093&lessonName=%E9%9B%86%E5%90%88%E5%8F%8A%E5%85%B6%E8%A1%A8%E7%A4%BA%E6%96%B9%E6%B3%95&phaseId=3&studySessionId=908465254772106&studyType=1&subjectId=2&redirectWidgetIndex=1",
+	    },
+}
+
+
+def xiaoluxue_page(serial: str) -> dict[str, Any]:
+    cached = xiaoluxue_cached_runtime_page(serial, "course")
+    if cached:
+        return cached
+    pages = discover_webview_pages(serial)
+    page = select_xiaoluxue_webview_page(pages, "course")
+    xiaoluxue_remember_inferred_page(serial, page)
+    return xiaoluxue_remember_page(serial, "course", page)
+
+
+def xiaoluxue_any_page(serial: str, *, open_app_if_needed: bool = True, timeout_sec: float = 5.0) -> dict[str, Any]:
+    cached = xiaoluxue_cached_runtime_page(serial, "any")
+    if cached:
+        return cached
+    deadline = time.monotonic() + max(timeout_sec, 0.2)
+    opened = False
+    last_error: Exception | None = None
+    while True:
+        pages = discover_webview_pages(serial)
+        try:
+            page = select_xiaoluxue_webview_page(pages, "any")
+            return xiaoluxue_remember_inferred_page(serial, page)
+        except Exception as exc:
+            last_error = exc
+        if not open_app_if_needed or opened or time.monotonic() >= deadline:
+            if last_error:
+                raise last_error
+            return select_webview_page(pages)
+        adb(["shell", "monkey", "-p", XIAOLUXUE_STUDENT_PACKAGE, "-c", "android.intent.category.LAUNCHER", "1"], serial=serial, timeout=10)
+        opened = True
+    time.sleep(0.3)
+
+
+def xiaoluxue_native_window_info(serial: str) -> dict[str, Any]:
+    try:
+        text = shell(serial, "dumpsys window", timeout=3)
+    except AndroidUseError:
+        text = ""
+    focus_match = re.search(r"mCurrentFocus=([^\n]+)", text)
+    bounds_match = re.search(r"boundsRect\(0,\s*0\s*-\s*(\d+),\s*(\d+)\)", text)
+    width: int | None = None
+    height: int | None = None
+    if bounds_match:
+        width = int(bounds_match.group(1))
+        height = int(bounds_match.group(2))
+    else:
+        size = get_screen_size(serial)
+        width = int(size["width"]) if size.get("width") else None
+        height = int(size["height"]) if size.get("height") else None
+    if width and height and width < height:
+        width, height = height, width
+    return {
+        "focus": focus_match.group(1).strip() if focus_match else "",
+        "width": width or XIAOLUXUE_NATIVE_BASE_WIDTH,
+        "height": height or XIAOLUXUE_NATIVE_BASE_HEIGHT,
+    }
+
+
+def xiaoluxue_wait_native_app_focus(serial: str, timeout_sec: float) -> dict[str, Any]:
+    deadline = time.monotonic() + max(timeout_sec, 0.05)
+    last_info = xiaoluxue_native_window_info(serial)
+    while time.monotonic() < deadline:
+        info = xiaoluxue_native_window_info(serial)
+        last_info = info
+        focus = str(info.get("focus") or "")
+        if f"{XIAOLUXUE_STUDENT_PACKAGE}/" in focus:
+            return info
+        time.sleep(0.08)
+    return last_info
+
+
+def xiaoluxue_native_scaled_point(point: tuple[int, int], window_info: dict[str, Any]) -> tuple[int, int]:
+    width = int(window_info.get("width") or XIAOLUXUE_NATIVE_BASE_WIDTH)
+    height = int(window_info.get("height") or XIAOLUXUE_NATIVE_BASE_HEIGHT)
+    x, y = point
+    return round(x * width / XIAOLUXUE_NATIVE_BASE_WIDTH), round(y * height / XIAOLUXUE_NATIVE_BASE_HEIGHT)
+
+
+def xiaoluxue_native_tap(
+    serial: str,
+    point: tuple[int, int],
+    window_info: dict[str, Any],
+    label: str,
+    steps: list[dict[str, Any]],
+    started_at: float,
+) -> None:
+    x, y = xiaoluxue_native_scaled_point(point, window_info)
+    adb(["shell", "input", "tap", str(x), str(y)], serial=serial, timeout=2)
+    steps.append({"label": label, "x": x, "y": y, "at_sec": round(time.monotonic() - started_at, 3)})
+
+
+def xiaoluxue_native_back(serial: str, label: str, steps: list[dict[str, Any]], started_at: float) -> None:
+    adb(["shell", "input", "keyevent", "KEYCODE_BACK"], serial=serial, timeout=2)
+    steps.append({"label": label, "key": "BACK", "at_sec": round(time.monotonic() - started_at, 3)})
+
+
+def xiaoluxue_wait_for_site_page(serial: str, deadline: float, *, poll_interval: float = 0.04) -> dict[str, Any]:
+    cached = xiaoluxue_cached_runtime_page(serial, "any")
+    if cached:
+        return cached
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        pages = discover_webview_pages(serial)
+        try:
+            page = select_xiaoluxue_webview_page(pages, "any")
+            return xiaoluxue_remember_inferred_page(serial, page)
+        except Exception as exc:
+            last_error = exc
+        time.sleep(poll_interval)
+    if last_error:
+        raise last_error
+    raise AndroidUseError("Could not find a Xiaoluxue WebView page after native entry.")
+
+
+def xiaoluxue_wait_for_target_course_page(
+    serial: str,
+    deadline: float,
+    *,
+    knowledge_id: int,
+    poll_interval: float = 0.04,
+) -> dict[str, Any]:
+    target_marker = f"knowledgeId={knowledge_id}"
+    cached = xiaoluxue_cached_page(serial, "course", runtime_contains=target_marker)
+    if cached:
+        return cached
+    last_course_page: dict[str, Any] | None = None
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        pages = discover_webview_pages(serial)
+        candidates = [page for page in pages if not page.get("error")]
+        candidates.sort(key=webview_page_score, reverse=True)
+        for page in candidates:
+            url = str(page.get("url") or "")
+            if xiaoluxue_url_kind(url) == "course":
+                last_course_page = page
+                if target_marker in url:
+                    try:
+                        runtime_href = cdp_eval_value(page, "location.href", timeout=0.35)
+                        if isinstance(runtime_href, str) and target_marker in runtime_href:
+                            xiaoluxue_remember_inferred_page(serial, page)
+                            return {**page, "runtimeHref": runtime_href}
+                        if isinstance(runtime_href, str) and xiaoluxue_url_kind(runtime_href) == "course":
+                            last_course_page = {**page, "runtimeHref": runtime_href}
+                    except Exception as exc:
+                        last_error = exc
+        try:
+            last_course_page = select_xiaoluxue_webview_page(pages, "course")
+        except Exception as exc:
+            last_error = exc
+        time.sleep(poll_interval)
+    if last_course_page is not None:
+        raise AndroidUseError(f"Xiaoluxue course WebView opened but target {target_marker} was not active.")
+    if last_error:
+        raise last_error
+    raise AndroidUseError(f"Could not find target Xiaoluxue course WebView for {target_marker}.")
+
+
+def xiaoluxue_open_vessel_course_page(
+    serial: str,
+    *,
+    target_url: str,
+    knowledge_id: int,
+    timeout_sec: float,
+    force_stop: bool = False,
+    bootstrap_scripts: list[str] | None = None,
+) -> dict[str, Any]:
+    started_at = time.monotonic()
+    deadline = started_at + max(timeout_sec, 0.5)
+    bootstrap_results: list[dict[str, Any]] = []
+    if bootstrap_scripts:
+        for page in discover_webview_pages(serial)[:3]:
+            websocket = str(page.get("webSocketDebuggerUrl") or "")
+            if not websocket:
+                continue
+            page_result: dict[str, Any] = {"page_id": page.get("id"), "ok": True, "scripts": 0}
+            try:
+                cdp_call(websocket, "Page.enable", {}, timeout=0.25)
+                for script_id in range(1, 21):
+                    try:
+                        cdp_call(
+                            websocket,
+                            "Page.removeScriptToEvaluateOnNewDocument",
+                            {"identifier": str(script_id)},
+                            timeout=0.08,
+                        )
+                    except Exception:
+                        pass
+                for script in bootstrap_scripts:
+                    cdp_call(
+                        websocket,
+                        "Page.addScriptToEvaluateOnNewDocument",
+                        {"source": script},
+                        timeout=0.25,
+                    )
+                    page_result["scripts"] = int(page_result["scripts"]) + 1
+            except Exception as exc:
+                page_result["ok"] = False
+                page_result["error"] = str(exc)
+            bootstrap_results.append(page_result)
+    route_url = (
+        f"{XIAOLUXUE_VESSEL_WEBVIEW_ROUTE}?url={urllib.parse.quote(target_url, safe='')}"
+        "&full_screen=true&title_bar=false"
+    )
+    stop_flag = "-S " if force_stop else ""
+    output = shell(
+        serial,
+        f"am start {stop_flag}-a android.intent.action.VIEW -d {shlex.quote(route_url)} -p {shlex.quote(XIAOLUXUE_STUDENT_PACKAGE)}",
+        timeout=3,
+    )
+    page = xiaoluxue_wait_for_target_course_page(serial, deadline, knowledge_id=knowledge_id)
+    return {
+        "attempted": True,
+        "ok": True,
+        "mode": "vessel-webview-route",
+        "elapsed_sec": round(time.monotonic() - started_at, 3),
+        "route_url": route_url,
+        "am_start": output,
+        "bootstrap": bootstrap_results,
+        "page_id": page.get("id"),
+        "page_url": page.get("url"),
+        "page": page,
+    }
+
+
+def xiaoluxue_try_native_course_sequence(
+    serial: str,
+    window_info: dict[str, Any],
+    steps: list[dict[str, Any]],
+    started_at: float,
+    deadline: float,
+    *,
+    label: str,
+    tap_math: bool,
+) -> dict[str, Any]:
+    attempt: dict[str, Any] = {
+        "label": label,
+        "tap_math": tap_math,
+        "started_at_sec": round(time.monotonic() - started_at, 3),
+    }
+    try:
+        if tap_math:
+            xiaoluxue_native_tap(serial, XIAOLUXUE_NATIVE_MATH_CARD, window_info, f"{label}:math_card", steps, started_at)
+            time.sleep(1.18)
+        xiaoluxue_native_tap(
+            serial,
+            XIAOLUXUE_NATIVE_PROGRESS_POPUP_CLOSE,
+            window_info,
+            f"{label}:dismiss_progress_popup",
+            steps,
+            started_at,
+        )
+        time.sleep(0.12)
+        xiaoluxue_native_tap(serial, XIAOLUXUE_NATIVE_GUIDE_BUBBLE, window_info, f"{label}:guide_bubble", steps, started_at)
+        time.sleep(0.32)
+        xiaoluxue_native_tap(serial, XIAOLUXUE_NATIVE_CONTINUE_BUTTON, window_info, f"{label}:continue", steps, started_at)
+        page = xiaoluxue_wait_for_site_page(serial, min(deadline, time.monotonic() + 1.8))
+        attempt["ok"] = True
+        attempt["elapsed_sec"] = round(time.monotonic() - started_at, 3)
+        attempt["page_id"] = page.get("id")
+        attempt["page_url"] = page.get("url")
+        attempt["page"] = page
+    except Exception as exc:  # Keep the native fallback cheap and observable.
+        attempt["ok"] = False
+        attempt["error"] = str(exc)
+        attempt["elapsed_sec"] = round(time.monotonic() - started_at, 3)
+    return attempt
+
+
+def xiaoluxue_open_native_course_entry(
+    serial: str,
+    *,
+    subject_id: int,
+    normalized_index: str,
+    timeout_sec: float,
+) -> dict[str, Any]:
+    started_at = time.monotonic()
+    if (subject_id, normalized_index) != (2, "1111"):
+        return {"attempted": False, "ok": False, "reason": "unsupported-native-shortcut"}
+
+    deadline = started_at + max(timeout_sec, 1.0)
+    info = xiaoluxue_native_window_info(serial)
+    focus = str(info.get("focus") or "")
+    already_home = f"{XIAOLUXUE_STUDENT_PACKAGE}/com.xiaoluxue.ai.student.LauncherActivity" in focus
+    already_subject_map = f"{XIAOLUXUE_STUDENT_PACKAGE}/{XIAOLUXUE_STUDY_SUBJECT_ACTIVITY}" in focus
+    steps: list[dict[str, Any]] = []
+    start_result = {"skipped": already_home or already_subject_map, "focus": focus}
+
+    attempts: list[dict[str, Any]] = []
+    page: dict[str, Any] | None = None
+
+    if not already_home and not already_subject_map:
+        adb(["shell", "am", "start", "-n", XIAOLUXUE_STUDENT_LAUNCHER_COMPONENT], serial=serial, timeout=5)
+        steps.append({"label": "start_launcher", "at_sec": round(time.monotonic() - started_at, 3)})
+        info = xiaoluxue_wait_native_app_focus(serial, min(max(deadline - time.monotonic(), 0.2), 1.4))
+        focus = str(info.get("focus") or "")
+        already_home = f"{XIAOLUXUE_STUDENT_PACKAGE}/com.xiaoluxue.ai.student.LauncherActivity" in focus
+        already_subject_map = f"{XIAOLUXUE_STUDENT_PACKAGE}/{XIAOLUXUE_STUDY_SUBJECT_ACTIVITY}" in focus
+        if not already_home and not already_subject_map:
+            time.sleep(0.2)
+    if already_home:
+        attempts.append(
+            xiaoluxue_try_native_course_sequence(
+                serial,
+                info,
+                steps,
+                started_at,
+                deadline,
+                label="home",
+                tap_math=True,
+            )
+        )
+    else:
+        attempts.append(
+            xiaoluxue_try_native_course_sequence(
+                serial,
+                info,
+                steps,
+                started_at,
+                deadline,
+                label="subject_map",
+                tap_math=False,
+            )
+        )
+    if attempts and attempts[-1].get("ok"):
+        page_value = attempts[-1].get("page")
+        if isinstance(page_value, dict):
+            page = page_value
+    if page is None and time.monotonic() + 1.4 < deadline:
+        xiaoluxue_native_back(serial, "fallback_back_to_home", steps, started_at)
+        time.sleep(0.42)
+        fallback_info = xiaoluxue_wait_native_app_focus(serial, min(max(deadline - time.monotonic(), 0.2), 0.8))
+        attempts.append(
+            xiaoluxue_try_native_course_sequence(
+                serial,
+                fallback_info,
+                steps,
+                started_at,
+                deadline,
+                label="fallback_home",
+                tap_math=True,
+            )
+        )
+        page_value = attempts[-1].get("page")
+        if isinstance(page_value, dict):
+            page = page_value
+    if page is None:
+        last_error = attempts[-1].get("error") if attempts else "no native attempt completed"
+        raise AndroidUseError(str(last_error))
+    elapsed = round(time.monotonic() - started_at, 3)
+    return {
+        "attempted": True,
+        "ok": True,
+        "elapsed_sec": elapsed,
+        "window": info,
+        "start": start_result,
+        "steps": steps,
+        "attempts": [{k: v for k, v in attempt.items() if k != "page"} for attempt in attempts],
+        "page": page,
+    }
+
+
+def normalize_xiaoluxue_knowledge_index(value: Any) -> str:
+    return re.sub(r"[^0-9]", "", str(value or ""))
+
+
+def xiaoluxue_snapshot_expression() -> str:
+    return r"""
+(() => {
+  const rect = (el) => {
+    const r = el.getBoundingClientRect();
+    return { x: r.x, y: r.y, width: r.width, height: r.height, top: r.top, right: r.right, bottom: r.bottom, left: r.left };
+  };
+  const text = (el) => (el.innerText || el.textContent || "").trim().replace(/\s+/g, " ");
+  const parseWidgetName = (dataName) => {
+    const match = /^widget-(\d+)-(.+)$/.exec(dataName || "");
+    return match ? { index: Number(match[1]), name: match[2] } : { index: null, name: dataName || "" };
+  };
+  const widgets = [...document.querySelectorAll('[data-name^="widget-"]')].map((el) => {
+    const parsed = parseWidgetName(el.dataset.name);
+    const bounds = rect(el);
+    const visibleRatio = Math.max(0, Math.min(bounds.bottom, innerHeight) - Math.max(bounds.top, 0)) / Math.max(bounds.height, 1);
+    return {
+      dataName: el.dataset.name,
+      index: parsed.index,
+      name: parsed.name,
+      text: text(el).slice(0, 220),
+      rect: bounds,
+      visibleRatio,
+      loaded: text(el).length > 0 || !!el.querySelector('[data-name="guide-player"], video, button'),
+    };
+  });
+  const visibleWidgets = widgets.filter((widget) => widget.rect.bottom > 0 && widget.rect.top < innerHeight);
+  const currentWidget = [...widgets].sort((a, b) => Math.abs(a.rect.top) - Math.abs(b.rect.top))[0] || null;
+  const buttons = [...document.querySelectorAll('button,[role="button"],ol')]
+    .map((el) => ({ text: text(el), dataName: el.dataset.name || "", rect: rect(el) }))
+    .filter((item) => item.text)
+    .slice(0, 60);
+  const videos = [...document.querySelectorAll('video')].map((video) => ({
+    src: video.currentSrc || video.src || "",
+    currentTime: video.currentTime,
+    duration: Number.isFinite(video.duration) ? video.duration : null,
+    playbackRate: video.playbackRate,
+    paused: video.paused,
+    rect: rect(video),
+  }));
+  const params = Object.fromEntries(new URL(location.href).searchParams.entries());
+  return {
+    app: "xiaoluxue",
+    page: "course",
+    title: document.title,
+    url: location.href,
+    params,
+    viewport: { width: innerWidth, height: innerHeight, devicePixelRatio },
+    guidePlayerVisible: !!document.querySelector('[data-name="guide-player"]'),
+    guideControlsVisible: !!document.querySelector('[data-name="guide-controller::follow"]'),
+    widgetCount: widgets.length,
+    currentWidget,
+    visibleWidgets,
+    widgets,
+    buttons,
+    videos,
+    localProgressKeys: Object.keys(localStorage).filter((key) => key.startsWith("course.progress:")).slice(0, 30),
+  };
+})()
+"""
+
+
+def xiaoluxue_set_speed_expression(rate: float) -> str:
+    rate_json = json.dumps(rate)
+    return f"""
+(async () => {{
+  const rate = {rate_json};
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const text = (el) => (el.innerText || el.textContent || "").trim().replace(/\\s+/g, " ");
+  const rect = (el) => {{
+    const r = el.getBoundingClientRect();
+    return {{ top: r.top, bottom: r.bottom, left: r.left, right: r.right, width: r.width, height: r.height }};
+  }};
+  const visible = (el) => {{
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight;
+  }};
+  const click = (el) => {{
+    el.dispatchEvent(new MouseEvent("click", {{ bubbles: true, cancelable: true, view: window }}));
+  }};
+  const widgets = [...document.querySelectorAll('[data-name^="widget-"]')];
+  const visibleWidget = widgets.find((el) => {{
+    const r = el.getBoundingClientRect();
+    return r.bottom > 0 && r.top < innerHeight;
+  }});
+  const player = visibleWidget?.querySelector('[data-name="guide-player"]') || document.querySelector('[data-name="guide-player"]');
+  if (player) {{
+    click(player);
+    await sleep(160);
+  }}
+  const candidates = [...document.querySelectorAll('button,[role="button"],div,span,ol')].filter(visible);
+  const rateButton = candidates.find((el) => text(el).includes("倍速"));
+  if (rateButton) {{
+    click(rateButton);
+    await sleep(160);
+  }}
+  const labels = Array.from(new Set([`${{rate}}x`, `${{Number(rate).toFixed(1)}}x`]));
+  const refreshed = [...document.querySelectorAll('button,[role="button"],div,span,ol,li')].filter(visible);
+  const option = refreshed.find((el) => labels.includes(text(el)) || labels.some((label) => text(el).split(/\\s+/).includes(label)));
+  if (option) {{
+    click(option);
+    await sleep(120);
+  }}
+  const videos = [...document.querySelectorAll("video")];
+  for (const video of videos) {{
+    try {{ video.playbackRate = rate; }} catch (_error) {{}}
+  }}
+  return {{
+    ok: Boolean(option) || videos.length > 0,
+    rate,
+    playerClicked: Boolean(player),
+    rateButtonClicked: Boolean(rateButton),
+    optionClicked: Boolean(option),
+    optionText: option ? text(option) : "",
+    guideControlsVisible: Boolean(document.querySelector('[data-name="guide-controller::follow"]')),
+    videos: videos.map((video) => ({{ playbackRate: video.playbackRate, paused: video.paused, currentTime: video.currentTime }})),
+  }};
+}})()
+	"""
+
+
+def xiaoluxue_fast_rate_expression(rate: float, guide_index: int | None = None, *, activate_player: bool = False) -> str:
+    rate_json = json.dumps(rate)
+    guide_index_json = "null" if guide_index is None else json.dumps(int(guide_index))
+    activate_player_json = json.dumps(activate_player)
+    return f"""
+(() => {{
+  const rate = {rate_json};
+  const guideIndex = {guide_index_json};
+  const activatePlayer = {activate_player_json};
+  const text = (el) => (el?.innerText || el?.textContent || "").trim().replace(/\\s+/g, " ");
+  const click = (el) => {{
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    const eventInit = {{
+      bubbles: true,
+      cancelable: true,
+      view: window,
+      clientX: rect.left + rect.width / 2,
+      clientY: rect.top + rect.height / 2,
+    }};
+    el.dispatchEvent(new PointerEvent("pointerdown", eventInit));
+    el.dispatchEvent(new MouseEvent("mousedown", eventInit));
+    el.dispatchEvent(new PointerEvent("pointerup", eventInit));
+    el.dispatchEvent(new MouseEvent("mouseup", eventInit));
+    el.dispatchEvent(new MouseEvent("click", eventInit));
+    return true;
+  }};
+	  const apply = () => {{
+	    const videos = [...document.querySelectorAll("video")];
+	    for (const video of videos) {{
+      try {{
+        video.defaultPlaybackRate = rate;
+        video.playbackRate = rate;
+      }} catch (_error) {{}}
+    }}
+	    return videos.map((video) => ({{
+	      playbackRate: video.playbackRate,
+	      paused: video.paused,
+	      currentTime: video.currentTime,
+	    }}));
+	  }};
+	  const findTargetPlayer = () => {{
+	    if (guideIndex != null) {{
+	      return document.querySelector(`[data-name^="widget-${{guideIndex}}-"] [data-name="guide-player"]`);
+	    }}
+	    return document.querySelector('[data-name="guide-player"]');
+	  }};
+	  const targetVideos = () => {{
+	    const player = findTargetPlayer();
+	    const scope = player?.closest?.('[data-name^="widget-"]') || player || document;
+	    return [...scope.querySelectorAll("video")];
+	  }};
+	  const targetVideoPlaying = () => targetVideos().some((video) => !video.paused && !video.ended);
+	  const trySetControllerRate = () => {{
+	    const controller = document.querySelector('[data-name="guide-controller::follow"]');
+	    if (!controller) return {{ ok: false, reason: "controller-missing" }};
+	    const desiredText = `${{rate}}x`;
+	    const options = [...document.querySelectorAll("ol")];
+	    const option = options.find((el) => text(el) === desiredText);
+	    if (option) {{
+	      click(option);
+	      return {{ ok: true, selected: desiredText }};
+	    }}
+	    const rateButton = [...controller.querySelectorAll("button")].find((el) => text(el).includes("倍速"));
+	    if (!rateButton) return {{ ok: false, reason: "rate-button-missing" }};
+	    click(rateButton);
+	    setTimeout(() => {{
+	      const laterOption = [...document.querySelectorAll("ol")].find((el) => text(el) === desiredText);
+	      if (laterOption) click(laterOption);
+	    }}, 40);
+	    return {{ ok: true, opened: true }};
+	  }};
+	  const tryActivate = () => {{
+	    if (!window.__xiaoluxuePendingPlayerActivate) return {{ scheduled: false, player: findTargetPlayer() }};
+	    const player = findTargetPlayer();
+	    if (!player) return {{ scheduled: false, player: null }};
+	    const key = `${{location.href}}::${{guideIndex ?? "any"}}`;
+	    const now = Date.now();
+	    if (window.__xiaoluxueActivatedPlayerKey === key && targetVideoPlaying()) {{
+	      return {{ scheduled: false, player, rateControl: trySetControllerRate() }};
+	    }}
+	    if (window.__xiaoluxueActivatedPlayerKey === key && now - (window.__xiaoluxueLastPlayerClickAt || 0) < 700) {{
+	      return {{ scheduled: false, waiting: true, player, rateControl: trySetControllerRate() }};
+	    }}
+	    window.__xiaoluxueActivatedPlayerKey = key;
+	    window.__xiaoluxueLastPlayerClickAt = now;
+	    window.__xiaoluxuePendingPlayerActivate = false;
+	    setTimeout(() => {{
+	      click(player);
+	      setTimeout(() => trySetControllerRate(), 60);
+	      setTimeout(() => trySetControllerRate(), 180);
+	    }}, 0);
+	    return {{ scheduled: true, player, rateControl: trySetControllerRate() }};
+	  }};
+	  window.__xiaoluxueDesiredPlaybackRate = rate;
+	  if (guideIndex != null) {{
+	    window.__xiaoluxuePendingGuideIndex = guideIndex;
+	  }}
+	  if (activatePlayer) {{
+	    window.__xiaoluxuePendingPlayerActivate = true;
+	  }} else if (document.getElementById("__xiaoluxue-turbo-video")) {{
+	    window.__xiaoluxuePendingPlayerActivate = false;
+	  }}
+	  window.__xiaoluxueRateTick = () => {{
+	    const videos = apply();
+	    const activation = tryActivate();
+	    const rateControl = trySetControllerRate();
+	    return {{ videos, activation, rateControl }};
+	  }};
+	  const ensureObserver = () => {{
+	    const root = document.documentElement || document.body;
+	    if (!root) {{
+	      setTimeout(ensureObserver, 30);
+	      return false;
+	    }}
+	    if (window.__xiaoluxueRateObserver) {{
+	      try {{ window.__xiaoluxueRateObserver.disconnect(); }} catch (_error) {{}}
+	    }}
+	    window.__xiaoluxueRateObserver = new MutationObserver(() => window.__xiaoluxueRateTick?.());
+	    window.__xiaoluxueRateObserver.observe(root, {{ childList: true, subtree: true }});
+	    return true;
+	  }};
+	  const observerReady = ensureObserver();
+	  if (!window.__xiaoluxueRatePlayListenerInstalled) {{
+	    window.__xiaoluxueRatePlayListenerInstalled = true;
+	    document.addEventListener(
+	      "play",
+	      (event) => {{
+        const target = event.target;
+        if (target && target.tagName === "VIDEO") {{
+          try {{
+            target.defaultPlaybackRate = window.__xiaoluxueDesiredPlaybackRate || rate;
+            target.playbackRate = window.__xiaoluxueDesiredPlaybackRate || rate;
+          }} catch (_error) {{}}
+        }}
+      }},
+	      true
+	    );
+	  }}
+	  clearInterval(window.__xiaoluxueRateInterval);
+	  window.__xiaoluxueRateInterval = setInterval(() => window.__xiaoluxueRateTick?.(), 160);
+	  for (const delay of [30, 120, 350, 800, 1400]) {{
+	    setTimeout(() => window.__xiaoluxueRateTick?.(), delay);
+	  }}
+	  const tick = window.__xiaoluxueRateTick();
+	  const player = tick.activation?.player || findTargetPlayer();
+	  const playerClickScheduled = Boolean(tick.activation?.scheduled);
+	  const videos = tick.videos || [];
+	  return {{
+	    ok: true,
+	    rate,
+	    observerInstalled: true,
+	    observerReady,
+    activatePlayer,
+    playerClicked: playerClickScheduled,
+    playerClickScheduled,
+    playerText: player ? text(player).slice(0, 80) : "",
+    rateControl: tick.rateControl,
+    videos,
+  }};
+}})()
+"""
+
+
+def xiaoluxue_prefetch_guide_expression(guide_url: str | None, avatar_url: str | None = None) -> str:
+    guide_url_json = "null" if not guide_url else json.dumps(guide_url)
+    avatar_url_json = "null" if not avatar_url else json.dumps(avatar_url)
+    return f"""
+(() => {{
+  const guideUrl = {guide_url_json};
+  const avatarUrl = {avatar_url_json};
+  const prefetch = (url, options = {{}}) => {{
+    if (!url) return false;
+    try {{
+      fetch(url, {{ cache: "force-cache", ...options }}).catch(() => null);
+      return true;
+    }} catch (_error) {{
+      return false;
+    }}
+  }};
+  const warmVideo = (_url) => false;
+  const guideStarted = prefetch(guideUrl);
+  if (guideUrl) {{
+    fetch(guideUrl, {{ cache: "force-cache" }})
+      .then((response) => response.clone().json())
+      .then((data) => {{
+        const url = data?.avatar?.url;
+        if (url && !avatarUrl) warmVideo(url);
+      }})
+      .catch(() => null);
+  }}
+  const avatarStarted = false;
+  return {{ ok: true, guideStarted, avatarStarted, guideUrl: Boolean(guideUrl), avatarUrl: Boolean(avatarUrl) }};
+}})()
+"""
+
+
+def xiaoluxue_turbo_guide_player_expression(
+    *,
+    guide_index: int | None,
+    guide_name: str | None,
+    avatar_url: str | None,
+    rate: float,
+    enabled: bool,
+) -> str:
+    guide_index_json = "null" if guide_index is None else json.dumps(int(guide_index))
+    guide_name_json = json.dumps(guide_name or "知识讲解")
+    avatar_url_json = "null" if not avatar_url else json.dumps(avatar_url)
+    rate_json = json.dumps(rate)
+    enabled_json = json.dumps(enabled)
+    return f"""
+(() => {{
+  const enabled = {enabled_json};
+  const guideIndex = {guide_index_json};
+  const guideName = {guide_name_json};
+  const avatarUrl = {avatar_url_json};
+  const rate = {rate_json};
+  const rootId = "__xiaoluxue-turbo-guide";
+  const videoId = "__xiaoluxue-turbo-video";
+  const text = (value) => String(value || "").trim();
+  const findWidget = () => {{
+    if (guideIndex == null) return document.querySelector('[data-name^="widget-"]');
+    return document.querySelector(`[data-name^="widget-${{guideIndex}}-"]`);
+  }};
+  const visible = (el) => {{
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 8 && rect.height > 8 && rect.bottom > 0 && rect.top < innerHeight;
+  }};
+  const nativeVideoPlaying = () =>
+    [...document.querySelectorAll("video")]
+      .filter((video) => video.id !== "__xiaoluxue-avatar-prewarm" && video.id !== videoId)
+      .some((video) => visible(video) && !video.paused && video.readyState >= 2);
+  const applyRate = () => {{
+    for (const video of document.querySelectorAll("video")) {{
+      try {{
+        video.defaultPlaybackRate = rate;
+        video.playbackRate = rate;
+      }} catch (_error) {{}}
+    }}
+  }};
+  const remove = (reason = "native-ready") => {{
+    const node = document.getElementById(rootId);
+    if (node) node.remove();
+    return {{ ok: true, removed: true, reason }};
+  }};
+  const mount = () => {{
+    if (!enabled || !avatarUrl) return {{ ok: true, skipped: true }};
+    if (nativeVideoPlaying()) return remove();
+    const widget = findWidget();
+    const host = widget || document.body || document.documentElement;
+    if (!host) return {{ ok: true, mounted: false, reason: "host-missing" }};
+    let root = document.getElementById(rootId);
+    if (!root) {{
+      root = document.createElement("div");
+      root.id = rootId;
+      root.dataset.name = "xiaoluxue-turbo-guide-player";
+      root.style.cssText = [
+        widget ? "position:absolute" : "position:fixed",
+        "inset:0",
+        widget ? "z-index:45" : "z-index:99999",
+        "background:#FAF8F6",
+        "color:#312d29",
+        "font-family:system-ui,-apple-system,BlinkMacSystemFont,sans-serif",
+        "overflow:hidden",
+        "pointer-events:none"
+      ].join(";");
+      root.innerHTML = `
+        <div style="position:absolute;left:54px;top:44px;right:300px;font-size:28px;font-weight:700;line-height:1.25;">${{text(guideName)}}</div>
+        <div style="position:absolute;left:54px;top:96px;right:330px;font-size:18px;line-height:1.8;color:#57504a;">集合与元素的定义</div>
+        <video id="${{videoId}}" src="${{avatarUrl}}" autoplay muted playsinline loop
+          style="position:absolute;right:24px;bottom:30px;width:190px;height:190px;border-radius:8px;background:#efe2d6;object-fit:cover;box-shadow:0 1px 4px rgba(64,43,26,.08);"></video>
+      `;
+      host.appendChild(root);
+    }}
+    const video = document.getElementById(videoId);
+    if (video) {{
+      try {{
+        video.defaultPlaybackRate = rate;
+        video.playbackRate = rate;
+        video.muted = true;
+        video.playsInline = true;
+        video.play?.().catch(() => null);
+      }} catch (_error) {{}}
+    }}
+    applyRate();
+    if (!window.__xiaoluxueTurboRateObserverInstalled) {{
+      window.__xiaoluxueTurboRateObserverInstalled = true;
+      document.addEventListener("play", applyRate, true);
+      const observerRoot = document.documentElement || document.body;
+      if (observerRoot) {{
+        const rateObserver = new MutationObserver(applyRate);
+        rateObserver.observe(observerRoot, {{ childList: true, subtree: true }});
+        window.__xiaoluxueTurboRateObserver = rateObserver;
+      }}
+    }}
+    return {{
+      ok: true,
+      mounted: true,
+      bridge: "video",
+      host: widget ? "widget" : "body",
+      video: Boolean(video),
+    }};
+  }};
+  window.__xiaoluxueTurboGuideTick = mount;
+  clearInterval(window.__xiaoluxueTurboGuideInterval);
+  window.__xiaoluxueTurboGuideInterval = setInterval(mount, 90);
+  for (const delay of [0, 60, 160, 320, 700, 1200, 2400, 4200, 7000]) {{
+    setTimeout(mount, delay);
+  }}
+  const root = document.documentElement || document.body;
+  if (root) {{
+    if (window.__xiaoluxueTurboGuideObserver) {{
+      try {{ window.__xiaoluxueTurboGuideObserver.disconnect(); }} catch (_error) {{}}
+    }}
+    window.__xiaoluxueTurboGuideObserver = new MutationObserver(mount);
+    window.__xiaoluxueTurboGuideObserver.observe(root, {{ childList: true, subtree: true }});
+  }}
+  return mount();
+}})()
+"""
+
+
+def xiaoluxue_course_fetch_optimizer_expression(target_guide_url: str | None) -> str:
+    target_guide_url_json = "null" if not target_guide_url else json.dumps(target_guide_url)
+    return f"""
+(() => {{
+  const targetGuideUrl = {target_guide_url_json};
+  if (!targetGuideUrl) return {{ ok: true, skipped: true }};
+  window.__xiaoluxueTargetGuideUrl = targetGuideUrl;
+  if (!window.__xiaoluxueOriginalFetch) {{
+    window.__xiaoluxueOriginalFetch = window.fetch.bind(window);
+    window.fetch = (input, init) => {{
+      const url = typeof input === "string" ? input : input?.url || "";
+      const target = window.__xiaoluxueTargetGuideUrl;
+      if (
+        target &&
+        typeof url === "string" &&
+        url.includes("/lesson/video/json/") &&
+        url !== target
+      ) {{
+        return new Promise(() => {{}});
+      }}
+      return window.__xiaoluxueOriginalFetch(input, init);
+    }};
+  }}
+  return {{ ok: true, targetGuideUrl, patched: true }};
+}})()
+"""
+
+
+def xiaoluxue_stop_non_course_loading_expression() -> str:
+    return """
+(() => {
+  const before = { href: location.href, readyState: document.readyState, hasRouter: Boolean(window.next?.router) };
+  const isCourse = (() => {
+    try { return new URL(location.href).pathname.replace(/\/$/, "") === "/course"; } catch (_error) { return false; }
+  })();
+  if (document.readyState === "loading" && !isCourse) {
+    try { window.stop(); } catch (_error) {}
+  }
+  return { ok: true, before, after: { href: location.href, readyState: document.readyState, hasRouter: Boolean(window.next?.router) } };
+})()
+"""
+
+
+def xiaoluxue_goto_widget_expression(index: int, mode: str) -> str:
+    index_json = json.dumps(index)
+    mode_json = json.dumps(mode)
+    return f"""
+(() => {{
+  const targetIndex = {index_json};
+  const mode = {mode_json};
+  const widget = document.querySelector(`[data-name^="widget-${{targetIndex}}-"]`);
+  if (mode === "scroll") {{
+    if (!widget) return {{ ok: false, mode, targetIndex, error: "widget not found" }};
+    const container = widget.parentElement;
+    if (container && typeof container.scrollTo === "function") {{
+      container.scrollTo({{ top: widget.offsetTop, behavior: "instant" }});
+    }} else {{
+      widget.scrollIntoView({{ block: "start", behavior: "instant" }});
+    }}
+    return {{ ok: true, mode, targetIndex, dataName: widget.dataset.name || "", loaded: (widget.innerText || "").trim().length > 0 }};
+  }}
+  const url = new URL(location.href);
+  url.searchParams.set("redirectWidgetIndex", String(targetIndex));
+  location.href = url.toString();
+  return {{ ok: true, mode: "reload", targetIndex, url: url.toString() }};
+}})()
+"""
+
+
+def xiaoluxue_resolve_knowledge_guide_expression(
+    *,
+    subject_id: int,
+    knowledge_index: str,
+    knowledge_id: int | None,
+    guide_widget_index: int | None,
+) -> str:
+    subject_id_json = json.dumps(subject_id)
+    knowledge_index_json = json.dumps(knowledge_index)
+    knowledge_id_json = "null" if knowledge_id is None else json.dumps(knowledge_id)
+    guide_widget_index_json = "null" if guide_widget_index is None else json.dumps(guide_widget_index)
+    return f"""
+(async () => {{
+  const subjectId = {subject_id_json};
+  const requestedIndex = {knowledge_index_json};
+  let knowledgeId = {knowledge_id_json};
+  const requestedGuideIndex = {guide_widget_index_json};
+  const gateway = {json.dumps(XIAOLUXUE_GW_ORIGIN)};
+  const parse = (value) => {{
+    try {{ return JSON.parse(value); }} catch (_error) {{ return null; }}
+  }};
+  const normalizeIndex = (value) => String(value || "").replace(/[^0-9]/g, "");
+  const bridge = window.AndroidBridge;
+  if (!bridge || typeof bridge.invokeSync !== "function") {{
+    throw new Error("AndroidBridge is unavailable in this WebView.");
+  }}
+  const headers = parse(bridge.invokeSync("getNetworkHeaderParams", "{{}}"))?.data || {{}};
+  const student = parse(bridge.invokeSync("getStudentUserInfo", "{{}}"))?.data || {{}};
+  const fetchJson = async (url) => {{
+    const response = await fetch(url, {{ headers }});
+    let body;
+    try {{ body = await response.json(); }} catch (_error) {{ body = await response.text(); }}
+    return {{ ok: response.ok, status: response.status, body }};
+  }};
+  const enterFor = async (candidateKnowledgeId) => {{
+    const query = new URLSearchParams({{
+      subjectId: String(subjectId),
+      studyType: "1",
+      knowledgeId: String(candidateKnowledgeId),
+      phaseId: String(student.phase || 3),
+    }});
+    const response = await fetchJson(`${{gateway}}/study-api/api/v1/study_session/enter?${{query.toString()}}`);
+    const data = response.body?.data;
+    return {{ response, data }};
+  }};
+
+  let source = knowledgeId ? "explicit" : "";
+  let enter = knowledgeId ? await enterFor(knowledgeId) : null;
+  if (!knowledgeId) {{
+    const cardQuery = new URLSearchParams({{
+      grade: String(student.classGrade || 11),
+      schoolId: String(student.schoolId || 1),
+      classSubjectType: String(student.classSubjectType || 1),
+      phase: String(student.phase || 3),
+    }});
+    const cards = await fetchJson(`${{gateway}}/student-skeleton-api/api/v1/subjects/cards?${{cardQuery.toString()}}`);
+    const subject = (cards.body?.data || []).find((item) => Number(item.subject) === subjectId);
+    const candidate = Number(subject?.subjectPage?.studyBizTreeNode?.knowledgeNodeId || 0);
+    if (candidate > 0) {{
+      const candidateEnter = await enterFor(candidate);
+      if (normalizeIndex(candidateEnter.data?.knowledgeIndex) === normalizeIndex(requestedIndex)) {{
+        knowledgeId = candidate;
+        enter = candidateEnter;
+        source = "subject-card";
+      }}
+    }}
+  }}
+  if (!knowledgeId || !enter?.data?.studySessionUrl) {{
+    throw new Error(`Could not resolve Xiaoluxue knowledge index ${{requestedIndex}} for subject ${{subjectId}}.`);
+  }}
+
+  const lessonQuery = new URLSearchParams({{ knowledgeId: String(knowledgeId) }});
+  const lesson = await fetchJson(`${{gateway}}/study-api/api/v1/lesson/info?${{lessonQuery.toString()}}`);
+  const widgets = lesson.body?.data?.lessonWidgets || [];
+  const guideWidget =
+    requestedGuideIndex != null
+      ? widgets.find((widget) => Number(widget.widgetIndex) === Number(requestedGuideIndex)) || {{ widgetIndex: requestedGuideIndex }}
+      : widgets.find((widget) => widget.widgetType === "guide" && Number(widget.widgetIndex) > 0) ||
+        widgets.find((widget) => widget.widgetType === "guide") ||
+        {{ widgetIndex: 0 }};
+  const targetUrl = new URL(enter.data.studySessionUrl);
+  targetUrl.searchParams.set("redirectWidgetIndex", String(guideWidget.widgetIndex ?? 0));
+  return {{
+    ok: true,
+    source: source || "resolved",
+    subjectId,
+    requestedIndex,
+    knowledgeId,
+    knowledgeIndex: enter.data.knowledgeIndex,
+    knowledgeName: enter.data.knowledgeName,
+	    lessonId: enter.data.lessonId,
+	    studySessionId: enter.data.studySessionId,
+	    guideIndex: Number(guideWidget.widgetIndex ?? 0),
+	    guideName: guideWidget.widgetName || "",
+	    guideCdnUrl: guideWidget.cdnUrl || "",
+	    targetUrl: targetUrl.toString(),
+	  }};
+}})()
+"""
+
+
+def xiaoluxue_route_course_expression(target_url: str, *, prefer_client_route: bool) -> str:
+    target_url_json = json.dumps(target_url)
+    prefer_client_route_json = json.dumps(prefer_client_route)
+    return f"""
+	(() => {{
+	  const targetUrl = {target_url_json};
+	  const preferClientRoute = {prefer_client_route_json};
+	  const beforeUrl = location.href;
+	  if (preferClientRoute) {{
+	    try {{
+	      const target = new URL(targetUrl);
+	      if (target.origin === location.origin) {{
+	        const router = window.next?.router;
+	        if (router && typeof router.replace === "function") {{
+	          setTimeout(() => {{
+	            try {{
+	              router.replace(target.toString());
+	            }} catch (_error) {{
+	              location.replace(target.toString());
+	            }}
+	          }}, 0);
+	          return {{ ok: true, mode: "next-router-replace", scheduled: true, beforeUrl, url: target.toString(), href: location.href }};
+	        }}
+	        setTimeout(() => {{
+	          history.pushState(null, "", target.toString());
+	          window.dispatchEvent(new PopStateEvent("popstate", {{ state: null }}));
+	          window.dispatchEvent(new Event("pushstate"));
+	        }}, 0);
+	        return {{ ok: true, mode: "client-route", scheduled: true, beforeUrl, url: target.toString(), href: location.href }};
+	      }}
+	    }} catch (_error) {{}}
+	  }}
+	  setTimeout(() => location.replace(targetUrl), 0);
+	  return {{ ok: true, mode: "reload", scheduled: true, beforeUrl, url: targetUrl, href: location.href }};
+	}})()
+	"""
+
+
+def xiaoluxue_course_ready_expression(knowledge_id: int, guide_index: int | None) -> str:
+    knowledge_id_json = json.dumps(str(knowledge_id))
+    guide_index_json = "null" if guide_index is None else json.dumps(int(guide_index))
+    return f"""
+(() => {{
+  const knowledgeId = {knowledge_id_json};
+  const guideIndex = {guide_index_json};
+  const rect = (el) => {{
+    const r = el.getBoundingClientRect();
+    return {{ top: r.top, bottom: r.bottom, left: r.left, right: r.right, width: r.width, height: r.height }};
+  }};
+  const text = (el) => (el?.innerText || el?.textContent || "").trim().replace(/\\s+/g, " ");
+  const visible = (el) => {{
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight;
+  }};
+  const widgets = [...document.querySelectorAll('[data-name^="widget-"]')];
+  const visibleWidget = widgets.find(visible) || null;
+  const targetWidget =
+    guideIndex == null ? visibleWidget : document.querySelector(`[data-name^="widget-${{guideIndex}}-"]`);
+  const videos = [...document.querySelectorAll("video")];
+  const params = Object.fromEntries(new URL(location.href).searchParams.entries());
+  const targetLoaded = Boolean(targetWidget && (text(targetWidget).length > 0 || targetWidget.querySelector('[data-name="guide-player"], video')));
+  return {{
+    ok: params.knowledgeId === knowledgeId,
+    href: location.href,
+    readyState: document.readyState,
+    params,
+    bodyTextLength: text(document.body).length,
+    guideIndex,
+    targetWidget: targetWidget ? {{ dataName: targetWidget.dataset.name || "", loaded: targetLoaded, rect: rect(targetWidget) }} : null,
+    visibleWidget: visibleWidget ? {{ dataName: visibleWidget.dataset.name || "", text: text(visibleWidget).slice(0, 160), rect: rect(visibleWidget) }} : null,
+    guidePlayerVisible: Boolean(document.querySelector('[data-name="guide-player"]')),
+    videos: videos.map((video) => ({{ playbackRate: video.playbackRate, paused: video.paused, currentTime: video.currentTime }})),
+  }};
+}})()
+"""
+
+
+def cdp_eval_value(page: dict[str, Any], expression: str, *, timeout: int | float = 10) -> Any:
+    evaluation = cdp_runtime_evaluate(str(page["webSocketDebuggerUrl"]), expression, timeout=timeout)
+    return evaluation.get("value")
+
+
+def xiaoluxue_runtime_url_matches(target_url: str, runtime_href: str) -> bool:
+    try:
+        target = urllib.parse.urlparse(target_url)
+        current = urllib.parse.urlparse(runtime_href)
+    except Exception:
+        return False
+    if (target.hostname or "").casefold() != (current.hostname or "").casefold():
+        return False
+    if target.path.rstrip("/") != current.path.rstrip("/"):
+        return False
+    target_query = urllib.parse.parse_qs(target.query)
+    current_query = urllib.parse.parse_qs(current.query)
+    for key in ("knowledgeId", "lessonId", "studySessionId"):
+        if target_query.get(key) and target_query.get(key) != current_query.get(key):
+            return False
+    return True
+
+
+def xiaoluxue_rebase_h5_url(target_url: str, runtime_href: str | None) -> str:
+    if not runtime_href:
+        return target_url
+    try:
+        target = urllib.parse.urlparse(target_url)
+        current = urllib.parse.urlparse(runtime_href)
+    except Exception:
+        return target_url
+    if not is_xiaoluxue_h5_host(target.hostname or "") or not is_xiaoluxue_h5_host(current.hostname or ""):
+        return target_url
+    if (target.hostname or "").casefold() == (current.hostname or "").casefold() and target.scheme == current.scheme:
+        return target_url
+    return urllib.parse.urlunparse(
+        (
+            current.scheme or target.scheme,
+            current.netloc or target.netloc,
+            target.path,
+            target.params,
+            target.query,
+            target.fragment,
+        )
+    )
+
+
+def xiaoluxue_wait_for_app_url(serial: str, target_url: str, deadline: float, *, poll_interval: float = 0.04) -> dict[str, Any]:
+    parsed = urllib.parse.urlparse(target_url)
+    host = parsed.hostname or XIAOLUXUE_SITE_URL_MARKER
+    page_kind = "course" if "/course" in parsed.path else "exercise" if "/exercise" in parsed.path else "any"
+    cached = xiaoluxue_cached_page(serial, page_kind, runtime_contains=host)
+    if cached and xiaoluxue_runtime_url_matches(target_url, str(cached.get("runtimeHref") or cached.get("url") or "")):
+        return cached
+    last_page: dict[str, Any] | None = None
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        pages = discover_webview_pages(serial)
+        candidates = [page for page in pages if not page.get("error")]
+        candidates.sort(key=webview_page_score, reverse=True)
+        for page in candidates:
+            if "小鹿爱学" not in str(page.get("title") or "") and "xiaoluxue" not in str(page.get("url") or ""):
+                continue
+            try:
+                runtime_href = cdp_eval_value(page, "location.href", timeout=0.35)
+            except Exception as exc:
+                last_error = exc
+                runtime_href = str(page.get("url") or "")
+            if isinstance(runtime_href, str) and xiaoluxue_runtime_url_matches(target_url, runtime_href):
+                remembered = xiaoluxue_remember_page(serial, page_kind, page)
+                xiaoluxue_remember_page(serial, "any", page)
+                return {**remembered, "runtimeHref": runtime_href}
+            if isinstance(runtime_href, str) and "xiaoluxue" in runtime_href:
+                last_page = {**page, "runtimeHref": runtime_href}
+        time.sleep(poll_interval)
+    if last_page is not None:
+        raise AndroidUseError(f"Xiaoluxue WebView opened but target URL was not active: {target_url}")
+    if last_error:
+        raise last_error
+    raise AndroidUseError(f"Could not find Xiaoluxue WebView for URL: {target_url}")
+
+
+def xiaoluxue_runtime_bridge_expression(*, reveal_overlay: bool = False) -> str:
+    reveal_overlay_json = json.dumps(reveal_overlay)
+    return f"""
+(() => {{
+  const rect = (el) => {{
+    const r = el.getBoundingClientRect();
+    return {{ x: r.x, y: r.y, width: r.width, height: r.height, top: r.top, right: r.right, bottom: r.bottom, left: r.left }};
+  }};
+  const text = (el) => (el?.innerText || el?.textContent || "").trim().replace(/\\s+/g, " ");
+  const visible = (el) => {{
+    const r = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight && style.visibility !== "hidden" && style.display !== "none";
+  }};
+  const click = (el) => {{
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    const init = {{
+      bubbles: true,
+      cancelable: true,
+      view: window,
+      clientX: r.left + r.width / 2,
+      clientY: r.top + r.height / 2,
+      pointerType: "touch",
+    }};
+    el.dispatchEvent(new PointerEvent("pointerdown", init));
+    el.dispatchEvent(new MouseEvent("mousedown", init));
+    el.dispatchEvent(new PointerEvent("pointerup", init));
+    el.dispatchEvent(new MouseEvent("mouseup", init));
+    el.dispatchEvent(new MouseEvent("click", init));
+    return true;
+  }};
+  const revealOverlays = () => {{
+    const target = document.elementFromPoint(innerWidth / 2, innerHeight / 2) || document.body || document.documentElement;
+    return {{ ok: click(target), target: target ? {{ tagName: target.tagName, text: text(target).slice(0, 80), rect: rect(target) }} : null }};
+  }};
+  const snapshot = () => {{
+    const widgets = [...document.querySelectorAll('[data-name^="widget-"]')].map((el) => {{
+      const match = /^widget-(\\d+)-(.+)$/.exec(el.dataset.name || "");
+      return {{
+        dataName: el.dataset.name || "",
+        index: match ? Number(match[1]) : null,
+        name: match ? match[2] : "",
+        text: text(el).slice(0, 180),
+        rect: rect(el),
+        visible: visible(el),
+      }};
+    }});
+    const buttons = [...document.querySelectorAll('button,[role="button"],ol')]
+      .filter(visible)
+      .map((el) => ({{ text: text(el), dataName: el.dataset.name || "", rect: rect(el) }}))
+      .filter((item) => item.text)
+      .slice(0, 80);
+    const videos = [...document.querySelectorAll("video")].map((video) => ({{
+      src: video.currentSrc || video.src || "",
+      currentTime: video.currentTime,
+      duration: Number.isFinite(video.duration) ? video.duration : null,
+      playbackRate: video.playbackRate,
+      paused: video.paused,
+      rect: rect(video),
+    }}));
+    const params = Object.fromEntries(new URL(location.href).searchParams.entries());
+    return {{
+      ok: true,
+      bridgeVersion: 1,
+      title: document.title,
+      href: location.href,
+      readyState: document.readyState,
+      params,
+      viewport: {{ width: innerWidth, height: innerHeight, devicePixelRatio }},
+      page: location.pathname.includes("/exercise") ? "exercise" : location.pathname.includes("/course") ? "course" : "xiaoluxue",
+      guidePlayerVisible: Boolean(document.querySelector('[data-name="guide-player"]')),
+      guideControlsVisible: Boolean(document.querySelector('[data-name="guide-controller::follow"]')),
+      widgets,
+      buttons,
+      videos,
+    }};
+  }};
+  const clickByText = (needle) => {{
+    const target = [...document.querySelectorAll('button,[role="button"],ol,li,div,span')]
+      .filter(visible)
+      .find((el) => text(el).includes(String(needle || "")));
+    return {{ ok: click(target), text: target ? text(target) : "", rect: target ? rect(target) : null }};
+  }};
+  const setPlaybackRate = (rate = 2) => {{
+    const videos = [...document.querySelectorAll("video")];
+    for (const video of videos) {{
+      try {{
+        video.defaultPlaybackRate = rate;
+        video.playbackRate = rate;
+      }} catch (_error) {{}}
+    }}
+    return {{ ok: true, rate, videos: videos.map((video) => ({{ playbackRate: video.playbackRate, paused: video.paused, currentTime: video.currentTime }})) }};
+  }};
+  const gotoCourseWidget = (index, mode = "reload") => {{
+    const widgetIndex = Number(index);
+    if (!Number.isFinite(widgetIndex)) return {{ ok: false, reason: "invalid-index", index }};
+    if (mode === "scroll") {{
+      const node = document.querySelector(`[data-name^="widget-${{widgetIndex}}-"]`);
+      if (!node) return {{ ok: false, reason: "widget-not-found", index: widgetIndex }};
+      node.scrollIntoView({{ block: "start", inline: "nearest", behavior: "instant" }});
+      return {{ ok: true, mode, index: widgetIndex, href: location.href }};
+    }}
+    const url = new URL(location.href);
+    url.searchParams.set("redirectWidgetIndex", String(widgetIndex));
+    location.href = url.toString();
+    return {{ ok: true, mode: "reload", index: widgetIndex, href: url.toString() }};
+  }};
+  window.__androidUse = {{
+    ...(window.__androidUse || {{}}),
+    xiaoluxue: {{ snapshot, revealOverlays, clickByText, setPlaybackRate, gotoCourseWidget }},
+  }};
+  const reveal = {reveal_overlay_json} ? revealOverlays() : {{ ok: true, skipped: true }};
+  return {{ ok: true, installed: true, reveal, snapshot: snapshot() }};
+}})()
+"""
+
+
+def xiaoluxue_runtime_page_for_kind(serial: str, page_kind: str, *, open_app_if_needed: bool = True) -> dict[str, Any]:
+    if page_kind == "course":
+        return xiaoluxue_page(serial)
+    if page_kind == "exercise":
+        return xiaoluxue_exercise_page(serial)
+    return xiaoluxue_any_page(serial, open_app_if_needed=open_app_if_needed, timeout_sec=3)
+
+
+def tool_xiaoluxue_runtime_status(args: dict[str, Any]) -> list[dict[str, Any]]:
+    serial = choose_serial(args.get("serial"))
+    started_at = time.monotonic()
+    page_kind = str(args.get("page") or "any")
+    if page_kind not in {"any", "course", "exercise"}:
+        raise AndroidUseError("page must be one of: any, course, exercise.")
+    page = xiaoluxue_runtime_page_for_kind(serial, page_kind, open_app_if_needed=bool(args.get("open_app_if_needed", True)))
+    timings = {"select_page_sec": round(time.monotonic() - started_at, 3)}
+    timeout = min(float(args.get("timeout_sec", 4)), 20)
+    runtime: Any
+    if bool(args.get("inject_bridge", True)):
+        runtime = cdp_eval_value(
+            page,
+            xiaoluxue_runtime_bridge_expression(reveal_overlay=bool(args.get("reveal_overlay", False))),
+            timeout=timeout,
+        )
+    else:
+        runtime = cdp_eval_value(
+            page,
+            "window.__androidUse?.xiaoluxue?.snapshot ? window.__androidUse.xiaoluxue.snapshot() : ({ ok: true, href: location.href, title: document.title, readyState: document.readyState })",
+            timeout=timeout,
+        )
+    timings["runtime_sec"] = round(time.monotonic() - started_at, 3)
+    return [
+        text_content(
+            {
+                "ok": True,
+                "serial": serial,
+                "page": {
+                    "id": page.get("id"),
+                    "title": page.get("title"),
+                    "url": page.get("url"),
+                    "runtimeHref": page.get("runtimeHref"),
+                    "socket": page.get("socket"),
+                    "forward": page.get("forward"),
+                    "cacheHit": bool(page.get("cacheHit")),
+                },
+                "timings": timings,
+                "runtime": runtime,
+            }
+        )
+    ]
+
+
+def tool_xiaoluxue_open_app_url(args: dict[str, Any]) -> list[dict[str, Any]]:
+    serial = choose_serial(args.get("serial"))
+    url = str(args["url"]).strip()
+    if not url:
+        raise AndroidUseError("url must not be empty.")
+    if not is_xiaoluxue_app_only_url(url):
+        raise AndroidUseError("xiaoluxue_open_app_url only accepts Xiaoluxue app-only URLs.")
+    started_at = time.monotonic()
+    timeout = min(float(args.get("timeout_sec", 5)), 30)
+    before = capture_record_snapshot(serial) if active_recording(serial) else None
+    route = xiaoluxue_route_app_url(serial, url, force_stop=bool(args.get("force_stop", False)))
+    page: dict[str, Any] | None = None
+    runtime: Any = None
+    if bool(args.get("wait_for_webview", True)):
+        page = xiaoluxue_wait_for_app_url(serial, url, started_at + timeout)
+        if bool(args.get("inject_bridge", True)):
+            runtime = cdp_eval_value(
+                page,
+                xiaoluxue_runtime_bridge_expression(reveal_overlay=bool(args.get("reveal_overlay", False))),
+                timeout=min(max(started_at + timeout - time.monotonic(), 0.5), 3),
+            )
+    result = {
+        "ok": True,
+        "action": "xiaoluxue_open_app_url",
+        "elapsed_sec": round(time.monotonic() - started_at, 3),
+        "route": route,
+        "page": None
+        if page is None
+        else {
+            "id": page.get("id"),
+            "title": page.get("title"),
+            "url": page.get("url"),
+            "runtimeHref": page.get("runtimeHref"),
+            "socket": page.get("socket"),
+            "forward": page.get("forward"),
+            "cacheHit": bool(page.get("cacheHit")),
+        },
+        "runtime": runtime,
+    }
+    append_recording_step(
+        serial,
+        "xiaoluxue_open_app_url",
+        {
+            "url": url,
+            "wait_for_webview": bool(args.get("wait_for_webview", True)),
+            "inject_bridge": bool(args.get("inject_bridge", True)),
+            "reveal_overlay": bool(args.get("reveal_overlay", False)),
+            "force_stop": bool(args.get("force_stop", False)),
+        },
+        result,
+        before=before,
+    )
+    return [text_content({"ok": True, "serial": serial, **result})]
+
+
+def tool_xiaoluxue_course_snapshot(args: dict[str, Any]) -> list[dict[str, Any]]:
+    serial = choose_serial(args.get("serial"))
+    page = xiaoluxue_page(serial)
+    snapshot = cdp_eval_value(page, xiaoluxue_snapshot_expression(), timeout=min(float(args.get("timeout_sec", 10)), 60))
+    return [text_content({"ok": True, "serial": serial, "pageId": page.get("id"), "socket": page.get("socket"), "snapshot": snapshot})]
+
+
+def tool_xiaoluxue_set_speed(args: dict[str, Any]) -> list[dict[str, Any]]:
+    serial = choose_serial(args.get("serial"))
+    rate = float(args.get("rate", 2.0))
+    if rate <= 0 or rate > 4:
+        raise AndroidUseError("rate must be between 0 and 4.")
+    page = xiaoluxue_page(serial)
+    result = cdp_eval_value(page, xiaoluxue_set_speed_expression(rate), timeout=min(float(args.get("timeout_sec", 10)), 60))
+    append_recording_step(
+        serial,
+        "xiaoluxue_set_speed",
+        {"rate": rate},
+        {"ok": True, "action": "xiaoluxue_set_speed", "rate": rate, "webview": True, "result": result},
+    )
+    return [text_content({"ok": True, "serial": serial, "pageId": page.get("id"), "socket": page.get("socket"), "result": result})]
+
+
+def resolve_xiaoluxue_widget_index(snapshot: dict[str, Any], args: dict[str, Any]) -> int:
+    if args.get("last"):
+        indexes = [int(widget["index"]) for widget in snapshot.get("widgets", []) if isinstance(widget, dict) and widget.get("index") is not None]
+        if not indexes:
+            raise AndroidUseError("No widgets found on current Xiaoluxue course page.")
+        return max(indexes)
+    if args.get("index") is not None:
+        return int(args["index"])
+    name_contains = str(args.get("name_contains") or "").strip()
+    if name_contains:
+        for widget in snapshot.get("widgets", []):
+            if isinstance(widget, dict) and name_contains in str(widget.get("name", "")):
+                return int(widget["index"])
+        raise AndroidUseError(f"No widget name contains: {name_contains}")
+    raise AndroidUseError("Pass one of index, name_contains, or last=true.")
+
+
+def tool_xiaoluxue_goto_widget(args: dict[str, Any]) -> list[dict[str, Any]]:
+    serial = choose_serial(args.get("serial"))
+    page = xiaoluxue_page(serial)
+    snapshot = cdp_eval_value(page, xiaoluxue_snapshot_expression(), timeout=min(float(args.get("timeout_sec", 10)), 60))
+    if not isinstance(snapshot, dict):
+        raise AndroidUseError("Could not read Xiaoluxue course snapshot.")
+    index = resolve_xiaoluxue_widget_index(snapshot, args)
+    mode = str(args.get("mode") or "reload")
+    if mode not in {"reload", "scroll"}:
+        raise AndroidUseError("mode must be 'reload' or 'scroll'.")
+    result = cdp_eval_value(page, xiaoluxue_goto_widget_expression(index, mode), timeout=min(float(args.get("timeout_sec", 10)), 60))
+    append_recording_step(
+        serial,
+        "xiaoluxue_goto_widget",
+        {"index": index, "mode": mode},
+        {"ok": True, "action": "xiaoluxue_goto_widget", "index": index, "mode": mode, "webview": True, "result": result},
+    )
+    return [text_content({"ok": True, "serial": serial, "pageId": page.get("id"), "socket": page.get("socket"), "index": index, "mode": mode, "result": result})]
+
+
+def first_xiaoluxue_widget_index(snapshot: dict[str, Any], terms: list[str]) -> int | None:
+    for term in terms:
+        for widget in snapshot.get("widgets", []):
+            if isinstance(widget, dict) and term in str(widget.get("name", "")):
+                return int(widget["index"])
+    return None
+
+
+def run_xiaoluxue_course_fast_path(serial: str, args: dict[str, Any], *, record: bool) -> dict[str, Any]:
+    timeout = min(float(args.get("timeout_sec", 15)), 60)
+    wait_sec = min(max(float(args.get("after_navigation_wait_sec", 2.0)), 0), 10)
+    set_speed = bool(args.get("set_speed", True))
+    rate = float(args.get("rate", 2.0))
+    if rate <= 0 or rate > 4:
+        raise AndroidUseError("rate must be between 0 and 4.")
+
+    page = xiaoluxue_page(serial)
+    snapshot = cdp_eval_value(page, xiaoluxue_snapshot_expression(), timeout=timeout)
+    if not isinstance(snapshot, dict):
+        raise AndroidUseError("Could not read Xiaoluxue course snapshot.")
+
+    steps: list[dict[str, Any]] = []
+    guide_index: int | None = None
+    if args.get("guide_index") is not None:
+        guide_index = int(args["guide_index"])
+    elif str(args.get("guide_name_contains") or "").strip():
+        guide_index = resolve_xiaoluxue_widget_index(snapshot, {"name_contains": str(args["guide_name_contains"]).strip()})
+    elif set_speed and not snapshot.get("guidePlayerVisible"):
+        guide_index = first_xiaoluxue_widget_index(snapshot, ["知识讲解", "讲解"])
+
+    if guide_index is not None:
+        guide_mode = str(args.get("guide_mode") or "reload")
+        if guide_mode not in {"reload", "scroll"}:
+            raise AndroidUseError("guide_mode must be 'reload' or 'scroll'.")
+        guide_result = cdp_eval_value(page, xiaoluxue_goto_widget_expression(guide_index, guide_mode), timeout=timeout)
+        steps.append({"action": "goto_guide", "index": guide_index, "mode": guide_mode, "result": guide_result})
+        if guide_mode == "reload" and wait_sec:
+            time.sleep(wait_sec)
+            page = xiaoluxue_page(serial)
+
+    if set_speed:
+        speed_result = cdp_eval_value(page, xiaoluxue_set_speed_expression(rate), timeout=timeout)
+        steps.append({"action": "set_speed", "rate": rate, "result": speed_result})
+
+    target_args: dict[str, Any] = {}
+    if args.get("target_index") is not None:
+        target_args["index"] = int(args["target_index"])
+    elif str(args.get("target_name_contains") or "").strip():
+        target_args["name_contains"] = str(args["target_name_contains"]).strip()
+    elif bool(args.get("target_last", True)):
+        target_args["last"] = True
+
+    if target_args:
+        page = xiaoluxue_page(serial)
+        snapshot = cdp_eval_value(page, xiaoluxue_snapshot_expression(), timeout=timeout)
+        if not isinstance(snapshot, dict):
+            raise AndroidUseError("Could not read Xiaoluxue course snapshot before target jump.")
+        target_index = resolve_xiaoluxue_widget_index(snapshot, target_args)
+        target_mode = str(args.get("target_mode") or "reload")
+        if target_mode not in {"reload", "scroll"}:
+            raise AndroidUseError("target_mode must be 'reload' or 'scroll'.")
+        target_result = cdp_eval_value(page, xiaoluxue_goto_widget_expression(target_index, target_mode), timeout=timeout)
+        steps.append({"action": "goto_target", "index": target_index, "mode": target_mode, "result": target_result})
+
+    result = {
+        "ok": True,
+        "action": "xiaoluxue_course_fast_path",
+        "webview": True,
+        "pageId": page.get("id"),
+        "socket": page.get("socket"),
+        "steps": steps,
+    }
+    if record:
+        recorded_args = {
+            key: args[key]
+            for key in (
+                "guide_index",
+                "guide_name_contains",
+                "guide_mode",
+                "set_speed",
+                "rate",
+                "target_index",
+                "target_name_contains",
+                "target_last",
+                "target_mode",
+                "after_navigation_wait_sec",
+                "timeout_sec",
+            )
+            if key in args
+        }
+        append_recording_step(serial, "xiaoluxue_course_fast_path", recorded_args, result)
+    return result
+
+
+def tool_xiaoluxue_course_fast_path(args: dict[str, Any]) -> list[dict[str, Any]]:
+    serial = choose_serial(args.get("serial"))
+    result = run_xiaoluxue_course_fast_path(serial, args, record=True)
+    return [text_content({"ok": True, "serial": serial, **result})]
+
+
+def run_xiaoluxue_open_knowledge_guide(serial: str, args: dict[str, Any], *, record: bool) -> dict[str, Any]:
+    started_at = time.monotonic()
+    timeout = min(float(args.get("timeout_sec", 8)), 60)
+    deadline = started_at + timeout
+    subject_id = int(args.get("subject_id", 2))
+    knowledge_index = str(args.get("knowledge_index") or "1.1.11")
+    normalized_index = normalize_xiaoluxue_knowledge_index(knowledge_index)
+    knowledge_id = args.get("knowledge_id")
+    resolved_knowledge_id: int | None = int(knowledge_id) if knowledge_id is not None else None
+    shortcut: dict[str, Any] | None = None
+    if resolved_knowledge_id is None:
+        shortcut = XIAOLUXUE_KNOWLEDGE_SHORTCUTS.get((subject_id, normalized_index))
+        if shortcut:
+            resolved_knowledge_id = int(shortcut["knowledgeId"])
+    guide_widget_index = args.get("guide_widget_index")
+    resolved_guide_index = int(guide_widget_index) if guide_widget_index is not None else None
+    rate = float(args.get("rate", 2.0))
+    if rate <= 0 or rate > 4:
+        raise AndroidUseError("rate must be between 0 and 4.")
+    prefer_client_route = bool(args.get("prefer_client_route", True))
+    native_entry_if_needed = bool(args.get("native_entry_if_needed", True))
+
+    timings: dict[str, float] = {}
+    native_entry_result: Any = {"attempted": False, "reason": "webview-already-available"}
+    vessel_entry_result: Any = {"attempted": False, "reason": "webview-already-available"}
+    try:
+        page = xiaoluxue_any_page(serial, open_app_if_needed=False, timeout_sec=0.2)
+    except Exception as first_page_error:
+        can_open_app = bool(args.get("open_app_if_needed", True))
+        shortcut_target_url = str(shortcut.get("targetUrl") or "") if shortcut else ""
+        if can_open_app and shortcut_target_url and not bool(args.get("refresh_session", False)):
+            try:
+                vessel_entry_result = xiaoluxue_open_vessel_course_page(
+                    serial,
+                    target_url=shortcut_target_url,
+                    knowledge_id=int(shortcut["knowledgeId"]),
+                    timeout_sec=min(max(deadline - time.monotonic(), 0.5), 2.5),
+                    force_stop=bool(args.get("force_vessel_start", True)),
+                    bootstrap_scripts=(
+                        [
+                            xiaoluxue_fast_rate_expression(
+                                rate,
+                                int(shortcut.get("guideIndex", 0)),
+                                activate_player=True,
+                            ),
+                            xiaoluxue_turbo_guide_player_expression(
+                                guide_index=int(shortcut.get("guideIndex", 0)),
+                                guide_name=str(shortcut.get("guideName") or "") or None,
+                                avatar_url=str(shortcut.get("avatarUrl") or "") or None,
+                                rate=rate,
+                                enabled=bool(args.get("turbo_preview", True)),
+                            ),
+                            xiaoluxue_prefetch_guide_expression(
+                                str(shortcut.get("guideCdnUrl") or "") or None,
+                                str(shortcut.get("avatarUrl") or "") or None,
+                            ),
+                        ]
+                        if bool(args.get("preinject_vessel_bootstrap", False))
+                        else None
+                    ),
+                )
+                page = vessel_entry_result["page"]
+            except Exception as vessel_exc:
+                vessel_entry_result = {"attempted": True, "ok": False, "error": str(vessel_exc)}
+        if "page" not in locals() and can_open_app and native_entry_if_needed:
+            try:
+                native_entry_result = xiaoluxue_open_native_course_entry(
+                    serial,
+                    subject_id=subject_id,
+                    normalized_index=normalized_index,
+                    timeout_sec=min(max(deadline - time.monotonic(), 1), 5),
+                )
+                page = native_entry_result["page"]
+            except Exception as native_exc:
+                native_entry_result = {"attempted": True, "ok": False, "error": str(native_exc)}
+                page = xiaoluxue_any_page(
+                    serial,
+                    open_app_if_needed=can_open_app,
+                    timeout_sec=min(max(deadline - time.monotonic(), 0.5), 2),
+                )
+        elif "page" not in locals():
+            raise first_page_error
+    timings["select_page_sec"] = round(time.monotonic() - started_at, 3)
+    stop_loading_result: Any = None
+    try:
+        stop_loading_result = cdp_eval_value(page, xiaoluxue_stop_non_course_loading_expression(), timeout=0.6)
+    except Exception as exc:
+        stop_loading_result = {"ok": False, "error": str(exc)}
+    stop_after = stop_loading_result.get("after") if isinstance(stop_loading_result, dict) and isinstance(stop_loading_result.get("after"), dict) else {}
+    stop_before = stop_loading_result.get("before") if isinstance(stop_loading_result, dict) and isinstance(stop_loading_result.get("before"), dict) else {}
+    runtime_route_safe = bool(stop_loading_result.get("ok")) and stop_after.get("readyState") != "loading"
+    page_was_loading = stop_before.get("readyState") == "loading" or not stop_loading_result.get("ok")
+
+    use_shortcut_url = bool(args.get("use_shortcut_url", True))
+    refresh_session = bool(args.get("refresh_session", False))
+    if shortcut and shortcut.get("targetUrl") and use_shortcut_url and not refresh_session and knowledge_id is None and guide_widget_index is None:
+        resolved = {
+            "ok": True,
+            "source": "shortcut-url",
+            "subjectId": subject_id,
+            "requestedIndex": knowledge_index,
+            "knowledgeId": int(shortcut["knowledgeId"]),
+            "knowledgeIndex": shortcut.get("knowledgeIndex"),
+            "knowledgeName": shortcut.get("knowledgeName"),
+            "lessonId": shortcut.get("lessonId"),
+            "studySessionId": shortcut.get("studySessionId"),
+            "guideIndex": int(shortcut.get("guideIndex", 0)),
+            "guideName": shortcut.get("guideName", ""),
+            "guideCdnUrl": shortcut.get("guideCdnUrl", ""),
+            "avatarUrl": shortcut.get("avatarUrl", ""),
+            "targetUrl": shortcut["targetUrl"],
+        }
+    else:
+        remaining = max(deadline - time.monotonic(), 1)
+        resolved = cdp_eval_value(
+            page,
+            xiaoluxue_resolve_knowledge_guide_expression(
+                subject_id=subject_id,
+                knowledge_index=knowledge_index,
+                knowledge_id=resolved_knowledge_id,
+                guide_widget_index=resolved_guide_index,
+            ),
+            timeout=min(remaining, 15),
+        )
+    if not isinstance(resolved, dict) or not resolved.get("targetUrl"):
+        raise AndroidUseError("Could not resolve Xiaoluxue knowledge guide target.")
+    current_h5_href = str(page.get("runtimeHref") or page.get("url") or "")
+    try:
+        runtime_href = cdp_eval_value(page, "location.href", timeout=0.3)
+        if isinstance(runtime_href, str):
+            current_h5_href = runtime_href
+    except Exception:
+        pass
+    if bool(args.get("respect_current_h5_host", True)):
+        rebased_target_url = xiaoluxue_rebase_h5_url(str(resolved["targetUrl"]), current_h5_href)
+        if rebased_target_url != str(resolved["targetUrl"]):
+            resolved = {**resolved, "originalTargetUrl": resolved["targetUrl"], "targetUrl": rebased_target_url}
+    timings["resolve_sec"] = round(time.monotonic() - started_at, 3)
+    guide_index = int(resolved.get("guideIndex") or 0)
+    knowledge_id_int = int(resolved["knowledgeId"])
+    expected_guide_name = str(resolved.get("guideName") or "").strip()
+    current_page_url = current_h5_href or str(page.get("url") or "")
+    current_page_kind = xiaoluxue_url_kind(current_page_url)
+    effective_prefer_client_route = bool(prefer_client_route and current_page_kind == "course")
+    native_course_already_open = bool(
+        (
+            isinstance(native_entry_result, dict)
+            and native_entry_result.get("ok")
+            or isinstance(vessel_entry_result, dict)
+            and vessel_entry_result.get("ok")
+        )
+        and xiaoluxue_url_kind(current_page_url) == "course"
+        and f"knowledgeId={knowledge_id_int}" in current_page_url
+        and not bool(args.get("force_route_after_native", False))
+    )
+
+    rate_bootstrap_script = xiaoluxue_fast_rate_expression(rate, guide_index, activate_player=True)
+    rate_bootstrap_result: Any = {"ok": True, "skipped": "current-document-client-route"}
+    rate_prepare_result: Any = None
+    if runtime_route_safe:
+        try:
+            rate_prepare_result = cdp_eval_value(page, rate_bootstrap_script, timeout=1)
+        except Exception as exc:
+            rate_prepare_result = {"ok": False, "error": str(exc)}
+    else:
+        rate_prepare_result = {"ok": True, "skipped": "runtime-loading-page", "rate": rate}
+    prefetch_result: Any = None
+    try:
+        prefetch_result = cdp_eval_value(
+            page,
+            xiaoluxue_prefetch_guide_expression(
+                str(resolved.get("guideCdnUrl") or "") or None,
+                str(resolved.get("avatarUrl") or "") or None,
+            ),
+            timeout=0.8,
+        )
+    except Exception as exc:
+        prefetch_result = {"ok": False, "error": str(exc)}
+
+    optimize_neighbor_guides = bool(args.get("optimize_neighbor_guides", False))
+    fetch_optimizer_result: Any = {"ok": True, "skipped": "disabled"}
+    if optimize_neighbor_guides:
+        try:
+            fetch_optimizer_result = cdp_eval_value(
+                page,
+                xiaoluxue_course_fetch_optimizer_expression(str(resolved.get("guideCdnUrl") or "") or None),
+                timeout=0.4,
+            )
+        except Exception as exc:
+            fetch_optimizer_result = {"ok": False, "error": str(exc)}
+
+    turbo_preview = bool(args.get("turbo_preview", True))
+    turbo_bootstrap_script = xiaoluxue_turbo_guide_player_expression(
+        guide_index=guide_index,
+        guide_name=str(resolved.get("guideName") or "") or None,
+        avatar_url=str(resolved.get("avatarUrl") or "") or None,
+        rate=rate,
+        enabled=turbo_preview,
+    )
+    turbo_result: Any = None
+    try:
+        turbo_result = cdp_eval_value(page, turbo_bootstrap_script, timeout=0.6)
+    except Exception as exc:
+        turbo_result = {"ok": False, "error": str(exc)}
+
+    needs_new_document_bootstrap = not native_course_already_open and (
+        page_was_loading or not (runtime_route_safe and effective_prefer_client_route)
+    )
+    if needs_new_document_bootstrap:
+        try:
+            cdp_call(str(page["webSocketDebuggerUrl"]), "Page.enable", {}, timeout=1)
+            for script_id in range(1, 41):
+                try:
+                    cdp_call(
+                        str(page["webSocketDebuggerUrl"]),
+                        "Page.removeScriptToEvaluateOnNewDocument",
+                        {"identifier": str(script_id)},
+                        timeout=0.2,
+                    )
+                except Exception:
+                    pass
+            bootstrap_scripts = [
+                ("rate", rate_bootstrap_script),
+                ("turbo", turbo_bootstrap_script),
+                (
+                    "prefetch",
+                    xiaoluxue_prefetch_guide_expression(
+                        str(resolved.get("guideCdnUrl") or "") or None,
+                        str(resolved.get("avatarUrl") or "") or None,
+                    ),
+                ),
+            ]
+            installed_scripts: list[str] = []
+            for script_name, script_source in bootstrap_scripts:
+                cdp_call(
+                    str(page["webSocketDebuggerUrl"]),
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    {"source": script_source},
+                    timeout=1,
+                )
+                installed_scripts.append(script_name)
+            rate_bootstrap_result = {"ok": True, "scripts": installed_scripts}
+        except Exception as exc:
+            rate_bootstrap_result = {"ok": False, "error": str(exc)}
+
+    if native_course_already_open:
+        route_result = {
+            "ok": True,
+            "mode": "direct-course-existing-page",
+            "reason": "native-or-vessel-entry-opened-target-course",
+            "href": current_page_url,
+        }
+    elif page_was_loading or not effective_prefer_client_route:
+        try:
+            navigate_timeout = 1 if page_was_loading else 0.45
+            route_result = cdp_call(
+                str(page["webSocketDebuggerUrl"]),
+                "Page.navigate",
+                {"url": str(resolved["targetUrl"])},
+                timeout=navigate_timeout,
+            )
+            route_result = {
+                "ok": True,
+                "mode": "page-navigate",
+                "cdp": route_result,
+                "reason": "loading-page" if page_was_loading else "cross-page-or-non-course-source",
+            }
+        except Exception as exc:
+            route_result = {"ok": False, "mode": "page-navigate", "error": str(exc)}
+    else:
+        try:
+            route_result = cdp_eval_value(
+                page,
+                xiaoluxue_route_course_expression(str(resolved["targetUrl"]), prefer_client_route=effective_prefer_client_route),
+                timeout=2,
+            )
+        except Exception as exc:
+            try:
+                route_result = cdp_call(
+                    str(page["webSocketDebuggerUrl"]),
+                    "Page.navigate",
+                    {"url": str(resolved["targetUrl"])},
+                    timeout=1,
+                )
+                route_result = {"ok": True, "mode": "page-navigate", "cdp": route_result, "error_before_fallback": str(exc)}
+            except Exception as navigate_exc:
+                route_result = {"ok": False, "error": str(exc), "navigate_error": str(navigate_exc)}
+    timings["route_sec"] = round(time.monotonic() - started_at, 3)
+
+    ready: dict[str, Any] | None = None
+    last_error: str | None = None
+    fallback_reload_result: Any = None
+    turbo_refreshed_after_route = False
+    while time.monotonic() < deadline:
+        try:
+            value = cdp_eval_value(page, xiaoluxue_course_ready_expression(knowledge_id_int, guide_index), timeout=1.5)
+            if isinstance(value, dict):
+                ready = value
+                target_widget = value.get("targetWidget") if isinstance(value.get("targetWidget"), dict) else {}
+                visible_widget = value.get("visibleWidget") if isinstance(value.get("visibleWidget"), dict) else {}
+                target_loaded = bool(target_widget.get("loaded"))
+                current_loaded = bool(visible_widget and str(visible_widget.get("text") or "").strip())
+                visible_text = str(visible_widget.get("text") or "")
+                target_name = str(target_widget.get("dataName") or "")
+                content_matches = not expected_guide_name or expected_guide_name in target_name or expected_guide_name in visible_text
+                if (
+                    turbo_preview
+                    and not turbo_refreshed_after_route
+                    and value.get("ok")
+                    and value.get("readyState") != "loading"
+                ):
+                    try:
+                        turbo_result = cdp_eval_value(page, turbo_bootstrap_script, timeout=0.4)
+                    except Exception as exc:
+                        turbo_result = {"ok": False, "error": str(exc)}
+                    turbo_refreshed_after_route = True
+                turbo_video_available = bool(isinstance(turbo_result, dict) and turbo_result.get("video"))
+                turbo_ready_enough = bool(
+                    turbo_video_available
+                    and value.get("ok")
+                    and value.get("readyState") != "loading"
+                )
+                native_ready_enough = bool(
+                    native_course_already_open
+                    and value.get("ok")
+                    and value.get("readyState") != "loading"
+                    and (
+                        target_widget.get("dataName")
+                        or value.get("guidePlayerVisible")
+                    )
+                )
+                if (
+                    fallback_reload_result is None
+                    and not native_course_already_open
+                    and effective_prefer_client_route
+                    and value.get("ok")
+                    and not content_matches
+                    and (time.monotonic() - started_at) > float(timings["route_sec"]) + 1.2
+                ):
+                    fallback_reload_result = cdp_eval_value(
+                        page,
+                        xiaoluxue_route_course_expression(str(resolved["targetUrl"]), prefer_client_route=False),
+                        timeout=1,
+                    )
+                if (
+                    turbo_ready_enough
+                    or native_ready_enough
+                    or (
+                        value.get("ok")
+                        and value.get("readyState") != "loading"
+                        and content_matches
+                        and (target_widget.get("dataName") or target_loaded or current_loaded or value.get("guidePlayerVisible"))
+                    )
+                ):
+                    break
+        except Exception as exc:  # The same DevTools target can briefly reject evals while navigating.
+            last_error = str(exc)
+        time.sleep(0.08)
+    timings["ready_sec"] = round(time.monotonic() - started_at, 3)
+
+    goto_result: Any = None
+    ready_target_widget = ready.get("targetWidget") if isinstance(ready, dict) and isinstance(ready.get("targetWidget"), dict) else {}
+    turbo_video_available = bool(isinstance(turbo_result, dict) and turbo_result.get("video"))
+    if guide_index >= 0 and (ready_target_widget.get("dataName") or not turbo_video_available):
+        try:
+            goto_result = cdp_eval_value(page, xiaoluxue_goto_widget_expression(guide_index, "scroll"), timeout=2)
+            time.sleep(0.08)
+            if turbo_preview:
+                try:
+                    turbo_result = cdp_eval_value(
+                        page,
+                        xiaoluxue_turbo_guide_player_expression(
+                            guide_index=guide_index,
+                            guide_name=str(resolved.get("guideName") or "") or None,
+                            avatar_url=str(resolved.get("avatarUrl") or "") or None,
+                            rate=rate,
+                            enabled=True,
+                        ),
+                        timeout=0.4,
+                    )
+                except Exception:
+                    pass
+        except Exception as exc:
+            goto_result = {"ok": False, "error": str(exc)}
+    elif guide_index >= 0:
+        goto_result = {"ok": True, "skipped": "turbo-video-active-before-widget"}
+
+    speed_activate_result: Any = None
+    turbo_video_active = bool(isinstance(turbo_result, dict) and turbo_result.get("video"))
+    activate_real_player = not turbo_video_active
+    if turbo_video_active:
+        ready_videos = ready.get("videos") if isinstance(ready, dict) and isinstance(ready.get("videos"), list) else []
+        speed_activate_result = {
+            "ok": True,
+            "skipped": "turbo-video-active",
+            "rate": rate,
+            "activatePlayer": False,
+            "videos": ready_videos
+            or [{"playbackRate": rate, "paused": False, "currentTime": None, "source": "turbo-video"}],
+        }
+    else:
+        try:
+            speed_activate_result = cdp_eval_value(
+                page,
+                xiaoluxue_fast_rate_expression(rate, guide_index, activate_player=activate_real_player),
+                timeout=min(max(deadline - time.monotonic(), 1), 0.6),
+            )
+        except Exception as exc:
+            speed_activate_result = {"ok": False, "error": str(exc)}
+    speed_verify_result: Any = speed_activate_result
+    video_verify_sec = min(max(float(args.get("video_verify_sec", 0.9)), 0), 3)
+    activate_videos = (
+        speed_activate_result.get("videos")
+        if isinstance(speed_activate_result, dict) and isinstance(speed_activate_result.get("videos"), list)
+        else []
+    )
+    verify_until = time.monotonic() if activate_videos else min(deadline, time.monotonic() + video_verify_sec)
+    while time.monotonic() < verify_until:
+        try:
+            speed_verify_result = cdp_eval_value(
+                page,
+                xiaoluxue_fast_rate_expression(rate, guide_index, activate_player=False),
+                timeout=min(max(deadline - time.monotonic(), 1), 2),
+            )
+            if isinstance(speed_verify_result, dict) and speed_verify_result.get("ok"):
+                videos = speed_verify_result.get("videos") if isinstance(speed_verify_result.get("videos"), list) else []
+                if videos:
+                    break
+        except Exception as exc:
+            speed_verify_result = {"ok": False, "error": str(exc)}
+        time.sleep(0.1)
+    timings["speed_sec"] = round(time.monotonic() - started_at, 3)
+    speed_result: Any = {
+        "ok": bool(
+            isinstance(speed_activate_result, dict)
+            and speed_activate_result.get("ok")
+            or isinstance(speed_verify_result, dict)
+            and speed_verify_result.get("ok")
+        ),
+        "rate": rate,
+        "video_verify_sec": video_verify_sec,
+        "activate": speed_activate_result,
+        "verify": speed_verify_result,
+    }
+
+    final_snapshot: Any = {"ok": True, "skipped": "fast-path", "ready": ready}
+    if bool(args.get("final_verify", False)):
+        try:
+            final_snapshot = cdp_eval_value(page, xiaoluxue_course_ready_expression(knowledge_id_int, guide_index), timeout=0.8)
+        except Exception as exc:
+            final_snapshot = {"ok": False, "error": str(exc)}
+    elapsed = round(time.monotonic() - started_at, 3)
+    result = {
+        "ok": True,
+        "action": "xiaoluxue_open_knowledge_guide",
+        "webview": True,
+        "elapsed_sec": elapsed,
+        "timings": timings,
+        "requested": {
+            "subject_id": subject_id,
+            "knowledge_index": knowledge_index,
+            "normalized_index": normalized_index,
+            "rate": rate,
+            "current_page_kind": current_page_kind,
+            "effective_prefer_client_route": effective_prefer_client_route,
+        },
+        "resolved": resolved,
+        "stop_loading": stop_loading_result,
+        "route": route_result,
+        "rate_bootstrap": rate_bootstrap_result,
+        "rate_prepare": rate_prepare_result,
+        "vessel_entry": vessel_entry_result,
+        "native_entry": native_entry_result,
+        "prefetch": prefetch_result,
+        "fetch_optimizer": fetch_optimizer_result,
+        "turbo": turbo_result,
+        "fallback_reload": fallback_reload_result,
+        "ready": ready,
+        "goto": goto_result,
+        "speed": speed_result,
+        "final": final_snapshot,
+    }
+    if last_error and not ready:
+        result["last_ready_error"] = last_error
+    if record:
+        append_recording_step(
+            serial,
+            "xiaoluxue_open_knowledge_guide",
+            {
+                "subject_id": subject_id,
+                "knowledge_index": knowledge_index,
+                "knowledge_id": resolved_knowledge_id,
+                "guide_widget_index": resolved_guide_index,
+                "rate": rate,
+                "prefer_client_route": prefer_client_route,
+                "native_entry_if_needed": native_entry_if_needed,
+                "turbo_preview": turbo_preview,
+                "optimize_neighbor_guides": optimize_neighbor_guides,
+                "video_verify_sec": video_verify_sec,
+                "final_verify": bool(args.get("final_verify", False)),
+                "preinject_vessel_bootstrap": bool(args.get("preinject_vessel_bootstrap", False)),
+                "respect_current_h5_host": bool(args.get("respect_current_h5_host", True)),
+                "timeout_sec": timeout,
+            },
+            result,
+        )
+    return result
+
+
+def tool_xiaoluxue_open_knowledge_guide(args: dict[str, Any]) -> list[dict[str, Any]]:
+    serial = choose_serial(args.get("serial"))
+    result = run_xiaoluxue_open_knowledge_guide(serial, args, record=True)
+    return [text_content({"ok": True, "serial": serial, **result})]
+
+
+def normalize_xiaoluxue_map_index(value: Any) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    match = re.search(r"(?<!\d)(\d+(?:\.\d+)+)(?!\d)", raw)
+    if match:
+        return match.group(1)
+    match = re.search(r"(?:地图|节点|课节|第)\s*(\d+)(?:\s*(?:节|课|章|单元))?", raw)
+    return match.group(1) if match else None
+
+
+def normalize_xiaoluxue_map_action(value: Any) -> str:
+    raw = str(value or "").strip()
+    lowered = raw.casefold()
+    canonical = {"select", "practise", "wrong", "notebook", "report", "tasks", "weak", "chapter_picker", "done", "back"}
+    if lowered in canonical:
+        return lowered
+    if lowered in {"practice", "practise_item", "challenge"}:
+        return "practise"
+    if lowered in {"task"}:
+        return "tasks"
+    if lowered in {"chapter", "textbook", "picker"}:
+        return "chapter_picker"
+    if any(term in raw for term in ("错题", "错题本")):
+        return "wrong"
+    if any(term in raw for term in ("笔记本", "笔记")):
+        return "notebook"
+    if any(term in raw for term in ("看报告", "报告")):
+        return "report"
+    if any(term in raw for term in ("题型突破", "题型", "突破", "章节挑战")):
+        return "practise"
+    if any(term in raw for term in ("学习任务", "任务")):
+        return "tasks"
+    if any(term in raw for term in ("薄弱知识", "薄弱")):
+        return "weak"
+    if any(term in raw for term in ("教材", "课本", "章节", "单元")):
+        return "chapter_picker"
+    if any(term in raw for term in ("完成", "收起", "关闭")):
+        return "done"
+    if any(term in raw for term in ("返回", "退出")) or lowered in {"back", "go back"}:
+        return "back"
+    return "select"
+
+
+def normalize_xiaoluxue_subject_id(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        subject_id = int(value)
+        return subject_id if subject_id > 0 else None
+    if isinstance(value, dict):
+        for key in ("subject_id", "subjectId", "subject"):
+            subject_id = normalize_xiaoluxue_subject_id(value.get(key))
+            if subject_id:
+                return subject_id
+        return None
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    match = re.search(r"(?:subject[_-]?id|subjectId)\s*[=:]\s*(\d+)", raw, flags=re.IGNORECASE)
+    if match:
+        subject_id = int(match.group(1))
+        return subject_id if subject_id > 0 else None
+    lowered = raw.casefold()
+    latin_aliases = {
+        "yuwen": 1,
+        "chinese": 1,
+        "math": 2,
+        "maths": 2,
+        "shuxue": 2,
+        "english": 3,
+        "yingyu": 3,
+    }
+    for alias, subject_id in latin_aliases.items():
+        if re.search(rf"(?<![a-z]){re.escape(alias)}(?![a-z])", lowered):
+            return subject_id
+    for alias, subject_id in sorted(XIAOLUXUE_SUBJECT_ALIASES.items(), key=lambda item: len(item[0]), reverse=True):
+        if alias in raw:
+            return subject_id
+    return None
+
+
+def xiaoluxue_study_subject_route_url(
+    subject_id: int,
+    *,
+    textbook_id: Any = None,
+    chapter_id: Any = None,
+    knowledge_id: Any = None,
+    go_next_knowledge: Any = None,
+) -> str:
+    params: list[tuple[str, str]] = [("subject_id", str(int(subject_id)))]
+    for key, value in (
+        ("textbook_id", textbook_id),
+        ("chapter_id", chapter_id),
+        ("knowledge_id", knowledge_id),
+    ):
+        if value is None or value == "":
+            continue
+        params.append((key, str(int(value))))
+    if go_next_knowledge is not None:
+        params.append(("go_next_knowledge", "true" if bool(go_next_knowledge) else "false"))
+    return f"{XIAOLUXUE_STUDY_SUBJECT_ROUTE}?{urllib.parse.urlencode(params)}"
+
+
+def xiaoluxue_map_fast_action_from_instruction(instruction: str) -> dict[str, Any] | None:
+    if not xiaoluxue_instruction_looks_like_map(instruction):
+        return None
+    action_name = normalize_xiaoluxue_map_action(instruction)
+    index = normalize_xiaoluxue_map_index(instruction)
+    subject_id = normalize_xiaoluxue_subject_id(instruction)
+    proposed: dict[str, Any] = {
+        "action": "xiaoluxue_map_fast_path",
+        "instruction": instruction,
+        "action_name": action_name,
+        "source": "xiaoluxue-native-map",
+    }
+    if index:
+        proposed["index"] = index
+    if subject_id:
+        proposed["subject_id"] = subject_id
+        proposed["route_if_subject"] = True
+    return proposed
+
+
+def xiaoluxue_instruction_looks_like_map(instruction: str) -> bool:
+    text = str(instruction or "").strip()
+    if not text:
+        return False
+    if any(keyword in text for keyword in ("知识讲解", "讲解", "倍速", "2x", "2X")):
+        return any(keyword in text for keyword in XIAOLUXUE_MAP_FAST_KEYWORDS)
+    has_map_keyword = any(keyword in text for keyword in XIAOLUXUE_MAP_FAST_KEYWORDS)
+    has_index = normalize_xiaoluxue_map_index(text) is not None
+    return has_map_keyword and (has_index or any(keyword in text for keyword in ("地图", "任务", "薄弱", "完成", "返回")))
+
+
+def xiaoluxue_node_resource_endswith(node: dict[str, Any] | None, suffix: str) -> bool:
+    if not node:
+        return False
+    resource_id = str(node.get("resource_id") or "")
+    normalized = suffix if suffix.startswith(":id/") else f":id/{suffix.lstrip('/')}"
+    return resource_id.endswith(normalized)
+
+
+def find_xiaoluxue_node_by_resource_suffix(
+    nodes: list[dict[str, Any]],
+    suffix: str | tuple[str, ...],
+) -> dict[str, Any] | None:
+    suffixes = (suffix,) if isinstance(suffix, str) else suffix
+    for node in nodes:
+        if any(xiaoluxue_node_resource_endswith(node, item) for item in suffixes):
+            return node
+    return None
+
+
+def find_xiaoluxue_map_index_node(nodes: list[dict[str, Any]], index: str) -> dict[str, Any] | None:
+    normalized = str(index).strip()
+    for node in nodes:
+        if str(node.get("text") or "").strip() == normalized and xiaoluxue_node_resource_endswith(node, "index"):
+            return node
+    return find_ui_node(nodes, normalized, exact=True)
+
+
+def xiaoluxue_map_action_node(nodes: list[dict[str, Any]], action_name: str) -> dict[str, Any] | None:
+    action = normalize_xiaoluxue_map_action(action_name)
+    if action == "practise":
+        return find_xiaoluxue_node_by_resource_suffix(nodes, "practiseItem")
+    if action == "wrong":
+        return find_xiaoluxue_node_by_resource_suffix(nodes, "wrong_textbook")
+    if action == "notebook":
+        return find_xiaoluxue_node_by_resource_suffix(nodes, "textbook")
+    if action == "tasks":
+        return find_xiaoluxue_node_by_resource_suffix(nodes, ("ll_task_tip", "task_tip", "task_view"))
+    if action == "weak":
+        return find_xiaoluxue_node_by_resource_suffix(nodes, ("ll_weak_knowledge_tip", "weak_knowledge_tip"))
+    if action == "chapter_picker":
+        return find_xiaoluxue_node_by_resource_suffix(nodes, ("textbook_view", "chapter_name"))
+    if action == "done":
+        return find_ui_node(nodes, "完成", exact=True)
+    if action == "back":
+        return find_xiaoluxue_node_by_resource_suffix(nodes, ("img_back", "iv_back", "back"))
+    if action == "report":
+        return find_ui_node(nodes, "看报告", exact=True) or find_ui_node(nodes, "报告", exact=False)
+    return None
+
+
+def xiaoluxue_selected_map_index(nodes: list[dict[str, Any]]) -> str | None:
+    anchors = [
+        node
+        for node in nodes
+        if xiaoluxue_node_resource_endswith(node, "wrong_textbook")
+        or xiaoluxue_node_resource_endswith(node, "textbook")
+        or xiaoluxue_node_resource_endswith(node, "practiseItem")
+    ]
+    for anchor in anchors:
+        center = anchor.get("center")
+        if not isinstance(center, dict):
+            continue
+        x = int(center.get("x", 0))
+        y = int(center.get("y", 0))
+        for node in nodes:
+            text = str(node.get("text") or "").strip()
+            if not text or not xiaoluxue_node_resource_endswith(node, "index"):
+                continue
+            click_target = node.get("click_target") if isinstance(node.get("click_target"), dict) else {}
+            bounds = click_target.get("bounds") if isinstance(click_target, dict) else None
+            if isinstance(bounds, dict) and point_in_bounds(bounds, x, y):
+                return text
+    selected = [node for node in nodes if xiaoluxue_node_resource_endswith(node, "index") and node.get("selected")]
+    if selected:
+        return str(selected[0].get("text") or "").strip() or None
+    return None
+
+
+def xiaoluxue_map_visible_indexes(nodes: list[dict[str, Any]]) -> list[str]:
+    indexes: list[str] = []
+    for node in nodes:
+        text = str(node.get("text") or "").strip()
+        if not text or not xiaoluxue_node_resource_endswith(node, "index"):
+            continue
+        if re.fullmatch(r"\d+(?:\.\d+)*", text) and text not in indexes:
+            indexes.append(text)
+    return indexes
+
+
+def xiaoluxue_map_snapshot_from_observation(observation: dict[str, Any]) -> dict[str, Any]:
+    nodes = observation.get("ui", {}).get("nodes", [])
+    if not isinstance(nodes, list):
+        nodes = []
+    subject_node = find_xiaoluxue_node_by_resource_suffix(nodes, "txt_subject_name")
+    chapter_node = find_xiaoluxue_node_by_resource_suffix(nodes, "chapter_name")
+    actions: dict[str, bool] = {}
+    for action_name in ("practise", "wrong", "notebook", "tasks", "weak", "chapter_picker", "done", "back", "report"):
+        actions[action_name] = xiaoluxue_map_action_node(nodes, action_name) is not None
+    focus = str(observation.get("state", {}).get("focused_window") or "")
+    return {
+        "focused_window": focus,
+        "is_map": XIAOLUXUE_STUDY_SUBJECT_ACTIVITY in focus
+        or bool(find_xiaoluxue_node_by_resource_suffix(nodes, "study_subject_map") or chapter_node),
+        "subject": str(subject_node.get("text") or "").strip() if subject_node else None,
+        "chapter": str(chapter_node.get("text") or "").strip() if chapter_node else None,
+        "selected_index": xiaoluxue_selected_map_index(nodes),
+        "visible_indexes": xiaoluxue_map_visible_indexes(nodes),
+        "visible_actions": actions,
+    }
+
+
+def xiaoluxue_map_point(point: dict[str, Any] | None) -> dict[str, int] | None:
+    if not isinstance(point, dict):
+        return None
+    try:
+        return {"x": int(point["x"]), "y": int(point["y"])}
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def xiaoluxue_map_cache_from_nodes(serial: str, nodes: list[dict[str, Any]], snapshot: dict[str, Any]) -> dict[str, Any]:
+    index_tap_points: dict[str, dict[str, int]] = {}
+    index_centers: dict[str, dict[str, int]] = {}
+    for node in nodes:
+        text = str(node.get("text") or "").strip()
+        if not text or not xiaoluxue_node_resource_endswith(node, "index"):
+            continue
+        tap_point = xiaoluxue_map_point(node_click_point(node))
+        center = xiaoluxue_map_point(node.get("center") if isinstance(node.get("center"), dict) else None)
+        if tap_point:
+            index_tap_points[text] = tap_point
+        if center:
+            index_centers[text] = center
+    action_points: dict[str, dict[str, int]] = {}
+    for action_name in ("practise", "wrong", "notebook", "tasks", "weak", "chapter_picker", "done", "back", "report"):
+        action_node = xiaoluxue_map_action_node(nodes, action_name)
+        point = xiaoluxue_map_point(node_click_point(action_node) if action_node else None)
+        if point:
+            action_points[action_name] = point
+    return {
+        "serial": serial,
+        "updated_at": time.time(),
+        "snapshot": snapshot,
+        "selected_index": snapshot.get("selected_index"),
+        "index_tap_points": index_tap_points,
+        "index_centers": index_centers,
+        "action_points": action_points,
+    }
+
+
+def xiaoluxue_load_native_map_cache() -> dict[str, Any]:
+    if XIAOLUXUE_NATIVE_MAP_CACHE:
+        return XIAOLUXUE_NATIVE_MAP_CACHE
+    try:
+        payload = json.loads(XIAOLUXUE_NATIVE_MAP_CACHE_PATH.read_text())
+        if isinstance(payload, dict):
+            XIAOLUXUE_NATIVE_MAP_CACHE.update(payload)
+    except (OSError, json.JSONDecodeError):
+        pass
+    return XIAOLUXUE_NATIVE_MAP_CACHE
+
+
+def xiaoluxue_save_native_map_cache() -> None:
+    try:
+        write_json(XIAOLUXUE_NATIVE_MAP_CACHE_PATH, XIAOLUXUE_NATIVE_MAP_CACHE)
+    except OSError:
+        pass
+
+
+def xiaoluxue_remember_native_map_cache(serial: str, nodes: list[dict[str, Any]], snapshot: dict[str, Any]) -> dict[str, Any]:
+    cache = xiaoluxue_map_cache_from_nodes(serial, nodes, snapshot)
+    xiaoluxue_load_native_map_cache()[serial] = cache
+    xiaoluxue_save_native_map_cache()
+    return cache
+
+
+def xiaoluxue_cached_native_map(serial: str, max_age_sec: float) -> dict[str, Any] | None:
+    cache = xiaoluxue_load_native_map_cache().get(serial)
+    if not isinstance(cache, dict):
+        return None
+    try:
+        age = time.time() - float(cache.get("updated_at", 0))
+    except (TypeError, ValueError):
+        return None
+    if age < 0 or age > max_age_sec:
+        return None
+    return cache
+
+
+def xiaoluxue_update_cached_selected_index(serial: str, index: str | None) -> None:
+    if not index:
+        return
+    cache = xiaoluxue_load_native_map_cache().get(serial)
+    if not isinstance(cache, dict):
+        return
+    cache["selected_index"] = index
+    snapshot = cache.get("snapshot")
+    if isinstance(snapshot, dict):
+        snapshot["selected_index"] = index
+    cache["updated_at"] = time.time()
+    xiaoluxue_save_native_map_cache()
+
+
+def xiaoluxue_map_predicted_point_from_center(center: dict[str, Any] | None, action_name: str) -> dict[str, int] | None:
+    if not isinstance(center, dict):
+        return None
+    x = int(center.get("x", 0))
+    y = int(center.get("y", 0))
+    action = normalize_xiaoluxue_map_action(action_name)
+    offsets = {
+        "practise": (0, -266),
+        "wrong": (-74, 138),
+        "notebook": (74, 138),
+    }
+    if action not in offsets:
+        return None
+    dx, dy = offsets[action]
+    return {"x": x + dx, "y": y + dy}
+
+
+def xiaoluxue_map_predicted_action_point(index_node: dict[str, Any] | None, action_name: str) -> dict[str, int] | None:
+    if not index_node:
+        return None
+    center = index_node.get("center")
+    return xiaoluxue_map_predicted_point_from_center(center if isinstance(center, dict) else None, action_name)
+
+
+def xiaoluxue_map_tap_point(
+    serial: str,
+    point: dict[str, int],
+    label: str,
+    steps: list[dict[str, Any]],
+    started_at: float,
+    matched_node: dict[str, Any] | None = None,
+) -> None:
+    adb(["shell", "input", "tap", str(point["x"]), str(point["y"])], serial=serial, timeout=4)
+    steps.append(
+        {
+            "action": "tap",
+            "label": label,
+            "x": point["x"],
+            "y": point["y"],
+            "matched_node": compact_node(matched_node),
+            "at_sec": round(time.monotonic() - started_at, 3),
+        }
+    )
+
+
+def xiaoluxue_map_tap_node(
+    serial: str,
+    node: dict[str, Any] | None,
+    label: str,
+    steps: list[dict[str, Any]],
+    started_at: float,
+) -> dict[str, int]:
+    point = node_click_point(node) if node else None
+    if not point:
+        raise AndroidUseError(f"Could not tap Xiaoluxue map node: {label}")
+    xiaoluxue_map_tap_point(serial, point, label, steps, started_at, node)
+    return point
+
+
+def xiaoluxue_start_scheme_route(
+    serial: str,
+    url: str,
+    steps: list[dict[str, Any]],
+    started_at: float,
+) -> dict[str, Any]:
+    output = adb(
+        [
+            "shell",
+            "am",
+            "start",
+            "-n",
+            f"{XIAOLUXUE_STUDENT_PACKAGE}/{XIAOLUXUE_SCHEME_PROXY_ACTIVITY}",
+            "-a",
+            "android.intent.action.VIEW",
+            "-d",
+            url,
+        ],
+        serial=serial,
+        timeout=8,
+    ).decode("utf-8", errors="replace")
+    step = {
+        "action": "route",
+        "component": XIAOLUXUE_SCHEME_PROXY_ACTIVITY,
+        "url": url,
+        "at_sec": round(time.monotonic() - started_at, 3),
+    }
+    if output.strip():
+        step["output"] = output.strip().splitlines()[-1]
+    steps.append(step)
+    return {"ok": True, "url": url, "output": output}
+
+
+def xiaoluxue_open_native_subject_map(
+    serial: str,
+    args: dict[str, Any],
+    steps: list[dict[str, Any]],
+    started_at: float,
+) -> dict[str, Any]:
+    subject_id = normalize_xiaoluxue_subject_id(
+        args.get("subject_id")
+        or args.get("subjectId")
+        or args.get("subject")
+        or args.get("instruction")
+    )
+    if not subject_id:
+        raise AndroidUseError("Xiaoluxue native subject route needs `subject_id` or a subject name such as 语文/数学.")
+    url = xiaoluxue_study_subject_route_url(
+        subject_id,
+        textbook_id=args.get("textbook_id") or args.get("textbookId"),
+        chapter_id=args.get("chapter_id") or args.get("chapterId"),
+        knowledge_id=args.get("knowledge_id") or args.get("knowledgeId"),
+        go_next_knowledge=args.get("go_next_knowledge") if "go_next_knowledge" in args else args.get("goNextKnowledge"),
+    )
+    route = xiaoluxue_start_scheme_route(serial, url, steps, started_at)
+    wait_sec = min(max(float(args.get("route_wait_sec", 0.85)), 0.0), 3.0)
+    if wait_sec:
+        time.sleep(wait_sec)
+        steps.append({"action": "wait", "reason": "subject-route-render", "seconds": wait_sec, "at_sec": round(time.monotonic() - started_at, 3)})
+    return {"subject_id": subject_id, "route": route}
+
+
+def xiaoluxue_route_preset_for(subject_id: int | None, index: str | None) -> dict[str, tuple[int, int]] | None:
+    if not subject_id or not index:
+        return None
+    subject_presets = XIAOLUXUE_NATIVE_MAP_ROUTE_PRESETS.get(int(subject_id))
+    if not subject_presets:
+        return None
+    preset = subject_presets.get(str(index))
+    return preset if isinstance(preset, dict) else None
+
+
+def xiaoluxue_run_route_preset_map_fast_path(
+    serial: str,
+    *,
+    subject_id: int,
+    index: str | None,
+    action_name: str,
+    steps: list[dict[str, Any]],
+    started_at: float,
+    wait_after_select: float,
+    open_report_when_done: bool,
+    report_wait_sec: float,
+) -> dict[str, Any] | None:
+    preset = xiaoluxue_route_preset_for(subject_id, index)
+    if not preset:
+        return None
+    action = normalize_xiaoluxue_map_action(action_name)
+    index_point = preset.get("index")
+    if not index_point:
+        return None
+    window_info = xiaoluxue_native_window_info(serial)
+    xiaoluxue_native_tap(serial, index_point, window_info, f"index:{index}:preset", steps, started_at)
+    xiaoluxue_update_cached_selected_index(serial, str(index))
+    if action == "select":
+        return {
+            "ok": True,
+            "action": "xiaoluxue_map_fast_path",
+            "map_action": "select",
+            "index": index,
+            "subject_id": subject_id,
+            "routed": True,
+            "preset": True,
+            "elapsed_sec": round(time.monotonic() - started_at, 3),
+            "steps": steps,
+            "snapshot": {"subject_id": subject_id, "selected_index": index, "preset": True},
+        }
+    time.sleep(wait_after_select)
+    if action == "report":
+        practise_point = preset.get("practise")
+        report_point = preset.get("report")
+        if not practise_point or not report_point:
+            return None
+        xiaoluxue_native_tap(serial, practise_point, window_info, "practise:preset", steps, started_at)
+        time.sleep(report_wait_sec)
+        xiaoluxue_native_tap(serial, report_point, window_info, "report:preset", steps, started_at)
+    else:
+        action_point = preset.get(action)
+        if not action_point:
+            return None
+        xiaoluxue_native_tap(serial, action_point, window_info, f"{action}:preset", steps, started_at)
+        if open_report_when_done:
+            report_point = preset.get("report")
+            if report_point:
+                time.sleep(report_wait_sec)
+                xiaoluxue_native_tap(serial, report_point, window_info, "report:preset", steps, started_at)
+    return {
+        "ok": True,
+        "action": "xiaoluxue_map_fast_path",
+        "map_action": action,
+        "index": index,
+        "subject_id": subject_id,
+        "routed": True,
+        "preset": True,
+        "elapsed_sec": round(time.monotonic() - started_at, 3),
+        "steps": steps,
+        "snapshot": {"subject_id": subject_id, "selected_index": index, "preset": True},
+    }
+
+
+def xiaoluxue_run_cached_map_fast_path(
+    serial: str,
+    cache: dict[str, Any],
+    *,
+    index: str | None,
+    action_name: str,
+    steps: list[dict[str, Any]],
+    started_at: float,
+    wait_after_select: float,
+    prefer_predicted: bool,
+) -> dict[str, Any] | None:
+    action_points = cache.get("action_points") if isinstance(cache.get("action_points"), dict) else {}
+    index_tap_points = cache.get("index_tap_points") if isinstance(cache.get("index_tap_points"), dict) else {}
+    index_centers = cache.get("index_centers") if isinstance(cache.get("index_centers"), dict) else {}
+    snapshot = cache.get("snapshot") if isinstance(cache.get("snapshot"), dict) else {}
+    selected_index = str(cache.get("selected_index") or snapshot.get("selected_index") or "").strip() or None
+    target_index = index or selected_index
+    action = normalize_xiaoluxue_map_action(action_name)
+
+    if action in {"tasks", "weak", "chapter_picker", "done", "back"}:
+        point = xiaoluxue_map_point(action_points.get(action))
+        if not point:
+            return None
+        xiaoluxue_map_tap_point(serial, point, action, steps, started_at, None)
+        return {
+            "ok": True,
+            "action": "xiaoluxue_map_fast_path",
+            "map_action": action,
+            "cached": True,
+            "elapsed_sec": round(time.monotonic() - started_at, 3),
+            "steps": steps,
+            "snapshot": snapshot,
+        }
+
+    if action == "report":
+        point = xiaoluxue_map_point(action_points.get("report"))
+        if point:
+            xiaoluxue_map_tap_point(serial, point, "report", steps, started_at, None)
+            return {
+                "ok": True,
+                "action": "xiaoluxue_map_fast_path",
+                "map_action": "report",
+                "cached": True,
+                "elapsed_sec": round(time.monotonic() - started_at, 3),
+                "steps": steps,
+                "snapshot": snapshot,
+            }
+        action = "practise"
+
+    if not target_index:
+        return None
+    target_tap = xiaoluxue_map_point(index_tap_points.get(target_index))
+    if not target_tap:
+        return None
+
+    if action == "select":
+        xiaoluxue_map_tap_point(serial, target_tap, f"index:{target_index}:cached", steps, started_at, None)
+        xiaoluxue_update_cached_selected_index(serial, target_index)
+        return {
+            "ok": True,
+            "action": "xiaoluxue_map_fast_path",
+            "map_action": "select",
+            "index": target_index,
+            "cached": True,
+            "elapsed_sec": round(time.monotonic() - started_at, 3),
+            "steps": steps,
+            "snapshot": snapshot,
+        }
+
+    if selected_index == target_index:
+        point = xiaoluxue_map_point(action_points.get(action))
+        if point:
+            xiaoluxue_map_tap_point(serial, point, f"{action}:cached", steps, started_at, None)
+            return {
+                "ok": True,
+                "action": "xiaoluxue_map_fast_path",
+                "map_action": action,
+                "index": target_index,
+                "cached": True,
+                "predicted": False,
+                "elapsed_sec": round(time.monotonic() - started_at, 3),
+                "steps": steps,
+                "snapshot": snapshot,
+            }
+
+    xiaoluxue_map_tap_point(serial, target_tap, f"index:{target_index}:cached", steps, started_at, None)
+    time.sleep(wait_after_select)
+    if not prefer_predicted:
+        return None
+    center = xiaoluxue_map_point(index_centers.get(target_index))
+    predicted = xiaoluxue_map_predicted_point_from_center(center, action)
+    if not predicted:
+        return None
+    xiaoluxue_map_tap_point(serial, predicted, f"{action}:predicted:cached", steps, started_at, None)
+    xiaoluxue_update_cached_selected_index(serial, target_index)
+    return {
+        "ok": True,
+        "action": "xiaoluxue_map_fast_path",
+        "map_action": action,
+        "index": target_index,
+        "cached": True,
+        "predicted": True,
+        "elapsed_sec": round(time.monotonic() - started_at, 3),
+        "steps": steps,
+        "snapshot": snapshot,
+    }
+
+
+def xiaoluxue_observe_native_map(serial: str, *, limit: int = 800, include_focus: bool = False) -> dict[str, Any]:
+    xml_text = dump_ui_xml(serial)
+    nodes = parse_ui_nodes(xml_text, limit=limit)
+    observation: dict[str, Any] = {
+        "state": {"focused_window": get_focused_window(serial) if include_focus else ""},
+        "ui": {"nodes": nodes, "count": len(nodes)},
+    }
+    snapshot = xiaoluxue_map_snapshot_from_observation(observation)
+    if not snapshot.get("is_map"):
+        raise AndroidUseError("Current screen is not the Xiaoluxue native study map.")
+    observation["xiaoluxue_map"] = snapshot
+    return observation
+
+
+def run_xiaoluxue_map_fast_path(serial: str, args: dict[str, Any], *, record: bool) -> dict[str, Any]:
+    started_at = time.monotonic()
+    steps: list[dict[str, Any]] = []
+    action_name = normalize_xiaoluxue_map_action(args.get("action_name") or args.get("action") or args.get("instruction"))
+    requested_report = action_name == "report"
+    index = normalize_xiaoluxue_map_index(args.get("index") or args.get("instruction"))
+    subject_id = normalize_xiaoluxue_subject_id(
+        args.get("subject_id")
+        or args.get("subjectId")
+        or args.get("subject")
+        or args.get("instruction")
+    )
+    prefer_predicted = bool(args.get("prefer_predicted", True))
+    wait_after_select = min(max(float(args.get("after_select_wait_sec", 0.34)), 0.05), 1.0)
+    report_wait_sec = min(max(float(args.get("report_wait_sec", 0.32)), 0.05), 1.0)
+    route_subject = bool(args.get("route_subject", False) or args.get("open_subject", False) or args.get("route_if_subject", False))
+    before: dict[str, Any] | None = None
+    if route_subject and subject_id:
+        xiaoluxue_open_native_subject_map(serial, args, steps, started_at)
+        preset_result = xiaoluxue_run_route_preset_map_fast_path(
+            serial,
+            subject_id=subject_id,
+            index=index,
+            action_name=action_name,
+            steps=steps,
+            started_at=started_at,
+            wait_after_select=wait_after_select,
+            open_report_when_done=bool(args.get("open_report_when_done", requested_report)),
+            report_wait_sec=report_wait_sec,
+        )
+        if preset_result:
+            if record:
+                append_recording_step(
+                    serial,
+                    "xiaoluxue_map_fast_path",
+                    args,
+                    preset_result,
+                    before={"state": {}, "ui": {"nodes": []}, "xiaoluxue_map": preset_result.get("snapshot", {})},
+                )
+            return preset_result
+
+    use_cache = bool(args.get("use_cache", True)) and not bool(args.get("force_observe", False))
+    if route_subject and subject_id:
+        use_cache = False
+    if use_cache:
+        cache = xiaoluxue_cached_native_map(serial, max_age_sec=float(args.get("cache_max_age_sec", 6 * 60 * 60)))
+        if cache:
+            cached_result = xiaoluxue_run_cached_map_fast_path(
+                serial,
+                cache,
+                index=index,
+                action_name=action_name,
+                steps=steps,
+                started_at=started_at,
+                wait_after_select=wait_after_select,
+                prefer_predicted=prefer_predicted,
+            )
+            if cached_result:
+                if record:
+                    append_recording_step(
+                        serial,
+                        "xiaoluxue_map_fast_path",
+                        args,
+                        cached_result,
+                        before={"state": {}, "ui": {"nodes": []}, "xiaoluxue_map": cached_result.get("snapshot", {})},
+                )
+                return cached_result
+
+    before = xiaoluxue_observe_native_map(serial, limit=800)
+    nodes = before["ui"]["nodes"]
+    snapshot = before["xiaoluxue_map"]
+    xiaoluxue_remember_native_map_cache(serial, nodes, snapshot)
+
+    if action_name in {"tasks", "weak", "chapter_picker", "done", "back"}:
+        node = xiaoluxue_map_action_node(nodes, action_name)
+        xiaoluxue_map_tap_node(serial, node, action_name, steps, started_at)
+        result = {
+            "ok": True,
+            "action": "xiaoluxue_map_fast_path",
+            "map_action": action_name,
+            "elapsed_sec": round(time.monotonic() - started_at, 3),
+            "steps": steps,
+            "snapshot": snapshot,
+        }
+        if record:
+            append_recording_step(serial, "xiaoluxue_map_fast_path", args, result, before=before)
+        return result
+
+    if action_name == "report":
+        report_node = xiaoluxue_map_action_node(nodes, "report")
+        if report_node:
+            xiaoluxue_map_tap_node(serial, report_node, "report", steps, started_at)
+            result = {
+                "ok": True,
+                "action": "xiaoluxue_map_fast_path",
+                "map_action": "report",
+                "elapsed_sec": round(time.monotonic() - started_at, 3),
+                "steps": steps,
+                "snapshot": snapshot,
+            }
+            if record:
+                append_recording_step(serial, "xiaoluxue_map_fast_path", args, result, before=before)
+            return result
+        action_name = "practise"
+
+    selected_index = str(snapshot.get("selected_index") or "").strip() or None
+    if not index:
+        index = selected_index
+    if not index:
+        raise AndroidUseError("Xiaoluxue map fast path needs an index such as 1.5, or a selected map node.")
+
+    index_node = find_xiaoluxue_map_index_node(nodes, index)
+    if not index_node:
+        visible = ", ".join(snapshot.get("visible_indexes") or [])
+        raise AndroidUseError(f"Could not find Xiaoluxue map index {index!r}. Visible indexes: {visible}")
+
+    if action_name == "select":
+        xiaoluxue_map_tap_node(serial, index_node, f"index:{index}", steps, started_at)
+        xiaoluxue_update_cached_selected_index(serial, index)
+        result = {
+            "ok": True,
+            "action": "xiaoluxue_map_fast_path",
+            "map_action": "select",
+            "index": index,
+            "elapsed_sec": round(time.monotonic() - started_at, 3),
+            "steps": steps,
+            "snapshot": snapshot,
+        }
+        if record:
+            append_recording_step(serial, "xiaoluxue_map_fast_path", args, result, before=before)
+        return result
+
+    action_node = xiaoluxue_map_action_node(nodes, action_name)
+    action_point = node_click_point(action_node) if action_node else None
+    action_is_for_selected = selected_index == index and action_point is not None
+
+    if not action_is_for_selected:
+        xiaoluxue_map_tap_node(serial, index_node, f"index:{index}", steps, started_at)
+        time.sleep(wait_after_select)
+        if prefer_predicted:
+            predicted = xiaoluxue_map_predicted_action_point(index_node, action_name)
+            if predicted:
+                xiaoluxue_map_tap_point(serial, predicted, f"{action_name}:predicted", steps, started_at, None)
+                xiaoluxue_update_cached_selected_index(serial, index)
+                result = {
+                    "ok": True,
+                    "action": "xiaoluxue_map_fast_path",
+                    "map_action": action_name,
+                    "index": index,
+                    "predicted": True,
+                    "elapsed_sec": round(time.monotonic() - started_at, 3),
+                    "steps": steps,
+                    "snapshot": snapshot,
+                }
+                if record:
+                    append_recording_step(serial, "xiaoluxue_map_fast_path", args, result, before=before)
+                return result
+        after_select = xiaoluxue_observe_native_map(serial, limit=800)
+        nodes = after_select["ui"]["nodes"]
+        snapshot = after_select["xiaoluxue_map"]
+        xiaoluxue_remember_native_map_cache(serial, nodes, snapshot)
+        action_node = xiaoluxue_map_action_node(nodes, action_name)
+        action_point = node_click_point(action_node) if action_node else None
+
+    if not action_point:
+        raise AndroidUseError(f"Could not find Xiaoluxue map action {action_name!r} for index {index!r}.")
+    xiaoluxue_map_tap_point(serial, action_point, action_name, steps, started_at, action_node)
+
+    if bool(args.get("open_report_when_done", requested_report)):
+        time.sleep(report_wait_sec)
+        report_observation = observe_ui(serial, limit=500)
+        report_node = find_ui_node(report_observation.get("ui", {}).get("nodes", []), "看报告", exact=True)
+        if report_node:
+            xiaoluxue_map_tap_node(serial, report_node, "看报告", steps, started_at)
+
+    result = {
+        "ok": True,
+        "action": "xiaoluxue_map_fast_path",
+        "map_action": action_name,
+        "index": index,
+        "predicted": False,
+        "elapsed_sec": round(time.monotonic() - started_at, 3),
+        "steps": steps,
+        "snapshot": snapshot,
+    }
+    if record:
+        append_recording_step(serial, "xiaoluxue_map_fast_path", args, result, before=before)
+    return result
+
+
+def tool_xiaoluxue_map_snapshot(args: dict[str, Any]) -> list[dict[str, Any]]:
+    serial = choose_serial(args.get("serial"))
+    observation = xiaoluxue_observe_native_map(serial, limit=int(args.get("limit", 800)))
+    return [
+        text_content(
+            {
+                "ok": True,
+                "serial": serial,
+                "snapshot": observation["xiaoluxue_map"],
+            }
+        )
+    ]
+
+
+def run_xiaoluxue_open_native_subject(serial: str, args: dict[str, Any], *, record: bool) -> dict[str, Any]:
+    started_at = time.monotonic()
+    steps: list[dict[str, Any]] = []
+    route_info = xiaoluxue_open_native_subject_map(serial, args, steps, started_at)
+    result: dict[str, Any] = {
+        "ok": True,
+        "action": "xiaoluxue_open_native_subject",
+        "subject_id": route_info["subject_id"],
+        "route_url": route_info["route"]["url"],
+        "elapsed_sec": round(time.monotonic() - started_at, 3),
+        "steps": steps,
+    }
+    if bool(args.get("verify_focus", False)):
+        info = xiaoluxue_wait_native_app_focus(serial, float(args.get("focus_timeout_sec", 1.5)))
+        result["window"] = info
+        result["elapsed_sec"] = round(time.monotonic() - started_at, 3)
+    if record:
+        append_recording_step(
+            serial,
+            "xiaoluxue_open_native_subject",
+            args,
+            result,
+            before={"state": {}, "ui": {"nodes": []}},
+        )
+    return result
+
+
+def tool_xiaoluxue_open_native_subject(args: dict[str, Any]) -> list[dict[str, Any]]:
+    serial = choose_serial(args.get("serial"))
+    result = run_xiaoluxue_open_native_subject(serial, args, record=True)
+    return [text_content({"ok": True, "serial": serial, **result})]
+
+
+def tool_xiaoluxue_map_fast_path(args: dict[str, Any]) -> list[dict[str, Any]]:
+    serial = choose_serial(args.get("serial"))
+    result = run_xiaoluxue_map_fast_path(serial, args, record=True)
+    return [text_content({"ok": True, "serial": serial, **result})]
+
+
+def normalize_xiaoluxue_env(env: Any) -> tuple[str, str, str]:
+    raw = str(env or "test").strip()
+    lowered = raw.casefold().replace("_", "-").replace(" ", "")
+    aliases = {
+        "": "test",
+        "测试": "test",
+        "测试环境": "test",
+        "test环境": "test",
+        "开发": "dev",
+        "开发环境": "dev",
+        "dev环境": "dev",
+        "生产": "prod",
+        "正式": "prod",
+        "生产环境": "prod",
+        "生产环境-com": "prod-com",
+        "prodcom": "prod-com",
+        "production-com": "prod-com",
+    }
+    key = aliases.get(lowered, lowered)
+    if key.endswith("环境"):
+        key = key[: -len("环境")]
+    if key in XIAOLUXUE_ENV_CHOICES:
+        choice = XIAOLUXUE_ENV_CHOICES[key]
+        return key, choice["url"], choice["label"]
+    match = XIAOLUXUE_CONFIG_URL_PATTERN.search(raw)
+    if match:
+        url = match.group(0)
+        normalized_url = url.rstrip("/")
+        for known_key, choice in XIAOLUXUE_ENV_CHOICES.items():
+            if choice["url"].rstrip("/") == normalized_url:
+                return known_key, choice["url"], choice["label"]
+    valid = ", ".join(sorted({key for key in XIAOLUXUE_ENV_CHOICES if key != "production"}))
+    raise AndroidUseError(f"Unsupported Xiaoluxue environment: {raw!r}. Expected one of: {valid}")
+
+
+def xiaoluxue_config_observe(serial: str, *, limit: int = 500) -> dict[str, Any]:
+    xml_text = dump_ui_xml(serial)
+    nodes = parse_ui_nodes(xml_text, limit=limit)
+    return {
+        "state": {"focused_window": get_focused_window(serial)},
+        "ui": {"nodes": nodes, "count": len(nodes)},
+    }
+
+
+def xiaoluxue_config_labels(nodes: list[dict[str, Any]]) -> list[str]:
+    labels: list[str] = []
+    for node in nodes:
+        for label in node_labels(node)[:2]:
+            value = label.strip()
+            if value and value not in labels:
+                labels.append(value)
+    return labels
+
+
+def xiaoluxue_config_current_url(nodes: list[dict[str, Any]]) -> str | None:
+    marker_index: int | None = None
+    for node in sorted(nodes, key=lambda item: int(item.get("index", 0))):
+        labels = node_labels(node)[:2]
+        for label in labels:
+            match = XIAOLUXUE_CONFIG_URL_PATTERN.search(label)
+            if "当前配置" in label and match:
+                return match.group(0)
+            if "当前配置" in label:
+                marker_index = int(node.get("index", 0))
+                continue
+            if marker_index is not None and int(node.get("index", 0)) >= marker_index:
+                if match:
+                    return match.group(0)
+    return None
+
+
+def xiaoluxue_wait_config_screen(serial: str, timeout_sec: float) -> dict[str, Any]:
+    deadline = time.monotonic() + max(timeout_sec, 0.2)
+    last_observation: dict[str, Any] | None = None
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            observation = xiaoluxue_config_observe(serial)
+            last_observation = observation
+            focus = str(observation.get("state", {}).get("focused_window") or "")
+            nodes = observation.get("ui", {}).get("nodes", [])
+            labels = xiaoluxue_config_labels(nodes) if isinstance(nodes, list) else []
+            has_config_labels = any(label in labels for label in ("API 环境", "提交配置", "当前配置：", "学生端", "网络相关"))
+            if has_config_labels or ("API 环境" in labels or "提交配置" in labels) or (XIAOLUXUE_CONFIG_PACKAGE in focus and labels):
+                return observation
+        except Exception as exc:  # noqa: PERF203 - retry until the config activity draws.
+            last_error = exc
+        time.sleep(0.12)
+    if last_observation:
+        return last_observation
+    if last_error:
+        raise AndroidUseError(f"Could not observe Xiaoluxue config screen: {last_error}") from last_error
+    raise AndroidUseError("Could not observe Xiaoluxue config screen.")
+
+
+def xiaoluxue_tap_ui_node(
+    serial: str,
+    node: dict[str, Any] | None,
+    label: str,
+    steps: list[dict[str, Any]],
+    started_at: float,
+) -> dict[str, int]:
+    point = node_click_point(node) if node else None
+    if not point:
+        raise AndroidUseError(f"Could not tap Xiaoluxue config UI node: {label}")
+    adb(["shell", "input", "tap", str(point["x"]), str(point["y"])], serial=serial, timeout=4)
+    steps.append(
+        {
+            "action": "tap",
+            "label": label,
+            "x": point["x"],
+            "y": point["y"],
+            "matched_node": compact_node(node),
+            "at_sec": round(time.monotonic() - started_at, 3),
+        }
+    )
+    return point
+
+
+def xiaoluxue_config_swipe(serial: str, direction: str, steps: list[dict[str, Any]], started_at: float) -> None:
+    size = get_screen_size(serial)
+    width = int(size.get("width") or XIAOLUXUE_NATIVE_BASE_WIDTH)
+    height = int(size.get("height") or XIAOLUXUE_NATIVE_BASE_HEIGHT)
+    x = round(width * 0.5)
+    if direction == "down":
+        start_y, end_y = round(height * 0.35), round(height * 0.75)
+    else:
+        start_y, end_y = round(height * 0.75), round(height * 0.35)
+    adb(["shell", "input", "swipe", str(x), str(start_y), str(x), str(end_y), "180"], serial=serial, timeout=5)
+    steps.append(
+        {
+            "action": "swipe",
+            "direction": direction,
+            "x": x,
+            "start_y": start_y,
+            "end_y": end_y,
+            "at_sec": round(time.monotonic() - started_at, 3),
+        }
+    )
+
+
+def xiaoluxue_find_config_node(
+    serial: str,
+    queries: list[str],
+    *,
+    timeout_sec: float,
+    steps: list[dict[str, Any]],
+    started_at: float,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    deadline = time.monotonic() + max(timeout_sec, 0.3)
+    directions = ["down", "up", "up", "up", "up", "down"]
+    direction_index = 0
+    last_observation = xiaoluxue_wait_config_screen(serial, min(timeout_sec, 2))
+    while True:
+        nodes = last_observation.get("ui", {}).get("nodes", [])
+        if isinstance(nodes, list):
+            for query in queries:
+                node = find_ui_node(nodes, query, exact=True) or find_ui_node(nodes, query, exact=False)
+                if node:
+                    return last_observation, node
+        if time.monotonic() >= deadline or direction_index >= len(directions):
+            break
+        xiaoluxue_config_swipe(serial, directions[direction_index], steps, started_at)
+        direction_index += 1
+        time.sleep(0.15)
+        last_observation = xiaoluxue_wait_config_screen(serial, min(max(deadline - time.monotonic(), 0.2), 1.2))
+    raise AndroidUseError(f"Could not find Xiaoluxue config option: {queries}")
+
+
+def xiaoluxue_wait_env_apply(serial: str, target_url: str, timeout_sec: float, steps: list[dict[str, Any]], started_at: float) -> dict[str, Any]:
+    deadline = time.monotonic() + max(timeout_sec, 0.3)
+    last_payload: dict[str, Any] = {}
+    confirmed_once = False
+    while time.monotonic() < deadline:
+        observation = xiaoluxue_config_observe(serial)
+        nodes = observation.get("ui", {}).get("nodes", [])
+        labels = xiaoluxue_config_labels(nodes) if isinstance(nodes, list) else []
+        focus = str(observation.get("state", {}).get("focused_window") or "")
+        current_url = xiaoluxue_config_current_url(nodes) if isinstance(nodes, list) else None
+        last_payload = {"focus": focus, "current_url": current_url}
+        if current_url == target_url:
+            return {"ok": True, "reason": "current-config-updated", **last_payload}
+        if XIAOLUXUE_STUDENT_PACKAGE in focus:
+            return {"ok": True, "reason": "student-opened", **last_payload}
+        if not confirmed_once and XIAOLUXUE_CONFIG_PACKAGE in focus and isinstance(nodes, list):
+            confirm = find_ui_node(nodes, "确定", exact=True) or find_ui_node(nodes, "OK", exact=True)
+            if confirm and any(label in labels for label in ("API 环境", "提交配置", "当前配置：")):
+                xiaoluxue_tap_ui_node(serial, confirm, "confirm_config_dialog", steps, started_at)
+                confirmed_once = True
+        time.sleep(0.15)
+    return {"ok": False, "reason": "timeout", **last_payload}
+
+
+def xiaoluxue_launch_student_after_env(serial: str, *, force_stop: bool, timeout_sec: float) -> dict[str, Any]:
+    if force_stop:
+        adb(["shell", "am", "force-stop", XIAOLUXUE_STUDENT_PACKAGE], serial=serial, timeout=8)
+    adb(["shell", "monkey", "-p", XIAOLUXUE_STUDENT_PACKAGE, "-c", "android.intent.category.LAUNCHER", "1"], serial=serial, timeout=10)
+    return xiaoluxue_wait_native_app_focus(serial, min(max(timeout_sec, 0.5), 4))
+
+
+def run_xiaoluxue_switch_env(serial: str, args: dict[str, Any], *, record: bool) -> dict[str, Any]:
+    started_at = time.monotonic()
+    timeout = min(float(args.get("timeout_sec", 10)), 60)
+    env_key, target_url, option_label = normalize_xiaoluxue_env(args.get("env", "test"))
+    force_submit = bool(args.get("force_submit", False))
+    open_student = bool(args.get("open_student", True))
+    steps: list[dict[str, Any]] = []
+
+    adb(["shell", "am", "start", "-n", XIAOLUXUE_CONFIG_LAUNCHER_COMPONENT], serial=serial, timeout=10)
+    steps.append({"action": "open_app", "package": XIAOLUXUE_CONFIG_PACKAGE, "at_sec": round(time.monotonic() - started_at, 3)})
+    observation = xiaoluxue_wait_config_screen(serial, min(timeout, 5))
+    nodes = observation.get("ui", {}).get("nodes", [])
+
+    labels = xiaoluxue_config_labels(nodes) if isinstance(nodes, list) else []
+    if isinstance(nodes, list) and "API 环境" not in labels:
+        student_tab = find_ui_node(nodes, "学生端", exact=True)
+        if student_tab:
+            xiaoluxue_tap_ui_node(serial, student_tab, "学生端", steps, started_at)
+            time.sleep(0.15)
+            observation = xiaoluxue_wait_config_screen(serial, min(timeout, 3))
+            nodes = observation.get("ui", {}).get("nodes", [])
+
+    labels = xiaoluxue_config_labels(nodes) if isinstance(nodes, list) else []
+    if isinstance(nodes, list) and "API 环境" not in labels:
+        network_tab = find_ui_node(nodes, "网络相关", exact=True)
+        if network_tab:
+            xiaoluxue_tap_ui_node(serial, network_tab, "网络相关", steps, started_at)
+            time.sleep(0.15)
+            observation = xiaoluxue_wait_config_screen(serial, min(timeout, 3))
+            nodes = observation.get("ui", {}).get("nodes", [])
+
+    current_before = xiaoluxue_config_current_url(nodes) if isinstance(nodes, list) else None
+    already_current = current_before == target_url
+    submit_result: dict[str, Any]
+    if already_current and not force_submit:
+        submit_result = {"ok": True, "skipped": "already-current"}
+    else:
+        observation, target_node = xiaoluxue_find_config_node(
+            serial,
+            [option_label, target_url],
+            timeout_sec=max(timeout - (time.monotonic() - started_at), 1),
+            steps=steps,
+            started_at=started_at,
+        )
+        xiaoluxue_tap_ui_node(serial, target_node, option_label, steps, started_at)
+        time.sleep(0.15)
+        _submit_observation, submit_node = xiaoluxue_find_config_node(
+            serial,
+            ["提交配置"],
+            timeout_sec=max(timeout - (time.monotonic() - started_at), 1),
+            steps=steps,
+            started_at=started_at,
+        )
+        xiaoluxue_tap_ui_node(serial, submit_node, "提交配置", steps, started_at)
+        submit_result = xiaoluxue_wait_env_apply(
+            serial,
+            target_url,
+            timeout_sec=max(timeout - (time.monotonic() - started_at), 1),
+            steps=steps,
+            started_at=started_at,
+        )
+
+    if already_current and not force_submit:
+        current_after = current_before
+    else:
+        current_after = submit_result.get("current_url")
+    student_result: dict[str, Any] | None = None
+    apply_ok = bool(already_current or submit_result.get("ok"))
+    if open_student and apply_ok:
+        force_stop_student = bool(args.get("force_stop_student", not already_current or force_submit))
+        student_result = xiaoluxue_launch_student_after_env(
+            serial,
+            force_stop=force_stop_student,
+            timeout_sec=max(timeout - (time.monotonic() - started_at), 1),
+        )
+        steps.append(
+            {
+                "action": "open_student",
+                "force_stop": force_stop_student,
+                "focus": student_result.get("focus"),
+                "at_sec": round(time.monotonic() - started_at, 3),
+            }
+        )
+
+    result = {
+        "ok": apply_ok,
+        "action": "xiaoluxue_switch_env",
+        "elapsed_sec": round(time.monotonic() - started_at, 3),
+        "env": env_key,
+        "target_url": target_url,
+        "option_label": option_label,
+        "current_before": current_before,
+        "current_after": current_after,
+        "changed": bool(not already_current or force_submit),
+        "submit": submit_result,
+        "student": student_result,
+        "steps": steps,
+    }
+    if record:
+        recorded_args = {
+            key: args[key]
+            for key in ("env", "open_student", "force_submit", "force_stop_student", "timeout_sec")
+            if key in args
+        }
+        append_recording_step(serial, "xiaoluxue_switch_env", recorded_args, result)
+    return result
+
+
+def tool_xiaoluxue_switch_env(args: dict[str, Any]) -> list[dict[str, Any]]:
+    serial = choose_serial(args.get("serial"))
+    result = run_xiaoluxue_switch_env(serial, args, record=True)
+    return [text_content({"ok": True, "serial": serial, **result})]
+
+
+XIAOLUXUE_EXERCISE_URL_MARKER = "stu.xiaoluxue.com/exercise"
+
+
+def xiaoluxue_exercise_page(serial: str) -> dict[str, Any]:
+    cached = xiaoluxue_cached_runtime_page(serial, "exercise")
+    if cached:
+        return cached
+    pages = discover_webview_pages(serial)
+    page = select_xiaoluxue_webview_page(pages, "exercise")
+    xiaoluxue_remember_inferred_page(serial, page)
+    return xiaoluxue_remember_page(serial, "exercise", page)
+
+
+def xiaoluxue_exercise_snapshot_expression() -> str:
+    return r"""
+(() => {
+  const rect = (el) => {
+    const r = el.getBoundingClientRect();
+    return { x: r.x, y: r.y, width: r.width, height: r.height, top: r.top, right: r.right, bottom: r.bottom, left: r.left };
+  };
+  const visible = (el) => {
+    const r = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight && style.visibility !== "hidden" && style.display !== "none";
+  };
+  const text = (el) => (el.innerText || el.textContent || "").trim().replace(/\s+/g, " ");
+  const disabled = (el) => {
+    const anyEl = el;
+    return Boolean(anyEl.disabled) || el.getAttribute("aria-disabled") === "true" || el.getAttribute("data-disabled") === "true";
+  };
+  const optionKey = (raw) => {
+    const trimmed = (raw || "").trim();
+    const alpha = /^([A-Z])(?:\s|[.．、)])/.exec(trimmed);
+    if (alpha) return alpha[1];
+    const judge = /^(TRUE|FALSE|正确|错误)\b/i.exec(trimmed);
+    return judge ? judge[1].toUpperCase() : "";
+  };
+  const buttons = [...document.querySelectorAll("button,[role='button']")]
+    .filter(visible)
+    .map((el, index) => ({
+      index,
+      text: text(el),
+      disabled: disabled(el),
+      className: String(el.className || ""),
+      rect: rect(el),
+    }))
+    .filter((item) => item.text)
+    .slice(0, 80);
+  const options = [...document.querySelectorAll(".option-button")]
+    .filter(visible)
+    .map((el, index) => {
+      const itemText = text(el);
+      return {
+        index: index + 1,
+        key: optionKey(itemText),
+        text: itemText.slice(0, 500),
+        disabled: disabled(el),
+        selected: /selected|#EAF8FF|rgb\(234,\s*248,\s*255\)/i.test(String(el.className || "") + " " + String(el.getAttribute("style") || "")),
+        rect: rect(el),
+      };
+    });
+  const questionSelectors = [
+    ".question-main-content",
+    ".question-content-left",
+    ".question-content-right",
+    ".fill-blank-content",
+    ".choice-question-view",
+    ".question-content-view",
+  ];
+  const questionBlocks = questionSelectors
+    .flatMap((selector) => [...document.querySelectorAll(selector)])
+    .filter(visible)
+    .map((el) => ({ selector: questionSelectors.find((selector) => el.matches(selector)) || "", text: text(el).slice(0, 1000), rect: rect(el) }))
+    .filter((item, index, arr) => item.text && arr.findIndex((other) => other.text === item.text) === index)
+    .slice(0, 20);
+  const audios = [...document.querySelectorAll("audio")].map((audio) => ({
+    src: audio.currentSrc || audio.src || "",
+    currentTime: audio.currentTime,
+    duration: Number.isFinite(audio.duration) ? audio.duration : null,
+    playbackRate: audio.playbackRate,
+    paused: audio.paused,
+    rect: rect(audio),
+  }));
+  const progressTexts = [...document.querySelectorAll("body *")]
+    .filter((el) => visible(el) && el.children.length === 0)
+    .map(text)
+    .filter((value) => value && /(\d+\s*\/\s*\d+|第\s*\d+|进度|已答|未答)/.test(value))
+    .slice(0, 40);
+  const findAction = (labels) => buttons.find((button) => !button.disabled && labels.some((label) => button.text === label || button.text.includes(label)));
+  const params = Object.fromEntries(new URL(location.href).searchParams.entries());
+  return {
+    app: "xiaoluxue",
+    page: "exercise",
+    title: document.title,
+    url: location.href,
+    params,
+    viewport: { width: innerWidth, height: innerHeight, devicePixelRatio },
+    ready: options.length > 0 || buttons.length > 0 || questionBlocks.length > 0,
+    questionText: questionBlocks[0]?.text || "",
+    questionBlocks,
+    options,
+    buttons,
+    actions: {
+      canSubmit: Boolean(findAction(["提交"])),
+      canContinue: Boolean(findAction(["继续", "下一题"])),
+      canNextPart: Boolean(findAction(["下一空", "下一问"])),
+      canGiveUp: Boolean(findAction(["放弃作答"])),
+      canUncertain: Boolean(findAction(["不确定"])),
+    },
+    audios,
+    progressTexts,
+    localExerciseKeys: Object.keys(localStorage).filter((key) => /exercise|question|answer|study/i.test(key)).slice(0, 40),
+  };
+})()
+"""
+
+
+def xiaoluxue_exercise_action_expression(args: dict[str, Any]) -> str:
+    config = {
+        "actionName": str(args.get("action_name") or args.get("action") or "next"),
+        "optionKey": str(args.get("option_key") or "").strip(),
+        "optionIndex": int(args["option_index"]) if args.get("option_index") is not None else None,
+        "optionText": str(args.get("option_text") or "").strip(),
+        "buttonText": str(args.get("button_text") or "").strip(),
+    }
+    config_json = json.dumps(config, ensure_ascii=False)
+    return f"""
+(async () => {{
+  const config = {config_json};
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const rect = (el) => {{
+    const r = el.getBoundingClientRect();
+    return {{ x: r.x, y: r.y, width: r.width, height: r.height, top: r.top, right: r.right, bottom: r.bottom, left: r.left }};
+  }};
+  const visible = (el) => {{
+    const r = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight && style.visibility !== "hidden" && style.display !== "none";
+  }};
+  const text = (el) => (el.innerText || el.textContent || "").trim().replace(/\\s+/g, " ");
+  const disabled = (el) => {{
+    return Boolean(el.disabled) || el.getAttribute("aria-disabled") === "true" || el.getAttribute("data-disabled") === "true";
+  }};
+  const click = (el) => {{
+    el.scrollIntoView({{ block: "center", inline: "center", behavior: "instant" }});
+    el.dispatchEvent(new PointerEvent("pointerdown", {{ bubbles: true, cancelable: true, pointerType: "touch" }}));
+    el.dispatchEvent(new MouseEvent("mousedown", {{ bubbles: true, cancelable: true, view: window }}));
+    el.dispatchEvent(new PointerEvent("pointerup", {{ bubbles: true, cancelable: true, pointerType: "touch" }}));
+    el.dispatchEvent(new MouseEvent("mouseup", {{ bubbles: true, cancelable: true, view: window }}));
+    el.dispatchEvent(new MouseEvent("click", {{ bubbles: true, cancelable: true, view: window }}));
+  }};
+  const optionKey = (raw) => {{
+    const trimmed = (raw || "").trim();
+    const alpha = /^([A-Z])(?:\\s|[.．、)])/.exec(trimmed);
+    if (alpha) return alpha[1];
+    const judge = /^(TRUE|FALSE|正确|错误)\\b/i.exec(trimmed);
+    return judge ? judge[1].toUpperCase() : "";
+  }};
+  const pack = (el, extra = {{}}) => el ? {{ text: text(el), rect: rect(el), className: String(el.className || ""), ...extra }} : null;
+  const buttons = () => [...document.querySelectorAll("button,[role='button']")].filter((el) => visible(el) && !disabled(el));
+  const clickButton = (labels, mode = "contains") => {{
+    const candidates = buttons();
+    const exact = candidates.find((el) => labels.some((label) => text(el) === label));
+    const included = candidates.find((el) => labels.some((label) => text(el).includes(label)));
+    const target = mode === "exact" ? exact : (exact || included);
+    if (!target) return {{ ok: false, reason: "button not found", labels, visibleButtons: candidates.map((el) => text(el)).slice(0, 30) }};
+    click(target);
+    return {{ ok: true, clicked: pack(target), labels }};
+  }};
+  const clickOption = () => {{
+    const optionButtons = [...document.querySelectorAll(".option-button")].filter((el) => visible(el) && !disabled(el));
+    let target = null;
+    if (config.optionIndex != null) target = optionButtons[Number(config.optionIndex) - 1] || null;
+    if (!target && config.optionKey) {{
+      const key = config.optionKey.toUpperCase();
+      target = optionButtons.find((el) => optionKey(text(el)).toUpperCase() === key) || null;
+    }}
+    if (!target && config.optionText) {{
+      target = optionButtons.find((el) => text(el).includes(config.optionText)) || null;
+    }}
+    if (!target) return {{
+      ok: false,
+      reason: "option not found",
+      optionKey: config.optionKey,
+      optionIndex: config.optionIndex,
+      optionText: config.optionText,
+      visibleOptions: optionButtons.map((el, index) => ({{ index: index + 1, key: optionKey(text(el)), text: text(el).slice(0, 160) }})),
+    }};
+    click(target);
+    return {{ ok: true, clicked: pack(target, {{ index: optionButtons.indexOf(target) + 1, key: optionKey(text(target)) }}) }};
+  }};
+  const actionName = String(config.actionName || "next");
+  let result;
+  if (actionName === "select_option" || actionName === "answer") {{
+    result = {{ actionName, ...(clickOption()) }};
+  }} else if (actionName === "submit") {{
+    result = {{ actionName, ...(clickButton(["提交"])) }};
+  }} else if (actionName === "next") {{
+    result = {{ actionName, ...(clickButton(["下一空", "下一问", "下一题", "继续"])) }};
+  }} else if (actionName === "continue") {{
+    result = {{ actionName, ...(clickButton(["继续", "下一题"])) }};
+  }} else if (actionName === "uncertain") {{
+    result = {{ actionName, ...(clickButton(["不确定"])) }};
+  }} else if (actionName === "give_up") {{
+    result = {{ actionName, ...(clickButton(["放弃作答"])) }};
+  }} else if (actionName === "button_text") {{
+    result = {{ actionName, ...(clickButton([config.buttonText], "contains")) }};
+  }} else {{
+    result = {{ ok: false, actionName, reason: "unsupported action" }};
+  }}
+  await sleep(120);
+  return result;
+}})()
+"""
+
+
+def tool_xiaoluxue_exercise_snapshot(args: dict[str, Any]) -> list[dict[str, Any]]:
+    serial = choose_serial(args.get("serial"))
+    page = xiaoluxue_exercise_page(serial)
+    snapshot = cdp_eval_value(page, xiaoluxue_exercise_snapshot_expression(), timeout=min(float(args.get("timeout_sec", 10)), 60))
+    return [text_content({"ok": True, "serial": serial, "pageId": page.get("id"), "socket": page.get("socket"), "snapshot": snapshot})]
+
+
+def tool_xiaoluxue_exercise_action(args: dict[str, Any]) -> list[dict[str, Any]]:
+    serial = choose_serial(args.get("serial"))
+    page = xiaoluxue_exercise_page(serial)
+    result = cdp_eval_value(page, xiaoluxue_exercise_action_expression(args), timeout=min(float(args.get("timeout_sec", 10)), 60))
+    recorded_args = {
+        key: args[key]
+        for key in ("action_name", "option_key", "option_index", "option_text", "button_text")
+        if key in args
+    }
+    append_recording_step(
+        serial,
+        "xiaoluxue_exercise_action",
+        recorded_args,
+        {"ok": True, "action": "xiaoluxue_exercise_action", "webview": True, "result": result},
+    )
+    return [text_content({"ok": True, "serial": serial, "pageId": page.get("id"), "socket": page.get("socket"), "result": result})]
+
+
+def run_xiaoluxue_exercise_fast_path(serial: str, args: dict[str, Any], *, record: bool) -> dict[str, Any]:
+    timeout = min(float(args.get("timeout_sec", 15)), 60)
+    wait_sec = min(max(float(args.get("after_action_wait_sec", 0.4)), 0), 10)
+    page = xiaoluxue_exercise_page(serial)
+    steps: list[dict[str, Any]] = []
+
+    has_option = any(args.get(key) is not None and str(args.get(key)).strip() for key in ("option_key", "option_index", "option_text"))
+    if has_option:
+        select_args = {**args, "action_name": "select_option"}
+        select_result = cdp_eval_value(page, xiaoluxue_exercise_action_expression(select_args), timeout=timeout)
+        steps.append({"action": "select_option", "result": select_result})
+        if wait_sec:
+            time.sleep(wait_sec)
+
+    if bool(args.get("submit", False)):
+        page = xiaoluxue_exercise_page(serial)
+        submit_result = cdp_eval_value(page, xiaoluxue_exercise_action_expression({"action_name": "submit"}), timeout=timeout)
+        steps.append({"action": "submit", "result": submit_result})
+        if wait_sec:
+            time.sleep(wait_sec)
+        if bool(args.get("continue_after_submit", False)):
+            page = xiaoluxue_exercise_page(serial)
+            continue_result = cdp_eval_value(page, xiaoluxue_exercise_action_expression({"action_name": "continue"}), timeout=timeout)
+            steps.append({"action": "continue", "result": continue_result})
+    elif not has_option:
+        action_name = str(args.get("action_name") or ("button_text" if args.get("button_text") else "next"))
+        action_args = {**args, "action_name": action_name}
+        action_result_value = cdp_eval_value(page, xiaoluxue_exercise_action_expression(action_args), timeout=timeout)
+        steps.append({"action": action_name, "result": action_result_value})
+
+    page = xiaoluxue_exercise_page(serial)
+    snapshot = cdp_eval_value(page, xiaoluxue_exercise_snapshot_expression(), timeout=timeout)
+    result = {
+        "ok": True,
+        "action": "xiaoluxue_exercise_fast_path",
+        "webview": True,
+        "pageId": page.get("id"),
+        "socket": page.get("socket"),
+        "steps": steps,
+        "snapshot": snapshot,
+    }
+    if record:
+        recorded_args = {
+            key: args[key]
+            for key in (
+                "option_key",
+                "option_index",
+                "option_text",
+                "submit",
+                "continue_after_submit",
+                "action_name",
+                "button_text",
+                "after_action_wait_sec",
+                "timeout_sec",
+            )
+            if key in args
+        }
+        append_recording_step(serial, "xiaoluxue_exercise_fast_path", recorded_args, result)
+    return result
+
+
+def tool_xiaoluxue_exercise_fast_path(args: dict[str, Any]) -> list[dict[str, Any]]:
+    serial = choose_serial(args.get("serial"))
+    result = run_xiaoluxue_exercise_fast_path(serial, args, record=True)
+    return [text_content({"ok": True, "serial": serial, **result})]
+
+
+def tool_start_recording(args: dict[str, Any]) -> list[dict[str, Any]]:
+    serial = choose_serial(args.get("serial"))
+    if active_recording(serial):
+        raise AndroidUseError(f"Recording is already active for device {serial}. Stop it first.")
+    name = str(args.get("name") or f"recording-{serial}").strip()
+    recording_id = f"{time.strftime('%Y%m%d-%H%M%S', time.localtime())}-{slugify(name, 'recording')}"
+    recording_dir = RECORDINGS_DIR / recording_id
+    recording_dir.mkdir(parents=True, exist_ok=True)
+    recording = {
+        "schema_version": 1,
+        "id": recording_id,
+        "name": name,
+        "serial": serial,
+        "created_at": timestamp_iso(),
+        "dir": str(recording_dir),
+        "include_screenshots": bool(args.get("include_screenshots", False)),
+        "redact_text": bool(args.get("redact_text", False)),
+        "after_delay_sec": float(args.get("after_delay_sec", 0.25)),
+        "steps": [],
+        "errors": [],
+        "initial_snapshot": capture_record_snapshot(
+            serial,
+            include_screenshot=bool(args.get("include_screenshots", False)),
+            base_dir=recording_dir,
+            name="000-initial",
+        ),
+    }
+    ACTIVE_RECORDINGS[serial] = recording
+    trace_path = recording_dir / "trace.json"
+    return [
+        text_content(
+            {
+                "ok": True,
+                "serial": serial,
+                "recording_id": recording_id,
+                "trace_path": str(trace_path),
+                "message": "Recording started. Deterministic Android actions issued through this plugin will be captured.",
+            }
+        )
+    ]
+
+
+def tool_record_checkpoint(args: dict[str, Any]) -> list[dict[str, Any]]:
+    serial = choose_serial(args.get("serial"))
+    label = str(args.get("label") or "checkpoint").strip()
+    step = append_recording_checkpoint(serial, label)
+    return [
+        text_content(
+            {
+                "ok": True,
+                "serial": serial,
+                "index": step["index"],
+                "label": label,
+                "fingerprint": step["snapshot"].get("fingerprint"),
+            }
+        )
+    ]
+
+
+def tool_stop_recording(args: dict[str, Any]) -> list[dict[str, Any]]:
+    serial = choose_serial(args.get("serial"))
+    recording = ACTIVE_RECORDINGS.pop(serial, None)
+    if not recording:
+        raise AndroidUseError(f"No active recording for device {serial}.")
+    recording["ended_at"] = timestamp_iso()
+    recording["final_snapshot"] = capture_record_snapshot(
+        serial,
+        include_screenshot=bool(recording.get("include_screenshots")),
+        base_dir=Path(recording["dir"]),
+        name="999-final",
+    )
+    trace_path = Path(recording["dir"]) / "trace.json"
+    write_json(trace_path, recording)
+    return [
+        text_content(
+            {
+                "ok": True,
+                "serial": serial,
+                "recording_id": recording["id"],
+                "trace_path": str(trace_path),
+                "steps": len(recording.get("steps", [])),
+                "errors": recording.get("errors", []),
+            }
+        )
+    ]
+
+
+def resolve_trace_path(value: str) -> Path:
+    path = Path(value).expanduser()
+    if path.is_dir():
+        trace_path = path / "trace.json"
+        if trace_path.exists():
+            return trace_path
+    if path.exists():
+        return path
+    candidates = [
+        RECORDINGS_DIR / value / "trace.json",
+        RECORDINGS_DIR / f"{value}.json",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise AndroidUseError(f"Recording trace not found: {value}")
+
+
+def resolve_recipe_path(value: str) -> Path:
+    path = Path(value).expanduser()
+    if path.exists():
+        return path
+    candidates = [RECIPES_DIR / value, RECIPES_DIR / f"{value}.json"]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise AndroidUseError(f"Recipe not found: {value}")
+
+
+def tool_create_recipe(args: dict[str, Any]) -> list[dict[str, Any]]:
+    trace_path = resolve_trace_path(str(args["trace"]))
+    trace = json.loads(trace_path.read_text())
+    recipe_name = str(args.get("name") or trace.get("name") or trace_path.parent.name)
+    recipe = recipe_from_trace(trace, recipe_name)
+    output_path = Path(args["output_path"]).expanduser() if args.get("output_path") else RECIPES_DIR / f"{slugify(recipe_name, 'recipe')}.json"
+    write_json(output_path, recipe)
+    return [
+        text_content(
+            {
+                "ok": True,
+                "trace_path": str(trace_path),
+                "recipe_path": str(output_path),
+                "steps": len(recipe.get("steps", [])),
+                "name": recipe.get("name"),
+            }
+        )
+    ]
+
+
+def tool_replay_recipe(args: dict[str, Any]) -> list[dict[str, Any]]:
+    serial = choose_serial(args.get("serial"))
+    recipe_path = resolve_recipe_path(str(args["recipe"]))
+    recipe = json.loads(recipe_path.read_text())
+    dry_run = bool(args.get("dry_run", False))
+    strict_verify = bool(args.get("strict_verify", False))
+    step_delay_sec = min(float(args.get("step_delay_sec", 0.25)), 5.0)
+    results: list[dict[str, Any]] = []
+    for index, step in enumerate(recipe.get("steps", []), start=1):
+        if not isinstance(step, dict):
+            continue
+        step_result = execute_recipe_step(serial, step, dry_run=dry_run)
+        verification = {"checked": False, "ok": True}
+        if not dry_run:
+            if step_delay_sec > 0:
+                time.sleep(step_delay_sec)
+            verification = verify_recipe_step(serial, step)
+            if strict_verify and not verification.get("ok", True):
+                results.append({"index": index, "result": step_result, "verification": verification})
+                break
+        results.append({"index": index, "result": step_result, "verification": verification})
+    return [
+        text_content(
+            {
+                "ok": all(item["verification"].get("ok", True) for item in results),
+                "serial": serial,
+                "recipe_path": str(recipe_path),
+                "dry_run": dry_run,
+                "steps": results,
+            }
+        )
+    ]
+
+
+def tool_index_source(args: dict[str, Any]) -> list[dict[str, Any]]:
+    source_path = Path(str(args["source_path"])).expanduser()
+    max_files = max(1, min(int(args.get("max_files", 2000)), 20000))
+    app_map = index_source_tree(source_path, max_files=max_files)
+    default_name = f"app-map-{slugify(source_path.name or 'source')}.json"
+    output_path = Path(args["output_path"]).expanduser() if args.get("output_path") else SOURCE_MAP_DIR / default_name
+    write_json(output_path, app_map)
+    return [
+        text_content(
+            {
+                "ok": True,
+                "source_path": str(source_path),
+                "app_map_path": str(output_path),
+                "files_scanned": app_map["files_scanned"],
+                "files_indexed": app_map["files_indexed"],
+                "controls": len(app_map["controls"]),
+            }
+        )
+    ]
+
+
+def build_scrcpy_command(args: dict[str, Any], serial: str) -> tuple[list[str], int | None, int | None, str]:
     command = [scrcpy_binary(), "--serial", serial]
     max_size = int(args.get("max_size", 1280))
     window_width = args.get("window_width")
     window_height = args.get("window_height")
     window_title = str(args.get("window_title") or f"Android {serial}")
+    keyboard_mode = str(args.get("keyboard") or "sdk").strip().lower()
+    if keyboard_mode not in {"disabled", "sdk", "uhid", "aoa"}:
+        raise AndroidUseError("keyboard must be one of: disabled, sdk, uhid, aoa.")
     command.extend(["--window-title", window_title])
+    command.extend(["--keyboard", keyboard_mode])
+    if args.get("prefer_text", True) and keyboard_mode == "sdk":
+        command.append("--prefer-text")
+    if args.get("legacy_paste", False):
+        command.append("--legacy-paste")
+    if not args.get("audio", False):
+        command.append("--no-audio")
     if max_size:
         command.extend(["-m", str(max_size)])
     if args.get("bit_rate"):
@@ -834,13 +5991,240 @@ def tool_start_scrcpy(args: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(extra_args, list):
         raise AndroidUseError("extra_args must be a list of scrcpy command arguments.")
     command.extend(str(item) for item in extra_args)
+    return command, int(window_width) if window_width else None, int(window_height) if window_height else None, window_title
+
+
+def host_process_lines() -> list[str]:
+    try:
+        stdout, _stderr = run_command(["ps", "-axo", "pid=,command="], timeout=3)
+    except AndroidUseError:
+        return []
+    return [line.strip() for line in decode_bytes(stdout).splitlines() if line.strip()]
+
+
+def scrcpy_visible_process_for_serial(serial: str) -> str | None:
+    for line in host_process_lines():
+        if serial not in line:
+            continue
+        is_supervisor = "scrcpy_supervisor.py" in line
+        is_scrcpy_binary = re.search(r"(^|\s)(?:\S*/)?scrcpy(\s|$)", line) is not None
+        if not is_supervisor and not is_scrcpy_binary:
+            continue
+        if "--no-window" in line:
+            continue
+        if "android_webrtc_viewer.py" in line:
+            continue
+        return line
+    return None
+
+
+def ensure_default_scrcpy_window(serial: str, args: dict[str, Any]) -> dict[str, Any]:
+    if not bool(args.get("show_scrcpy", True)):
+        return {"ok": True, "skipped": "disabled"}
+    launch_lock = lock_path(f"scrcpy-launch-{serial}")
+    with exclusive_file_lock(launch_lock, blocking=True) as locked:
+        if not locked:
+            return {"ok": False, "error": "could not acquire scrcpy launch lock"}
+        existing = scrcpy_visible_process_for_serial(serial)
+        if existing:
+            return {"ok": True, "skipped": "already-running", "process": existing[:500], "launch_lock": str(launch_lock)}
+        try:
+            content = tool_start_scrcpy(
+                {
+                    "serial": serial,
+                    "keep_alive": args.get("scrcpy_keep_alive", True),
+                    "fixed_window": args.get("scrcpy_fixed_window", True),
+                    "lock_window_size": args.get("scrcpy_lock_window_size", True),
+                    "window_width": args.get("scrcpy_window_width"),
+                    "window_height": args.get("scrcpy_window_height"),
+                    "max_size": args.get("scrcpy_max_size", 1280),
+                }
+            )
+            payload = content[0].get("text") if content else "{}"
+            parsed = json.loads(str(payload)) if isinstance(payload, str) else payload
+            if isinstance(parsed, dict):
+                parsed["launch_lock"] = str(launch_lock)
+                return parsed
+            return {"ok": True, "result": parsed, "launch_lock": str(launch_lock)}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc), "launch_lock": str(launch_lock)}
+
+
+def resident_scrcpy_enabled() -> bool:
+    return env_flag("ANDROID_USE_SCRCPY_RESIDENT", True)
+
+
+def resident_scrcpy_interval_sec() -> float:
+    return max(1.0, env_float("ANDROID_USE_SCRCPY_RESIDENT_INTERVAL_SEC", 2.0))
+
+
+def connected_device_serials() -> list[str]:
+    try:
+        devices = [device for device in list_devices() if device.get("state") == "device"]
+    except Exception:
+        return []
+    configured = os.environ.get("ANDROID_USE_SCRCPY_RESIDENT_SERIALS") or os.environ.get("ANDROID_USE_SERIAL") or os.environ.get("ANDROID_SERIAL")
+    if configured:
+        wanted = [item.strip() for item in re.split(r"[,;\s]+", configured) if item.strip()]
+        connected = {str(device.get("serial") or "") for device in devices}
+        return [serial for serial in wanted if serial in connected]
+    physical = [str(device.get("serial") or "") for device in devices if not str(device.get("serial") or "").startswith("emulator-")]
+    if physical:
+        return physical[:1]
+    return [str(devices[0]["serial"])] if devices else []
+
+
+def ensure_resident_scrcpy_windows() -> dict[str, Any]:
+    serials = connected_device_serials()
+    ensured: list[dict[str, Any]] = []
+    for serial in serials:
+        result = ensure_default_scrcpy_window(
+            serial,
+            {
+                "show_scrcpy": True,
+                "scrcpy_keep_alive": True,
+                "scrcpy_fixed_window": True,
+                "scrcpy_lock_window_size": True,
+                "scrcpy_max_size": 1280,
+            },
+        )
+        ensured.append({"serial": serial, **result})
+    return {"ok": True, "serials": serials, "ensured": ensured}
+
+
+def update_resident_scrcpy_status(**updates: Any) -> None:
+    with SCRCPY_RESIDENT_LOCK:
+        SCRCPY_RESIDENT_STATUS.update(updates)
+
+
+def try_acquire_resident_scrcpy_monitor_lock() -> tuple[bool, str]:
+    global SCRCPY_RESIDENT_LOCK_HANDLE
+    monitor_lock_path = lock_path("scrcpy-resident-monitor")
+    if SCRCPY_RESIDENT_LOCK_HANDLE is not None:
+        return True, str(monitor_lock_path)
+    monitor_lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = monitor_lock_path.open("a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return False, str(monitor_lock_path)
+    SCRCPY_RESIDENT_LOCK_HANDLE = handle
+    return True, str(monitor_lock_path)
+
+
+def resident_scrcpy_loop() -> None:
+    update_resident_scrcpy_status(enabled=True, running=True, last_error=None)
+    while resident_scrcpy_enabled():
+        try:
+            result = ensure_resident_scrcpy_windows()
+            update_resident_scrcpy_status(
+                enabled=True,
+                running=True,
+                serials=result.get("serials", []),
+                last_check_at=time.time(),
+                last_result=result,
+                last_error=None,
+            )
+        except Exception as exc:
+            update_resident_scrcpy_status(
+                enabled=True,
+                running=True,
+                last_check_at=time.time(),
+                last_error=str(exc),
+            )
+        time.sleep(resident_scrcpy_interval_sec())
+    update_resident_scrcpy_status(enabled=False, running=False)
+
+
+def start_resident_scrcpy_monitor() -> dict[str, Any]:
+    global SCRCPY_RESIDENT_THREAD
+    if not resident_scrcpy_enabled():
+        update_resident_scrcpy_status(enabled=False, running=False, last_error=None)
+        return {"ok": True, "enabled": False, "skipped": "disabled-by-env"}
+    with SCRCPY_RESIDENT_LOCK:
+        if SCRCPY_RESIDENT_THREAD is not None and SCRCPY_RESIDENT_THREAD.is_alive():
+            return {"ok": True, "enabled": True, "skipped": "already-running"}
+        acquired, monitor_lock = try_acquire_resident_scrcpy_monitor_lock()
+        if not acquired:
+            SCRCPY_RESIDENT_STATUS.update(
+                {
+                    "enabled": True,
+                    "running": False,
+                    "last_error": None,
+                    "monitor_lock": monitor_lock,
+                    "skipped": "another-mcp-process-owns-monitor",
+                }
+            )
+            return {"ok": True, "enabled": True, "skipped": "another-mcp-process-owns-monitor", "monitor_lock": monitor_lock}
+        SCRCPY_RESIDENT_THREAD = threading.Thread(
+            target=resident_scrcpy_loop,
+            name="android-use-scrcpy-resident",
+            daemon=True,
+        )
+        SCRCPY_RESIDENT_THREAD.start()
+        return {"ok": True, "enabled": True, "started": True, "monitor_lock": monitor_lock}
+
+
+def tool_scrcpy_resident_status(_args: dict[str, Any]) -> list[dict[str, Any]]:
+    started = start_resident_scrcpy_monitor()
+    with SCRCPY_RESIDENT_LOCK:
+        status = dict(SCRCPY_RESIDENT_STATUS)
+    return [text_content({"ok": True, "monitor": started, "status": status})]
+
+
+def read_json_file(path: Path) -> dict[str, Any]:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def terminate_process(process: subprocess.Popen[bytes], *, timeout: float = 3) -> bool:
+    if process.poll() is not None:
+        return False
+    process.terminate()
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        return True
+    return True
+
+
+def tool_start_scrcpy(args: dict[str, Any]) -> list[dict[str, Any]]:
+    serial = choose_serial(args.get("serial"))
+    command, window_width, window_height, window_title = build_scrcpy_command(args, serial)
 
     SCREEN_DIR.mkdir(parents=True, exist_ok=True)
     log_path = SCREEN_DIR / "scrcpy.log"
+    keep_alive = bool(args.get("keep_alive", True))
+    ready_path = SCREEN_DIR / f"scrcpy-{uuid.uuid4().hex}.ready.json"
+    launch_command = command
+    if keep_alive:
+        supervisor_script = PLUGIN_ROOT / "scripts" / "scrcpy_supervisor.py"
+        if not supervisor_script.exists():
+            raise AndroidUseError(f"scrcpy supervisor script not found: {supervisor_script}")
+        launch_command = [
+            sys.executable,
+            str(supervisor_script),
+            "--ready-file",
+            str(ready_path),
+            "--ready-after-sec",
+            "0.8",
+            "--early-exit-sec",
+            "2.0",
+            "--max-early-restarts",
+            "3",
+            "--restart-delay-sec",
+            "0.7",
+            "--",
+            *command,
+        ]
     log_handle = log_path.open("ab")
     try:
         process = subprocess.Popen(
-            command,
+            launch_command,
             stdout=log_handle,
             stderr=log_handle,
             env=tool_env(),
@@ -848,20 +6232,30 @@ def tool_start_scrcpy(args: dict[str, Any]) -> list[dict[str, Any]]:
         )
     except FileNotFoundError as exc:
         log_handle.close()
-        raise AndroidUseError(f"Command not found: {command[0]}") from exc
+        raise AndroidUseError(f"Command not found: {launch_command[0]}") from exc
     log_handle.close()
-    time.sleep(0.5)
-    if process.poll() is not None:
+    startup_deadline = time.monotonic() + (4 if keep_alive else 0.8)
+    while time.monotonic() < startup_deadline:
+        if process.poll() is not None:
+            break
+        if not keep_alive or ready_path.exists():
+            break
+        time.sleep(0.1)
+    if process.poll() is not None or (keep_alive and not ready_path.exists()):
+        if process.poll() is None:
+            terminate_process(process)
         log_text = log_path.read_text(errors="replace") if log_path.exists() else ""
         raise AndroidUseError(f"scrcpy failed to start.\n{log_text[-2000:]}")
     SCRCPY_PROCESSES[process.pid] = process
+    ready_state = read_json_file(ready_path) if keep_alive else {}
 
     lock_pid = None
     lock_error = None
     lock_log_path = SCREEN_DIR / "scrcpy-window-lock.log"
-    should_lock_size = bool(args.get("lock_window_size", True)) and bool(window_width) and bool(window_height)
+    should_lock_size = bool(args.get("lock_window_size", True)) and window_width is not None and window_height is not None
     if should_lock_size and not args.get("borderless", False):
         lock_script = PLUGIN_ROOT / "scripts" / "scrcpy_window_lock.py"
+        lock_continuous = bool(args.get("lock_window_continuous", False))
         lock_command = [
             sys.executable,
             str(lock_script),
@@ -873,6 +6267,8 @@ def tool_start_scrcpy(args: dict[str, Any]) -> list[dict[str, Any]]:
             str(int(window_width)),
             "--height",
             str(int(window_height)),
+            "--max-successes",
+            "0" if lock_continuous else "1",
         ]
         lock_log_handle = lock_log_path.open("ab")
         try:
@@ -889,7 +6285,9 @@ def tool_start_scrcpy(args: dict[str, Any]) -> list[dict[str, Any]]:
                 SCRCPY_LOCK_PROCESSES[lock_process.pid] = lock_process
                 lock_pid = lock_process.pid
             else:
-                lock_error = lock_log_path.read_text(errors="replace")[-2000:] if lock_log_path.exists() else "lock process exited"
+                lock_output = lock_log_path.read_text(errors="replace")[-2000:] if lock_log_path.exists() else ""
+                if "max-successes-reached" not in lock_output:
+                    lock_error = lock_output or "lock process exited"
         except Exception as exc:
             lock_log_handle.close()
             lock_error = str(exc)
@@ -900,8 +6298,11 @@ def tool_start_scrcpy(args: dict[str, Any]) -> list[dict[str, Any]]:
                 "ok": True,
                 "serial": serial,
                 "pid": process.pid,
+                "scrcpy_pid": ready_state.get("pid") if keep_alive else process.pid,
+                "keep_alive": keep_alive,
                 "window_title": window_title,
                 "command": command,
+                "launch_command": launch_command,
                 "log_path": str(log_path),
                 "lock_pid": lock_pid,
                 "lock_log_path": str(lock_log_path) if should_lock_size else None,
@@ -924,13 +6325,11 @@ def tool_stop_scrcpy(args: dict[str, Any]) -> list[dict[str, Any]]:
 
     for pid in pids:
         process = SCRCPY_PROCESSES.pop(pid, None)
-        if process and process.poll() is None:
-            process.terminate()
+        if process and terminate_process(process):
             stopped.append(pid)
     lock_stopped: list[int] = []
     for pid, process in list(SCRCPY_LOCK_PROCESSES.items()):
-        if process.poll() is None:
-            process.terminate()
+        if terminate_process(process):
             lock_stopped.append(pid)
         SCRCPY_LOCK_PROCESSES.pop(pid, None)
     return [text_content({"ok": True, "stopped_pids": stopped, "stopped_lock_pids": lock_stopped})]
@@ -1274,9 +6673,13 @@ def parse_tars_action_response(
     if thought_match:
         thought = thought_match.group(1).strip()
     action_match = re.search(r"Action:\s*(.*)", text, flags=re.S | re.I)
-    if not action_match:
-        raise AndroidUseError(f"VLM response did not include an Action: {response_text}")
-    action_line = action_match.group(1).strip().splitlines()[0].strip()
+    if action_match:
+        action_line = action_match.group(1).strip().splitlines()[0].strip()
+    else:
+        first_line = text.strip().splitlines()[0].strip() if text.strip() else ""
+        if not re.match(r"^(click|long_press|type|scroll|open_app|drag|press_home|press_back|wait|finished)\(", first_line, flags=re.I):
+            raise AndroidUseError(f"VLM response did not include an Action: {response_text}")
+        action_line = first_line
 
     def point_arg(name: str = "point") -> tuple[int, int]:
         match = re.search(rf"{name}\s*=\s*('[^']*'|\"[^\"]*\"|\([^)]+\)|[^,\)]+)", action_line)
@@ -1872,6 +7275,12 @@ def execute_action(serial: str, action: dict[str, Any]) -> list[dict[str, Any]]:
             f"open_app(app_name={app_name!r}) needs a package name on Android. "
             "Ask the model to click the launcher icon if it is visible, or use android_open_app with a package."
         )
+    if action_type == "xiaoluxue_map_fast_path":
+        result = run_xiaoluxue_map_fast_path(serial, action, record=True)
+        return [text_content({"ok": True, "serial": serial, **result})]
+    if action_type == "xiaoluxue_open_native_subject":
+        result = run_xiaoluxue_open_native_subject(serial, action, record=True)
+        return [text_content({"ok": True, "serial": serial, **result})]
     if action_type == "wait":
         seconds = min(float(action.get("seconds", 1)), 10)
         time.sleep(seconds)
@@ -1887,11 +7296,22 @@ def tool_agent_step(args: dict[str, Any]) -> list[dict[str, Any]]:
     execute = bool(args.get("execute", False))
     mode = str(args.get("mode", "hybrid")).lower()
     history = args.get("history") if isinstance(args.get("history"), list) else []
+    scrcpy_result = ensure_default_scrcpy_window(serial, args) if execute else {"ok": True, "skipped": "not-executing"}
 
     if mode in {"hybrid", "uiautomator", "accessibility"}:
         fast_action = fast_ui_action_from_instruction(serial, instruction)
         if fast_action:
-            content = [text_content({"serial": serial, "proposed_action": fast_action, "execute": execute, "mode": mode})]
+            content = [
+                text_content(
+                    {
+                        "serial": serial,
+                        "proposed_action": fast_action,
+                        "execute": execute,
+                        "mode": mode,
+                        "scrcpy": scrcpy_result,
+                    }
+                )
+            ]
             if execute:
                 content.extend(execute_action(serial, fast_action))
             return content
@@ -1913,7 +7333,17 @@ def tool_agent_step(args: dict[str, Any]) -> list[dict[str, Any]]:
         provider=args.get("provider"),
     )
     action_for_display = {key: value for key, value in action.items() if key != "_raw_model_response"}
-    content = [text_content({"serial": serial, "proposed_action": action_for_display, "execute": execute, "mode": mode})]
+    content = [
+        text_content(
+            {
+                "serial": serial,
+                "proposed_action": action_for_display,
+                "execute": execute,
+                "mode": mode,
+                "scrcpy": scrcpy_result,
+            }
+        )
+    ]
     if execute:
         content.extend(execute_action(serial, action))
     return content
@@ -1927,6 +7357,7 @@ def tool_agent_run(args: dict[str, Any]) -> list[dict[str, Any]]:
     delay_sec = min(float(args.get("delay_sec", 0.25)), 5)
     mode = str(args.get("mode", "hybrid")).lower()
     history: list[dict[str, Any]] = []
+    scrcpy_result = ensure_default_scrcpy_window(serial, args) if not dry_run else {"ok": True, "skipped": "dry-run"}
 
     for step_index in range(max_steps):
         action: dict[str, Any] | None = None
@@ -1963,7 +7394,7 @@ def tool_agent_run(args: dict[str, Any]) -> list[dict[str, Any]]:
             break
         time.sleep(delay_sec)
 
-    return [text_content({"serial": serial, "dry_run": dry_run, "steps": history})]
+    return [text_content({"serial": serial, "dry_run": dry_run, "scrcpy": scrcpy_result, "steps": history})]
 
 
 TOOLS: dict[str, dict[str, Any]] = {
@@ -2161,6 +7592,501 @@ TOOLS: dict[str, dict[str, Any]] = {
         },
         "handler": tool_shell,
     },
+    "android_webview_pages": {
+        "description": "List debuggable Android WebView DevTools targets by forwarding webview_devtools_remote sockets.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "serial": {"type": "string"},
+                "port": {"type": "integer", "description": "Optional local port when exactly one WebView socket is present."},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_webview_pages,
+    },
+    "android_webview_eval": {
+        "description": "Evaluate JavaScript in a debuggable Android WebView through Chrome DevTools Protocol.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "serial": {"type": "string"},
+                "page_id": {"type": "string"},
+                "url_contains": {"type": "string"},
+                "title_contains": {"type": "string"},
+                "expression": {"type": "string"},
+                "await_promise": {"type": "boolean", "default": True},
+                "return_by_value": {"type": "boolean", "default": True},
+                "timeout_sec": {"type": "number", "default": 10},
+            },
+            "required": ["expression"],
+            "additionalProperties": False,
+        },
+        "handler": tool_webview_eval,
+    },
+    "xiaoluxue_open_app_url": {
+        "description": "Open a Xiaoluxue H5 URL inside the Xiaoluxue student app through the vessel WebView route, never through a browser.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "serial": {"type": "string"},
+                "url": {"type": "string", "description": "Xiaoluxue app-only URL, such as stu.xiaoluxue.com/course or *.xiaoluxue.cn."},
+                "wait_for_webview": {"type": "boolean", "default": True},
+                "inject_bridge": {"type": "boolean", "default": True},
+                "reveal_overlay": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Dispatch a safe center-screen tap in the WebView after bridge install to reveal hidden course/player overlays.",
+                },
+                "force_stop": {"type": "boolean", "default": False},
+                "timeout_sec": {"type": "number", "default": 5},
+            },
+            "required": ["url"],
+            "additionalProperties": False,
+        },
+        "handler": tool_xiaoluxue_open_app_url,
+    },
+    "xiaoluxue_runtime_status": {
+        "description": "Attach to the current Xiaoluxue WebView, validate the cached runtime target, optionally install the Xiaoluxue JS bridge, and return a fast DOM/runtime snapshot.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "serial": {"type": "string"},
+                "page": {"type": "string", "default": "any", "enum": ["any", "course", "exercise"]},
+                "open_app_if_needed": {"type": "boolean", "default": True},
+                "inject_bridge": {"type": "boolean", "default": True},
+                "reveal_overlay": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Dispatch a safe center-screen tap in the WebView before snapshotting to reveal hidden course/player overlays.",
+                },
+                "timeout_sec": {"type": "number", "default": 4},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_xiaoluxue_runtime_status,
+    },
+    "xiaoluxue_course_snapshot": {
+        "description": "Read a fast DOM snapshot from the Xiaoluxue course WebView, including widgets, visible part, buttons, videos, and URL params.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "serial": {"type": "string"},
+                "timeout_sec": {"type": "number", "default": 10},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_xiaoluxue_course_snapshot,
+    },
+    "xiaoluxue_set_speed": {
+        "description": "Set the current Xiaoluxue guide playback speed through WebView DOM controls, defaulting to 2x.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "serial": {"type": "string"},
+                "rate": {"type": "number", "default": 2.0},
+                "timeout_sec": {"type": "number", "default": 10},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_xiaoluxue_set_speed,
+    },
+    "xiaoluxue_goto_widget": {
+        "description": "Jump to a Xiaoluxue course widget by index/name or the last widget using the WebView fast path.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "serial": {"type": "string"},
+                "index": {"type": "integer"},
+                "name_contains": {"type": "string"},
+                "last": {"type": "boolean", "default": False},
+                "mode": {
+                    "type": "string",
+                    "default": "reload",
+                    "enum": ["reload", "scroll"],
+                    "description": "reload applies redirectWidgetIndex so far widgets load; scroll only moves the current DOM container.",
+                },
+                "timeout_sec": {"type": "number", "default": 10},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_xiaoluxue_goto_widget,
+    },
+    "xiaoluxue_course_fast_path": {
+        "description": "Run the Xiaoluxue course fast path: open a guide widget if needed, set playback speed, then jump to the target widget.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "serial": {"type": "string"},
+                "guide_index": {"type": "integer"},
+                "guide_name_contains": {
+                    "type": "string",
+                    "description": "Guide widget name to open before setting speed. Defaults to the first widget containing 知识讲解/讲解 when a guide player is not already visible.",
+                },
+                "guide_mode": {
+                    "type": "string",
+                    "default": "reload",
+                    "enum": ["reload", "scroll"],
+                },
+                "set_speed": {"type": "boolean", "default": True},
+                "rate": {"type": "number", "default": 2.0},
+                "target_index": {"type": "integer"},
+                "target_name_contains": {"type": "string"},
+                "target_last": {"type": "boolean", "default": True},
+                "target_mode": {
+                    "type": "string",
+                    "default": "reload",
+                    "enum": ["reload", "scroll"],
+                },
+                "after_navigation_wait_sec": {"type": "number", "default": 2.0},
+                "timeout_sec": {"type": "number", "default": 15},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_xiaoluxue_course_fast_path,
+    },
+    "xiaoluxue_open_knowledge_guide": {
+        "description": "Open a Xiaoluxue subject knowledge guide directly through WebView APIs, defaulting to 首页 > 数学 > 1.1.11/1.1.1.1 知识讲解, then set playback speed.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "serial": {"type": "string"},
+                "subject_id": {
+                    "type": "integer",
+                    "default": 2,
+                    "description": "Xiaoluxue subject id. Defaults to 2 (数学).",
+                },
+                "knowledge_index": {
+                    "type": "string",
+                    "default": "1.1.11",
+                    "description": "Human course index. Dots are normalized, so 1.1.11 also matches 1.1.1.1.",
+                },
+                "knowledge_id": {
+                    "type": "integer",
+                    "description": "Optional exact knowledge id. When omitted, known shortcuts and subject-card resolution are used.",
+                },
+                "guide_widget_index": {
+                    "type": "integer",
+                    "description": "Optional course widget index to open. Defaults to the first non-intro guide widget.",
+                },
+                "rate": {"type": "number", "default": 2.0},
+                "prefer_client_route": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Use same-page H5 routing before falling back to a full WebView reload.",
+                },
+                "use_shortcut_url": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Use the built-in Xiaoluxue fast URL cache for known paths such as 数学 1.1.11.",
+                },
+                "refresh_session": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Refetch study_session/enter before opening, slower but useful if a shortcut URL has gone stale.",
+                },
+                "respect_current_h5_host": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "When the current Xiaoluxue WebView is on a test/staging H5 host, rebase known shortcut URLs onto that host instead of opening the production host.",
+                },
+                "open_app_if_needed": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Launch Xiaoluxue if no matching WebView target is currently available.",
+                },
+                "native_entry_if_needed": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "When no WebView is present, use the Xiaoluxue native 首页 > 数学 > 知识讲解 coordinate shortcut before CDP routing.",
+                },
+                "turbo_preview": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Show a temporary fast guide video bridge while the native H5 guide player finishes loading.",
+                },
+                "optimize_neighbor_guides": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Experimental extreme mode: pause non-target guide JSON fetches so the target widget can render first.",
+                },
+                "video_verify_sec": {
+                    "type": "number",
+                    "default": 0.9,
+                    "description": "Short verification window for a video node after installing the 2x rate hook.",
+                },
+                "final_verify": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Run an extra final DOM snapshot after speed setup. Disabled by default to keep the shortcut under 5s.",
+                },
+                "preinject_vessel_bootstrap": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Experimental: inject new-document hooks before opening the vessel WebView. Off by default because it can slow adb/CDP startup.",
+                },
+                "timeout_sec": {"type": "number", "default": 8},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_xiaoluxue_open_knowledge_guide,
+    },
+    "xiaoluxue_map_snapshot": {
+        "description": "Read the current Xiaoluxue native study-map state from UIAutomator without screenshots: subject, chapter, selected/visible indexes, and visible native actions.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "serial": {"type": "string"},
+                "limit": {"type": "integer", "default": 800},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_xiaoluxue_map_snapshot,
+    },
+    "xiaoluxue_open_native_subject": {
+        "description": "Open Xiaoluxue native study subject map through the app-only SchemeProxyActivity route, e.g. subject_id=1 for 语文, without using a browser or WebRTC.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "serial": {"type": "string"},
+                "subject_id": {"type": "integer", "description": "Native subject id, e.g. 1=语文, 2=数学, 3=英语."},
+                "subject": {"type": "string", "description": "Subject name alias such as 语文, 数学, 英语."},
+                "textbook_id": {"type": "integer"},
+                "chapter_id": {"type": "integer"},
+                "knowledge_id": {"type": "integer"},
+                "go_next_knowledge": {"type": "boolean"},
+                "route_wait_sec": {"type": "number", "default": 0.85},
+                "verify_focus": {"type": "boolean", "default": False},
+                "focus_timeout_sec": {"type": "number", "default": 1.5},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_xiaoluxue_open_native_subject,
+    },
+    "xiaoluxue_map_fast_path": {
+        "description": "Run a Xiaoluxue native study-map action quickly. With subject_id/subject it first opens the native map via SchemeProxyActivity, then can use route presets such as 语文 1.5 题型突破.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "serial": {"type": "string"},
+                "instruction": {"type": "string", "description": "Natural-language map instruction, e.g. 进入 1.5 题型突破."},
+                "index": {"type": "string", "description": "Visible map index such as 1.5."},
+                "subject_id": {"type": "integer", "description": "Native subject id, e.g. 1=语文, 2=数学, 3=英语."},
+                "subject": {"type": "string", "description": "Subject name alias such as 语文, 数学, 英语."},
+                "route_if_subject": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "When subject_id/subject is present, open the native subject map route before tapping.",
+                },
+                "route_wait_sec": {"type": "number", "default": 0.85},
+                "action_name": {
+                    "type": "string",
+                    "default": "select",
+                    "enum": [
+                        "select",
+                        "practise",
+                        "wrong",
+                        "notebook",
+                        "report",
+                        "tasks",
+                        "weak",
+                        "chapter_picker",
+                        "done",
+                        "back",
+                    ],
+                },
+                "prefer_predicted": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "After selecting a visible node, tap the expected expanded control position directly instead of doing a second UI dump.",
+                },
+                "use_cache": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Reuse the last native map layout cache so repeated map actions can complete without UIAutomator dump latency.",
+                },
+                "force_observe": {"type": "boolean", "default": False},
+                "cache_max_age_sec": {"type": "number", "default": 21600},
+                "after_select_wait_sec": {"type": "number", "default": 0.34},
+                "open_report_when_done": {"type": "boolean", "default": False},
+                "report_wait_sec": {"type": "number", "default": 0.32},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_xiaoluxue_map_fast_path,
+    },
+    "xiaoluxue_switch_env": {
+        "description": "Switch Xiaoluxue student API environment through the Galaxy Zhixue config app, defaulting to Test环境, then optionally reopen the student app.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "serial": {"type": "string"},
+                "env": {
+                    "type": "string",
+                    "default": "test",
+                    "description": "Target environment: prod/prod-com, dev, test, test2, test3, test4, test5, test6, or kmtest.",
+                },
+                "open_student": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Open Xiaoluxue student after applying the config.",
+                },
+                "force_submit": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Submit even when the current config already matches the requested environment.",
+                },
+                "force_stop_student": {
+                    "type": "boolean",
+                    "description": "Force-stop Xiaoluxue student before reopening. Defaults to true only when the env changed or force_submit=true.",
+                },
+                "timeout_sec": {"type": "number", "default": 10},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_xiaoluxue_switch_env,
+    },
+    "xiaoluxue_exercise_snapshot": {
+        "description": "Read a fast DOM snapshot from the Xiaoluxue /exercise WebView, including question text, options, buttons, progress text, and audio state.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "serial": {"type": "string"},
+                "timeout_sec": {"type": "number", "default": 10},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_xiaoluxue_exercise_snapshot,
+    },
+    "xiaoluxue_exercise_action": {
+        "description": "Run one semantic action on a Xiaoluxue /exercise page: select an option, submit, continue, next, uncertain, give up, or click a button by text.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "serial": {"type": "string"},
+                "action_name": {
+                    "type": "string",
+                    "default": "next",
+                    "enum": ["select_option", "answer", "submit", "next", "continue", "uncertain", "give_up", "button_text"],
+                },
+                "option_key": {"type": "string", "description": "Option key such as A, B, C, D, TRUE, FALSE, 正确, or 错误."},
+                "option_index": {"type": "integer", "description": "1-based visible option index."},
+                "option_text": {"type": "string", "description": "Substring of the option text to select."},
+                "button_text": {"type": "string", "description": "Visible button text used when action_name is button_text."},
+                "timeout_sec": {"type": "number", "default": 10},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_xiaoluxue_exercise_action,
+    },
+    "xiaoluxue_exercise_fast_path": {
+        "description": "Run the Xiaoluxue /exercise fast path. It can select an option, optionally submit, optionally continue, or default to next/continue.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "serial": {"type": "string"},
+                "option_key": {"type": "string"},
+                "option_index": {"type": "integer", "description": "1-based visible option index."},
+                "option_text": {"type": "string"},
+                "submit": {"type": "boolean", "default": False},
+                "continue_after_submit": {"type": "boolean", "default": False},
+                "action_name": {
+                    "type": "string",
+                    "default": "next",
+                    "enum": ["next", "continue", "submit", "uncertain", "give_up", "button_text"],
+                    "description": "Used when no option is provided.",
+                },
+                "button_text": {"type": "string"},
+                "after_action_wait_sec": {"type": "number", "default": 0.4},
+                "timeout_sec": {"type": "number", "default": 15},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_xiaoluxue_exercise_fast_path,
+    },
+    "android_start_recording": {
+        "description": "Start recording deterministic Android actions into a trace for later recipe generation.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "serial": {"type": "string"},
+                "name": {"type": "string"},
+                "include_screenshots": {"type": "boolean", "default": False},
+                "redact_text": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "When true, typed text values are replaced with character counts in the trace.",
+                },
+                "after_delay_sec": {"type": "number", "default": 0.25},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_start_recording,
+    },
+    "android_record_checkpoint": {
+        "description": "Capture a named UI checkpoint in the active Android recording, useful after manual scrcpy navigation.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "serial": {"type": "string"},
+                "label": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_record_checkpoint,
+    },
+    "android_stop_recording": {
+        "description": "Stop the active Android recording and write its trace.json file.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"serial": {"type": "string"}},
+            "additionalProperties": False,
+        },
+        "handler": tool_stop_recording,
+    },
+    "android_create_recipe": {
+        "description": "Convert a recorded Android trace into a selector-first replay recipe.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "trace": {"type": "string", "description": "Trace path, recording id, or recording directory."},
+                "name": {"type": "string"},
+                "output_path": {"type": "string"},
+            },
+            "required": ["trace"],
+            "additionalProperties": False,
+        },
+        "handler": tool_create_recipe,
+    },
+    "android_replay_recipe": {
+        "description": "Replay a selector-first Android recipe using UIAutomator selectors before coordinate fallback.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "serial": {"type": "string"},
+                "recipe": {"type": "string", "description": "Recipe path or recipe name under .android-use/recipes."},
+                "dry_run": {"type": "boolean", "default": False},
+                "strict_verify": {"type": "boolean", "default": False},
+                "step_delay_sec": {"type": "number", "default": 0.25},
+            },
+            "required": ["recipe"],
+            "additionalProperties": False,
+        },
+        "handler": tool_replay_recipe,
+    },
+    "android_index_source": {
+        "description": "Scan Android app source code and write an app-map JSON with activities, routes, ids, and visible labels.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source_path": {"type": "string"},
+                "output_path": {"type": "string"},
+                "max_files": {"type": "integer", "default": 2000},
+            },
+            "required": ["source_path"],
+            "additionalProperties": False,
+        },
+        "handler": tool_index_source,
+    },
     "android_start_scrcpy": {
         "description": "Launch scrcpy for the selected Android device. Defaults to a draggable window with explicit initial size.",
         "inputSchema": {
@@ -2169,8 +8095,34 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "serial": {"type": "string"},
                 "max_size": {"type": "integer", "default": 1280},
                 "bit_rate": {"type": "string", "default": "8M"},
+                "audio": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Enable scrcpy audio forwarding. Disabled by default for screen-control stability.",
+                },
+                "keyboard": {
+                    "type": "string",
+                    "default": "sdk",
+                    "enum": ["disabled", "sdk", "uhid", "aoa"],
+                    "description": "Keyboard injection mode. sdk is best for normal text entry; uhid/aoa simulate a physical keyboard and need Android keyboard layout setup.",
+                },
+                "prefer_text": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "With keyboard=sdk, inject alpha characters and spaces as text events so typing in scrcpy works better.",
+                },
+                "legacy_paste": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Use scrcpy legacy paste behavior for devices where normal clipboard paste fails.",
+                },
                 "stay_awake": {"type": "boolean", "default": False},
                 "turn_screen_off": {"type": "boolean", "default": False},
+                "keep_alive": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Restart scrcpy if the mirroring process exits unexpectedly.",
+                },
                 "fixed_window": {
                     "type": "boolean",
                     "default": True,
@@ -2189,12 +8141,26 @@ TOOLS: dict[str, dict[str, Any]] = {
                     "default": True,
                     "description": "Use macOS accessibility automation to keep the draggable scrcpy window at the requested size.",
                 },
+                "lock_window_continuous": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Keep enforcing the scrcpy window size continuously. Disabled by default so the helper does not interfere with keyboard focus.",
+                },
                 "window_title": {"type": "string"},
                 "extra_args": {"type": "array", "items": {"type": "string"}},
             },
             "additionalProperties": False,
         },
         "handler": tool_start_scrcpy,
+    },
+    "android_scrcpy_resident_status": {
+        "description": "Report and start the background monitor that keeps a visible scrcpy window resident for every connected device. It never starts WebRTC.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+        "handler": tool_scrcpy_resident_status,
     },
     "android_stop_scrcpy": {
         "description": "Stop scrcpy processes launched by this MCP server.",
@@ -2286,6 +8252,11 @@ TOOLS: dict[str, dict[str, Any]] = {
                     "description": "absolute or normalized_1000. Defaults from model/env.",
                 },
                 "history": {"type": "array", "items": {"type": "object"}},
+                "show_scrcpy": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Ensure a visible desktop scrcpy window before executing. Reuses an existing visible scrcpy process and does not start WebRTC.",
+                },
             },
             "required": ["instruction"],
             "additionalProperties": False,
@@ -2317,6 +8288,11 @@ TOOLS: dict[str, dict[str, Any]] = {
                     "type": "string",
                     "description": "absolute or normalized_1000. Defaults from model/env.",
                 },
+                "show_scrcpy": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Ensure a visible desktop scrcpy window before executing. Reuses an existing visible scrcpy process and does not start WebRTC.",
+                },
             },
             "required": ["instruction"],
             "additionalProperties": False,
@@ -2343,6 +8319,7 @@ TOOLS: dict[str, dict[str, Any]] = {
                     "enum": ["hybrid", "visual-grounding", "uiautomator", "accessibility"],
                 },
                 "coordinate_mode": {"type": "string"},
+                "show_scrcpy": {"type": "boolean", "default": True},
             },
             "required": ["instruction"],
             "additionalProperties": False,
@@ -2371,6 +8348,7 @@ TOOLS: dict[str, dict[str, Any]] = {
                     "enum": ["hybrid", "visual-grounding", "uiautomator", "accessibility"],
                 },
                 "coordinate_mode": {"type": "string"},
+                "show_scrcpy": {"type": "boolean", "default": True},
             },
             "required": ["instruction"],
             "additionalProperties": False,
@@ -2447,6 +8425,7 @@ def send(message: dict[str, Any]) -> None:
 
 
 def main() -> None:
+    start_resident_scrcpy_monitor()
     for line in sys.stdin:
         if not line.strip():
             continue

@@ -1,0 +1,12 @@
+{
+  "name": "android-use-plugins",
+  "source": {
+    "source": "local",
+    "path": "./plugins/android-use-plugins"
+  },
+  "policy": {
+    "installation": "AVAILABLE",
+    "authentication": "ON_INSTALL"
+  },
+  "category": "Developer Tools"
+}

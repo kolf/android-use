@@ -65,6 +65,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, required=True)
     parser.add_argument("--height", type=int, required=True)
     parser.add_argument("--interval-sec", type=float, default=0.25)
+    parser.add_argument(
+        "--max-successes",
+        type=int,
+        default=0,
+        help="Stop after this many successful size applications. 0 means run forever.",
+    )
     return parser.parse_args()
 
 
@@ -75,12 +81,17 @@ def main() -> int:
         f"locking {args.process_name!r} window {args.window_title!r} to {args.width}x{args.height}",
         flush=True,
     )
+    successes = 0
     while True:
         try:
             status = lock_once(args.process_name, args.window_title, args.width, args.height)
             failures = 0
             if status == "process-not-found":
                 print(status, flush=True)
+                return 0
+            successes += 1
+            if args.max_successes > 0 and successes >= args.max_successes:
+                print(f"max-successes-reached:{successes}", flush=True)
                 return 0
         except Exception as exc:
             failures += 1

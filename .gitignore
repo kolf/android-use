@@ -1,6 +1,8 @@
 .android/
+.android-use/
 .screen/
 .venv/
+Library/
 tools/
 __pycache__/
 *.py[cod]
