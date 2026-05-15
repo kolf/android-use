@@ -66,6 +66,7 @@ entry = {
     "policy": {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
     "category": "Developer Tools",
 }
+legacy_plugin_names = {"android-use", "xiaoluxue-android-use"}
 if path.exists():
     try:
         payload = json.loads(path.read_text())
@@ -86,12 +87,31 @@ if interface.get("displayName") in (None, "", "Xiaoluxue Codex Plugins", "[TODO:
 plugins = payload.setdefault("plugins", [])
 if not isinstance(plugins, list):
     raise SystemExit(f"{path}: plugins must be a list")
-for index, plugin in enumerate(plugins):
-    if isinstance(plugin, dict) and plugin.get("name") == plugin_name:
-        plugins[index] = entry
-        break
+
+replacement_index = None
+migrated_installation = None
+next_plugins = []
+for plugin in plugins:
+    if not isinstance(plugin, dict):
+        next_plugins.append(plugin)
+        continue
+    name = plugin.get("name")
+    if name == plugin_name or name in legacy_plugin_names:
+        if replacement_index is None:
+            replacement_index = len(next_plugins)
+        policy = plugin.get("policy") if isinstance(plugin.get("policy"), dict) else {}
+        if policy.get("installation") == "INSTALLED_BY_DEFAULT":
+            migrated_installation = "INSTALLED_BY_DEFAULT"
+        continue
+    next_plugins.append(plugin)
+
+if migrated_installation:
+    entry["policy"]["installation"] = migrated_installation
+if replacement_index is None:
+    next_plugins.append(entry)
 else:
-    plugins.append(entry)
+    next_plugins.insert(replacement_index, entry)
+payload["plugins"] = next_plugins
 
 path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
 print(path)

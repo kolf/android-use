@@ -61,10 +61,13 @@ from pathlib import Path
 path = Path(os.environ["MARKETPLACE_PATH"]).expanduser()
 name = os.environ["PLUGIN_NAME"]
 payload = json.loads(path.read_text())
-assert payload.get("name") == name, payload.get("name")
-assert payload.get("interface", {}).get("displayName") == "Android Use Plugins", payload.get("interface")
 plugins = payload.get("plugins", [])
-assert any(isinstance(item, dict) and item.get("name") == name for item in plugins), f"{name} not found in {path}"
+matches = [item for item in plugins if isinstance(item, dict) and item.get("name") == name]
+assert matches, f"{name} not found in {path}"
+legacy = [item.get("name") for item in plugins if isinstance(item, dict) and item.get("name") in {"android-use", "xiaoluxue-android-use"}]
+assert not legacy, f"legacy android plugin entries still present in {path}: {legacy}"
+entry = matches[-1]
+assert entry.get("source", {}).get("path") == f"./plugins/{name}", entry
 print(f"ok   marketplace entry: {path}")
 PY
 else
