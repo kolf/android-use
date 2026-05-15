@@ -1,6 +1,10 @@
 {
   "name": "android-use-plugins",
   "version": "0.1.0",
+  "displayName": "Android",
+  "icon": "./assets/android.png",
+  "composerIcon": "./assets/android.png",
+  "logo": "./assets/android.png",
   "description": "Control attached Android devices from Codex through adb, scrcpy, screenshots, and optional vision-model planning.",
   "author": {
     "name": "Xiaoluxue",
@@ -21,7 +25,7 @@
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {
-    "displayName": "Android Use Plugins",
+    "displayName": "Android",
     "shortDescription": "Control Android devices from Codex",
     "longDescription": "Android Use lets Codex inspect and control an attached Android device through adb, scrcpy, screenshots, input events, and an optional OpenAI-compatible vision-model planner inspired by Agent TARS and UI-TARS Desktop.",
     "developerName": "Xiaoluxue",

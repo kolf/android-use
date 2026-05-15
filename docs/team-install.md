@@ -1,4 +1,4 @@
-# Android Use Plugins 团队安装说明
+# Android 团队安装说明
 
 `android-use-plugins` 是小鹿内部 Codex Android 控制插件，提供 adb、scrcpy、截图、WebView 调试、小鹿爱学快路径等能力。
 
@@ -16,7 +16,7 @@ cd ~/.agents/plugins/android-use-plugins
 ~/.agents/plugins/marketplace.json
 ```
 
-完成后重启 Codex，在插件列表里启用 `Android Use Plugins`。
+完成后重启 Codex，在插件列表里启用 `Android`。
 
 ## 依赖
 

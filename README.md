@@ -1,6 +1,6 @@
-# Android Use Plugins
+# Android
 
-Android Use Plugins is a local Codex plugin package named `android-use-plugins`. It operates an attached Android device through adb and scrcpy, with an Agent-TARS-style natural-language operator loop and Xiaoluxue-specific fast paths.
+Android is a local Codex plugin package named `android-use-plugins`. It operates an attached Android device through adb and scrcpy, with an Agent-TARS-style natural-language operator loop and Xiaoluxue-specific fast paths.
 
 ## Team Install
 
@@ -11,7 +11,7 @@ cd ~/.agents/plugins/android-use-plugins
 ./doctor.sh
 ```
 
-Then restart Codex and enable `Android Use Plugins` from the local plugin marketplace.
+Then restart Codex and enable `Android` from the local plugin marketplace.
 
 The installer writes or updates `~/.agents/plugins/marketplace.json` with the `android-use-plugins` entry. See [docs/team-install.md](docs/team-install.md) for the Chinese team guide.
 

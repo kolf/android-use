@@ -44,7 +44,10 @@ import json
 from pathlib import Path
 plugin = json.loads(Path(".codex-plugin/plugin.json").read_text())
 assert plugin["name"] == "android-use-plugins", plugin["name"]
-assert plugin["interface"]["displayName"] == "Android Use Plugins", plugin["interface"]["displayName"]
+assert plugin["interface"]["displayName"] == "Android", plugin["interface"]["displayName"]
+assert plugin.get("icon") == "./assets/android.png", plugin.get("icon")
+assert plugin["interface"]["composerIcon"] == "./assets/android.png", plugin["interface"].get("composerIcon")
+assert plugin["interface"]["logo"] == "./assets/android.png", plugin["interface"].get("logo")
 mcp = json.loads(Path(".mcp.json").read_text())
 assert "android-use" in mcp["mcpServers"], mcp
 print("ok   plugin manifest and mcp config")

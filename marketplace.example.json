@@ -1,7 +1,7 @@
 {
   "name": "android-use-plugins",
   "interface": {
-    "displayName": "Android Use Plugins"
+    "displayName": "Android"
   },
   "plugins": [
     {

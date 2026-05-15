@@ -76,7 +76,7 @@ if path.exists():
 else:
     payload = {
         "name": "android-use-plugins",
-        "interface": {"displayName": "Android Use Plugins"},
+        "interface": {"displayName": "Android"},
         "plugins": [],
     }
 
@@ -84,7 +84,7 @@ if payload.get("name") in (None, "", "xiaoluxue-codex-plugins", "[TODO: marketpl
     payload["name"] = "android-use-plugins"
 interface = payload.setdefault("interface", {})
 if interface.get("displayName") in (None, "", "Xiaoluxue Codex Plugins", "[TODO: Marketplace Display Name]"):
-    interface["displayName"] = "Android Use Plugins"
+    interface["displayName"] = "Android"
 plugins = payload.setdefault("plugins", [])
 if not isinstance(plugins, list):
     raise SystemExit(f"{path}: plugins must be a list")
@@ -155,7 +155,7 @@ main() {
     info "Codex config migrated: $config"
   fi
   info "Plugin path: $INSTALL_DIR"
-  info "Restart Codex, then enable Android Use Plugins from the local plugin marketplace."
+  info "Restart Codex, then enable Android from the local plugin marketplace."
   info "Run ./doctor.sh after restart if the plugin does not appear or cannot control a device."
 }
 
