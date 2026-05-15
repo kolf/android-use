@@ -846,6 +846,23 @@ def lock_path(name: str) -> Path:
     return SCREEN_DIR / f"{slugify(name, 'lock')}.lock"
 
 
+def scrcpy_user_closed_path(serial: str) -> Path:
+    return SCREEN_DIR / f"scrcpy-user-closed-{slugify(serial)}.json"
+
+
+def read_scrcpy_user_closed(serial: str) -> dict[str, Any] | None:
+    path = scrcpy_user_closed_path(serial)
+    if not path.exists():
+        return None
+    payload = read_json_file(path)
+    return payload or {"path": str(path)}
+
+
+def clear_scrcpy_user_closed(serial: str) -> None:
+    with contextlib.suppress(OSError):
+        scrcpy_user_closed_path(serial).unlink()
+
+
 @contextlib.contextmanager
 def exclusive_file_lock(path: Path, *, blocking: bool = True) -> Iterator[bool]:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -6027,7 +6044,18 @@ def ensure_default_scrcpy_window(serial: str, args: dict[str, Any]) -> dict[str,
             return {"ok": False, "error": "could not acquire scrcpy launch lock"}
         existing = scrcpy_visible_process_for_serial(serial)
         if existing:
+            if not bool(args.get("respect_manual_close", False)):
+                clear_scrcpy_user_closed(serial)
             return {"ok": True, "skipped": "already-running", "process": existing[:500], "launch_lock": str(launch_lock)}
+        user_closed = read_scrcpy_user_closed(serial)
+        if user_closed and bool(args.get("respect_manual_close", False)):
+            return {
+                "ok": True,
+                "skipped": "user-closed",
+                "user_closed": user_closed,
+                "launch_lock": str(launch_lock),
+            }
+        clear_scrcpy_user_closed(serial)
         try:
             content = tool_start_scrcpy(
                 {
@@ -6086,6 +6114,7 @@ def ensure_resident_scrcpy_windows() -> dict[str, Any]:
                 "scrcpy_fixed_window": True,
                 "scrcpy_lock_window_size": True,
                 "scrcpy_max_size": 1280,
+                "respect_manual_close": True,
             },
         )
         ensured.append({"serial": serial, **result})
@@ -6195,11 +6224,13 @@ def terminate_process(process: subprocess.Popen[bytes], *, timeout: float = 3) -
 def tool_start_scrcpy(args: dict[str, Any]) -> list[dict[str, Any]]:
     serial = choose_serial(args.get("serial"))
     command, window_width, window_height, window_title = build_scrcpy_command(args, serial)
+    clear_scrcpy_user_closed(serial)
 
     SCREEN_DIR.mkdir(parents=True, exist_ok=True)
     log_path = SCREEN_DIR / "scrcpy.log"
     keep_alive = bool(args.get("keep_alive", True))
     ready_path = SCREEN_DIR / f"scrcpy-{uuid.uuid4().hex}.ready.json"
+    user_closed_path = scrcpy_user_closed_path(serial)
     launch_command = command
     if keep_alive:
         supervisor_script = PLUGIN_ROOT / "scripts" / "scrcpy_supervisor.py"
@@ -6214,10 +6245,14 @@ def tool_start_scrcpy(args: dict[str, Any]) -> list[dict[str, Any]]:
             "0.8",
             "--early-exit-sec",
             "2.0",
+            "--manual-exit-after-sec",
+            "2.0",
             "--max-early-restarts",
             "3",
             "--restart-delay-sec",
             "0.7",
+            "--user-closed-file",
+            str(user_closed_path),
             "--",
             *command,
         ]
@@ -6304,6 +6339,7 @@ def tool_start_scrcpy(args: dict[str, Any]) -> list[dict[str, Any]]:
                 "command": command,
                 "launch_command": launch_command,
                 "log_path": str(log_path),
+                "user_closed_path": str(user_closed_path) if keep_alive else None,
                 "lock_pid": lock_pid,
                 "lock_log_path": str(lock_log_path) if should_lock_size else None,
                 "lock_error": lock_error,
@@ -6311,6 +6347,60 @@ def tool_start_scrcpy(args: dict[str, Any]) -> list[dict[str, Any]]:
             }
         )
     ]
+
+
+AUTO_SCRCPY_TOOL_NAMES = {
+    "android_get_state",
+    "android_screenshot",
+    "android_show_screen",
+    "android_observe",
+    "android_tap_text",
+    "android_tap",
+    "android_swipe",
+    "android_type_text",
+    "android_press_key",
+    "android_wake_unlock",
+    "android_open_url",
+    "android_open_app",
+    "android_webview_pages",
+    "android_webview_eval",
+    "android_start_recording",
+    "android_record_checkpoint",
+    "android_stop_recording",
+    "android_replay_recipe",
+}
+
+
+def should_auto_show_scrcpy_for_tool(name: str, arguments: dict[str, Any]) -> bool:
+    if not env_flag("ANDROID_USE_SCRCPY_ON_TOOL_CALL", True):
+        return False
+    if arguments.get("show_scrcpy") is False:
+        return False
+    if name.startswith("xiaoluxue_"):
+        return True
+    return name in AUTO_SCRCPY_TOOL_NAMES
+
+
+def maybe_show_scrcpy_for_tool_call(name: str, arguments: dict[str, Any]) -> None:
+    if not should_auto_show_scrcpy_for_tool(name, arguments):
+        return
+    try:
+        serial = choose_serial(arguments.get("serial"))
+        result = ensure_default_scrcpy_window(
+            serial,
+            {
+                **arguments,
+                "show_scrcpy": True,
+                "respect_manual_close": False,
+                "scrcpy_keep_alive": arguments.get("scrcpy_keep_alive", True),
+                "scrcpy_fixed_window": arguments.get("scrcpy_fixed_window", True),
+                "scrcpy_lock_window_size": arguments.get("scrcpy_lock_window_size", True),
+                "scrcpy_max_size": arguments.get("scrcpy_max_size", 1280),
+            },
+        )
+        update_resident_scrcpy_status(last_on_demand_result={"tool": name, "serial": serial, **result})
+    except Exception as exc:
+        update_resident_scrcpy_status(last_on_demand_error={"tool": name, "error": str(exc), "at": time.time()})
 
 
 def tool_stop_scrcpy(args: dict[str, Any]) -> list[dict[str, Any]]:
@@ -8121,7 +8211,7 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "keep_alive": {
                     "type": "boolean",
                     "default": True,
-                    "description": "Restart scrcpy if the mirroring process exits unexpectedly.",
+                    "description": "Retry startup-time scrcpy exits. Manual window closes after startup are respected until the next Android tool call.",
                 },
                 "fixed_window": {
                     "type": "boolean",
@@ -8154,7 +8244,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_start_scrcpy,
     },
     "android_scrcpy_resident_status": {
-        "description": "Report and start the background monitor that keeps a visible scrcpy window resident for every connected device. It never starts WebRTC.",
+        "description": "Report and start the background monitor. It never starts WebRTC and respects manual scrcpy window closes until the next Android tool call.",
         "inputSchema": {
             "type": "object",
             "properties": {},
@@ -8401,6 +8491,7 @@ def handle_request(message: dict[str, Any]) -> dict[str, Any] | None:
                 "result": {"content": [text_content(f"Unknown tool: {name}")], "isError": True},
             }
         try:
+            maybe_show_scrcpy_for_tool_call(name, arguments)
             content = TOOLS[name]["handler"](arguments)
             return {"jsonrpc": "2.0", "id": message_id, "result": {"content": content}}
         except Exception as exc:  # Keep MCP session alive on tool errors.

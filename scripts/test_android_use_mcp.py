@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -344,6 +346,78 @@ abc123 unauthorized usb:336592896X
                     mcp.os.environ.pop(key, None)
                 else:
                     mcp.os.environ[key] = value
+
+    def test_scrcpy_manual_close_marker_blocks_resident_reopen_until_tool_call(self) -> None:
+        original_screen_dir = mcp.SCREEN_DIR
+        original_visible = mcp.scrcpy_visible_process_for_serial
+        original_start = mcp.tool_start_scrcpy
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                mcp.SCREEN_DIR = Path(tmpdir)
+                mcp.scrcpy_user_closed_path("device-1").write_text(json.dumps({"closed_at": 1, "runtime_sec": 3}))
+                mcp.scrcpy_visible_process_for_serial = lambda _serial: None
+                calls: list[dict[str, object]] = []
+
+                def fake_start(args: dict[str, object]) -> list[dict[str, str]]:
+                    calls.append(args)
+                    return [mcp.text_content({"ok": True, "serial": args.get("serial")})]
+
+                mcp.tool_start_scrcpy = fake_start  # type: ignore[assignment]
+
+                resident_result = mcp.ensure_default_scrcpy_window(
+                    "device-1",
+                    {"show_scrcpy": True, "respect_manual_close": True},
+                )
+                self.assertEqual(resident_result["skipped"], "user-closed")
+                self.assertEqual(calls, [])
+
+                tool_result = mcp.ensure_default_scrcpy_window(
+                    "device-1",
+                    {"show_scrcpy": True, "respect_manual_close": False},
+                )
+                self.assertTrue(tool_result["ok"])
+                self.assertEqual(len(calls), 1)
+                self.assertFalse(mcp.scrcpy_user_closed_path("device-1").exists())
+        finally:
+            mcp.SCREEN_DIR = original_screen_dir
+            mcp.scrcpy_visible_process_for_serial = original_visible
+            mcp.tool_start_scrcpy = original_start  # type: ignore[assignment]
+
+    def test_scrcpy_supervisor_treats_late_exit_as_manual_close(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            marker = Path(tmpdir) / "user-closed.json"
+            ready = Path(tmpdir) / "ready.json"
+            supervisor = Path(__file__).with_name("scrcpy_supervisor.py")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(supervisor),
+                    "--ready-file",
+                    str(ready),
+                    "--ready-after-sec",
+                    "0.05",
+                    "--early-exit-sec",
+                    "0.05",
+                    "--manual-exit-after-sec",
+                    "0.1",
+                    "--user-closed-file",
+                    str(marker),
+                    "--",
+                    sys.executable,
+                    "-c",
+                    "import time; time.sleep(0.2)",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+            self.assertTrue(marker.exists(), result.stdout)
+            payload = json.loads(marker.read_text())
+            self.assertGreaterEqual(payload["runtime_sec"], 0.1)
+            self.assertIn("not restarting", result.stdout)
 
     def test_tool_descriptors_include_required_tools(self) -> None:
         tool_names = {tool["name"] for tool in mcp.tool_descriptors()}

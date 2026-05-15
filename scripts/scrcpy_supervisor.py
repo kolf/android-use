@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Keep a scrcpy process alive until the supervisor is stopped."""
+"""Keep scrcpy alive through startup flakiness, but respect manual window closes."""
 
 from __future__ import annotations
 
@@ -20,6 +20,13 @@ CHILD: subprocess.Popen[bytes] | None = None
 
 
 def write_ready_file(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2))
+    tmp_path.replace(path)
+
+
+def write_user_closed_file(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     tmp_path.write_text(json.dumps(payload, indent=2))
@@ -83,8 +90,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ready-file")
     parser.add_argument("--ready-after-sec", type=float, default=0.8)
     parser.add_argument("--early-exit-sec", type=float, default=2.0)
+    parser.add_argument("--manual-exit-after-sec", type=float, default=2.0)
     parser.add_argument("--max-early-restarts", type=int, default=3)
     parser.add_argument("--restart-delay-sec", type=float, default=0.7)
+    parser.add_argument("--user-closed-file")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if args.command and args.command[0] == "--":
@@ -104,6 +113,22 @@ def main() -> int:
         returncode, runtime = run_child(args.command, args)
         if STOPPING:
             break
+        if args.manual_exit_after_sec >= 0 and runtime >= args.manual_exit_after_sec:
+            if args.user_closed_file:
+                write_user_closed_file(
+                    Path(args.user_closed_file),
+                    {
+                        "closed_at": time.time(),
+                        "runtime_sec": runtime,
+                        "returncode": returncode,
+                        "command": args.command,
+                    },
+                )
+            print(
+                "scrcpy-supervisor: child exited after manual-close threshold; not restarting",
+                flush=True,
+            )
+            return returncode or 0
         if runtime < args.early_exit_sec:
             early_restarts += 1
             if 0 <= args.max_early_restarts < early_restarts:

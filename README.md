@@ -20,12 +20,12 @@ The first version is intentionally small and practical:
 - device discovery through `adb devices -l`;
 - screenshots through `adb exec-out screencap -p`;
 - inline screen display through `android_show_screen`;
-- resident visible desktop mirroring through `android_start_scrcpy`; the MCP server keeps one scrcpy window alive for one physical device by default;
+- visible desktop mirroring through `android_start_scrcpy`; the MCP server opens one scrcpy window by default when Android tools are used;
 - optional Codex-embedded WebRTC video through `android_start_webrtc_viewer`;
 - a Codex-friendly local web viewer through `android_start_screen_viewer`;
 - taps, swipes, key events, simple text input, and adb shell commands;
 - wake/unlock, open URL, and launch app helpers;
-- scrcpy launch/stop helpers, defaulting to a draggable video-only window with keep-alive restart and a small macOS size-lock helper when Accessibility permission is available;
+- scrcpy launch/stop helpers, defaulting to a draggable video-only window with startup-flake restart and a small macOS size-lock helper when Accessibility permission is available;
 - fast UIAutomator observation and text tapping through `android_observe` and `android_tap_text`;
 - debuggable WebView discovery/eval through `android_webview_pages` and `android_webview_eval`;
 - Xiaoluxue app-only URL routing, runtime bridge/status, environment, native subject-map routing, native map, course, and exercise fast paths through `xiaoluxue_open_app_url`, `xiaoluxue_runtime_status`, `xiaoluxue_switch_env`, `xiaoluxue_open_native_subject`, `xiaoluxue_map_fast_path`, `xiaoluxue_course_fast_path`, `xiaoluxue_exercise_fast_path`, and lower-level Xiaoluxue tools;
@@ -95,7 +95,7 @@ python3 scripts/test_android_use_mcp.py
 python3 scripts/android_use_mcp.py
 ```
 
-For normal interactive operation, use the default visible scrcpy desktop window. The MCP server starts a background resident monitor on startup and keeps one visible scrcpy window alive for one physical device, preferring `ANDROID_USE_SCRCPY_RESIDENT_SERIALS`, `ANDROID_USE_SERIAL`, or `ANDROID_SERIAL` when set. `android_agent_run` and `android_agent_step` also ensure that window before executing unless `show_scrcpy=false` is passed, and they reuse an existing visible scrcpy process for the same device instead of starting a duplicate.
+For normal interactive operation, use the default visible scrcpy desktop window. The MCP server opens one visible scrcpy window for one physical device by default when Android tools are used, preferring `ANDROID_USE_SCRCPY_RESIDENT_SERIALS`, `ANDROID_USE_SERIAL`, or `ANDROID_SERIAL` when set. If the user manually closes the scrcpy window after it has been visible, the resident monitor leaves it closed. The next Android tool call clears that manual-close marker and opens a fresh scrcpy window. `android_agent_run` and `android_agent_step` also ensure that window before executing unless `show_scrcpy=false` is passed, and they reuse an existing visible scrcpy process for the same device instead of starting a duplicate.
 
 To show the device inside Codex, call `android_show_screen` for a current screenshot or `android_start_screen_viewer` for an auto-refreshing local web page.
 
@@ -108,9 +108,9 @@ python3 -m venv .venv
 
 The MCP server uses newline-delimited JSON-RPC over stdio and has no third-party Python dependencies.
 
-`android_start_scrcpy` disables scrcpy audio by default and launches through a small supervisor so accidental scrcpy exits are restarted. It also starts scrcpy with `keyboard=sdk` and `prefer_text=true` by default so typing in the scrcpy window uses text injection instead of fragile raw key combinations. Pass `audio=true` if you explicitly need audio forwarding, `keep_alive=false` for a one-off manual launch, `keyboard=uhid` if you need physical-keyboard behavior, or `legacy_paste=true` if normal clipboard paste fails on a device.
+`android_start_scrcpy` disables scrcpy audio by default and launches through a small supervisor so startup-time scrcpy exits are retried. Once the window has been visible, closing it manually is respected and it will not be relaunched until the next Android tool call. It also starts scrcpy with `keyboard=sdk` and `prefer_text=true` by default so typing in the scrcpy window uses text injection instead of fragile raw key combinations. Pass `audio=true` if you explicitly need audio forwarding, `keep_alive=false` for a one-off manual launch, `keyboard=uhid` if you need physical-keyboard behavior, or `legacy_paste=true` if normal clipboard paste fails on a device.
 
-The resident monitor never starts WebRTC. Set `ANDROID_USE_SCRCPY_RESIDENT_SERIALS` to a comma-separated serial list only when multiple resident windows are wanted. Set `ANDROID_USE_SCRCPY_RESIDENT=0` to disable the always-on scrcpy window, or `ANDROID_USE_SCRCPY_RESIDENT_INTERVAL_SEC` to change the watchdog interval. Use `android_scrcpy_resident_status` to check the monitor and its last restart result.
+The resident monitor never starts WebRTC. Set `ANDROID_USE_SCRCPY_RESIDENT_SERIALS` to a comma-separated serial list only when multiple resident windows are wanted. Set `ANDROID_USE_SCRCPY_RESIDENT=0` to disable the background monitor, `ANDROID_USE_SCRCPY_ON_TOOL_CALL=0` to stop Android tool calls from opening scrcpy, or `ANDROID_USE_SCRCPY_RESIDENT_INTERVAL_SEC` to change the watchdog interval. Use `android_scrcpy_resident_status` to check the monitor and its last launch result.
 
 ## Fast Repeat Workflows
 
