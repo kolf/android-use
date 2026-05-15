@@ -6,6 +6,7 @@ REPO_URL="${ANDROID_USE_PLUGIN_REPO_URL:-https://gitlab.xiaoluxue.cn/shixiankang
 PLUGIN_ROOT="${ANDROID_USE_PLUGIN_ROOT:-$HOME/.agents/plugins}"
 INSTALL_DIR="${ANDROID_USE_PLUGIN_INSTALL_DIR:-$PLUGIN_ROOT/$PLUGIN_NAME}"
 MARKETPLACE_PATH="${ANDROID_USE_PLUGIN_MARKETPLACE:-$HOME/.agents/plugins/marketplace.json}"
+CODEX_CONFIG_PATH="${ANDROID_USE_CODEX_CONFIG:-$HOME/.codex/config.toml}"
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 info() {
@@ -118,6 +119,25 @@ print(path)
 PY
 }
 
+migrate_codex_config() {
+  [ -f "$CODEX_CONFIG_PATH" ] || return 0
+  CODEX_CONFIG_PATH="$CODEX_CONFIG_PATH" PLUGIN_NAME="$PLUGIN_NAME" python3 - <<'PY'
+import os
+from pathlib import Path
+
+path = Path(os.environ["CODEX_CONFIG_PATH"]).expanduser()
+plugin_name = os.environ["PLUGIN_NAME"]
+text = path.read_text()
+original = text
+for legacy_name in ("android-use", "xiaoluxue-android-use"):
+    text = text.replace(f'[plugins."{legacy_name}@local"]', f'[plugins."{plugin_name}@local"]')
+    text = text.replace(f'[plugins."{legacy_name}@local".', f'[plugins."{plugin_name}@local".')
+if text != original:
+    path.write_text(text)
+    print(path)
+PY
+}
+
 main() {
   require_command git
   require_command python3
@@ -129,7 +149,11 @@ main() {
   fi
   install_or_update_plugin
   marketplace="$(write_marketplace)"
+  config="$(migrate_codex_config || true)"
   info "Marketplace updated: $marketplace"
+  if [ -n "${config:-}" ]; then
+    info "Codex config migrated: $config"
+  fi
   info "Plugin path: $INSTALL_DIR"
   info "Restart Codex, then enable Android Use Plugins from the local plugin marketplace."
   info "Run ./doctor.sh after restart if the plugin does not appear or cannot control a device."
