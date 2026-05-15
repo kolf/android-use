@@ -47,18 +47,20 @@ cd ~/.agents/plugins/android-use-plugins
 在 Codex 对话中：
 
 ```text
-[@android-use] 打开并截图
-[@android-use] 小鹿退出到首页
-[@android-use] 进入语文 1.5 题型突破
+[@Android] 打开并截图
+[@Android] 小鹿退出到首页
+[@Android] 进入语文 1.5 题型突破
 ```
 
 小鹿爱学 H5 链接不要用浏览器打开，插件会通过小鹿爱学 App 内部 route 或 WebView vessel 打开。
+
+默认会弹出一个 scrcpy 桌面窗口，方便人工观察和接管。窗口稳定显示后，如果你手动关闭，插件会尊重这次关闭，不会马上自动重开；下一次调用 Android 插件工具时会再弹出。
 
 ## 常见问题
 
 - 插件列表看不到：确认 `~/.agents/plugins/marketplace.json` 里有 `android-use-plugins`，然后重启 Codex。
 - 设备不可控：先跑 `adb devices -l`，确认设备状态是 `device`。
-- scrcpy 没窗口：跑 `scrcpy --version` 和 `./doctor.sh`，确认依赖已安装。
+- scrcpy 没窗口：跑 `scrcpy --version` 和 `./doctor.sh`，确认依赖已安装。若刚刚手动关闭过窗口，下一次调用 Android 工具时会重新弹出。
 - 多设备场景：默认只给一个物理设备保留常驻 scrcpy 窗口。需要指定设备时设置：
 
 ```bash

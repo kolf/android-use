@@ -5,7 +5,7 @@
   "icon": "./assets/android.png",
   "composerIcon": "./assets/android.png",
   "logo": "./assets/android.png",
-  "description": "Control attached Android devices from Codex through adb, scrcpy, screenshots, and optional vision-model planning.",
+  "description": "在 Codex 中通过 adb、scrcpy、截图和可选视觉模型控制已连接的 Android 设备。",
   "author": {
     "name": "Xiaoluxue",
     "email": "shixiankang@xiaoluxue.cn",
@@ -26,24 +26,25 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Android",
-    "shortDescription": "Control Android devices from Codex",
-    "longDescription": "Android Use lets Codex inspect and control an attached Android device through adb, scrcpy, screenshots, input events, and an optional OpenAI-compatible vision-model planner inspired by Agent TARS and UI-TARS Desktop.",
+    "shortDescription": "在 Codex 中控制 Android 设备",
+    "longDescription": "Android Use 让 Codex 通过 adb、scrcpy、截图、输入事件和可选 OpenAI-compatible 视觉模型操作已连接的 Android 设备，并提供小鹿爱学 WebView、课程、练习和原生地图快路径。",
     "developerName": "Xiaoluxue",
     "category": "Developer Tools",
     "capabilities": [
-      "Android device control",
+      "Android 设备控制",
       "ADB shell",
-      "scrcpy mirroring",
-      "Screenshot observation",
-      "Vision-model action planning"
+      "scrcpy 镜像",
+      "截图观察",
+      "视觉模型动作规划",
+      "小鹿爱学快路径"
     ],
     "websiteURL": "https://gitlab.xiaoluxue.cn/shixiankang/android-use",
     "privacyPolicyURL": "https://gitlab.xiaoluxue.cn/shixiankang/android-use",
     "termsOfServiceURL": "https://gitlab.xiaoluxue.cn/shixiankang/android-use",
     "defaultPrompt": [
-      "Show the connected Android device state",
-      "Take a screenshot and suggest the next action",
-      "Open scrcpy for my attached phone"
+      "显示已连接 Android 设备状态",
+      "截图并判断下一步操作",
+      "为我的手机打开 scrcpy 窗口"
     ],
     "brandColor": "#16A34A",
     "composerIcon": "./assets/android.png",

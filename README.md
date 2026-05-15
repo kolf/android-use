@@ -1,8 +1,8 @@
 # Android
 
-Android is a local Codex plugin package named `android-use-plugins`. It operates an attached Android device through adb and scrcpy, with an Agent-TARS-style natural-language operator loop and Xiaoluxue-specific fast paths.
+`android-use-plugins` 是一个本地 Codex 插件，用于通过 adb、scrcpy、截图、输入事件和可选视觉模型来操作已连接的 Android 设备。它内置了 Agent-TARS 风格的自然语言操作循环，也包含小鹿爱学专用快路径。
 
-## Team Install
+## 团队安装
 
 ```bash
 git clone https://gitlab.xiaoluxue.cn/shixiankang/android-use.git ~/.agents/plugins/android-use-plugins
@@ -11,72 +11,75 @@ cd ~/.agents/plugins/android-use-plugins
 ./doctor.sh
 ```
 
-Then restart Codex and enable `Android` from the local plugin marketplace.
+完成后重启 Codex，并在本地插件列表里启用 `Android`。
 
-The installer writes or updates `~/.agents/plugins/marketplace.json` with the `android-use-plugins` entry. See [docs/team-install.md](docs/team-install.md) for the Chinese team guide.
+安装脚本会写入或更新 `~/.agents/plugins/marketplace.json` 中的 `android-use-plugins` 条目。团队安装细节见 [docs/team-install.md](docs/team-install.md)。
 
-The first version is intentionally small and practical:
+当前版本重点解决高频调试需求：
 
-- device discovery through `adb devices -l`;
-- screenshots through `adb exec-out screencap -p`;
-- inline screen display through `android_show_screen`;
-- visible desktop mirroring through `android_start_scrcpy`; the MCP server opens one scrcpy window by default when Android tools are used;
-- optional Codex-embedded WebRTC video through `android_start_webrtc_viewer`;
-- a Codex-friendly local web viewer through `android_start_screen_viewer`;
-- taps, swipes, key events, simple text input, and adb shell commands;
-- wake/unlock, open URL, and launch app helpers;
-- scrcpy launch/stop helpers, defaulting to a draggable video-only window with startup-flake restart and a small macOS size-lock helper when Accessibility permission is available;
-- fast UIAutomator observation and text tapping through `android_observe` and `android_tap_text`;
-- debuggable WebView discovery/eval through `android_webview_pages` and `android_webview_eval`;
-- Xiaoluxue app-only URL routing, runtime bridge/status, environment, native subject-map routing, native map, course, and exercise fast paths through `xiaoluxue_open_app_url`, `xiaoluxue_runtime_status`, `xiaoluxue_switch_env`, `xiaoluxue_open_native_subject`, `xiaoluxue_map_fast_path`, `xiaoluxue_course_fast_path`, `xiaoluxue_exercise_fast_path`, and lower-level Xiaoluxue tools;
-- action recording, selector-first recipe generation/replay, and source indexing for fast repeat workflows;
-- Agent-TARS/UI-TARS-style hybrid operation through `android_agent_tars_step` and `android_agent_tars_run`: UI tree grounding first, then visual-grounding VLM fallback.
+- 通过 `adb devices -l` 发现设备；
+- 通过 `adb exec-out screencap -p` 获取截图；
+- 通过 `android_show_screen` 在 Codex 内直接显示当前屏幕；
+- 通过 `android_start_scrcpy` 打开桌面 scrcpy 镜像窗口；
+- Android 工具被调用时默认只保留一个可见 scrcpy 窗口；
+- 可选通过 `android_start_webrtc_viewer` 打开 Codex 内嵌 WebRTC 视频；
+- 可选通过 `android_start_screen_viewer` 打开截图自动刷新的本地页面；
+- 支持点击、滑动、按键、简单文本输入和 adb shell；
+- 支持唤醒解锁、打开 URL、启动 App；
+- scrcpy 启动阶段异常退出会自动重试，窗口显示稳定后如果用户手动关闭，会尊重手动关闭；下一次 Android 工具调用时再重新弹窗；
+- 支持 `android_observe` 和 `android_tap_text` 的 UIAutomator 快速观察和文字点击；
+- 支持 `android_webview_pages` 和 `android_webview_eval` 的 WebView DevTools 调试；
+- 支持小鹿爱学 App 内 URL 打开、运行时桥接、环境切换、原生学科地图、课程页、练习页快路径；
+- 支持录制动作、生成 selector 优先的 recipe、复放 recipe，以及根据源码生成静态页面/控件索引；
+- 支持 `android_agent_tars_step` 和 `android_agent_tars_run` 的混合模式：先走 UI 树定位，失败时再用视觉模型。
 
-## Setup
+## 环境准备
 
-Install Android platform tools and authorize the device:
+安装 Android platform tools，并确认设备已经授权：
 
 ```bash
 adb devices -l
 ```
 
-This local project also looks for a project-local install at:
+本项目也会查找项目内置路径：
 
 ```text
 tools/android-platform-tools/platform-tools/adb
 ```
 
-When running inside Codex, the MCP server sets the subprocess `HOME` to the Android Use project root, so adb can store key material in `.android` without writing to your real `~/.android`.
+在 Codex 内运行 MCP 服务时，插件会把子进程的 `HOME` 设置为 Android Use 项目根目录，因此 adb key 会写入项目内 `.android`，不会污染真实的 `~/.android`。
 
-Install scrcpy if you want live mirroring:
+如果需要桌面实时镜像，安装 scrcpy：
 
 ```bash
 brew install scrcpy
 ```
 
-Optional environment variables:
+可选环境变量：
 
 ```bash
 export ANDROID_USE_ADB=/path/to/adb
 export ANDROID_USE_SCRCPY=/path/to/scrcpy
 
-# OpenAI native providers
+# OpenAI 原生 provider
 export OPENAI_API_KEY=...
 export ANDROID_USE_AGENT_PROVIDER=openai-computer
 export ANDROID_USE_OPENAI_COMPUTER_MODEL=gpt-5.5
-# Or use a general vision/reasoning model instead of the computer tool:
+
+# 也可以使用通用视觉/推理模型
 # export ANDROID_USE_AGENT_PROVIDER=openai-vision
 # export ANDROID_USE_OPENAI_VISION_MODEL=gpt-5.5
 
-# OpenAI-compatible VLM providers such as Seed/UI-TARS-style endpoints
+# OpenAI-compatible 视觉模型，例如 Seed/UI-TARS 风格接口
 export ANDROID_USE_VLM_BASE_URL=https://your-provider.example/v1
 export ANDROID_USE_VLM_API_KEY=...
 export ANDROID_USE_VLM_MODEL=seed-1-5-vl
-# Optional: absolute or normalized_1000. Seed/UI-TARS-style model names default to normalized_1000.
+
+# 可选：absolute 或 normalized_1000。Seed/UI-TARS 风格模型默认 normalized_1000。
 export ANDROID_USE_VLM_COORDINATE_MODE=normalized_1000
 ```
 
-The MCP server also loads local private settings from `~/.config/android-use/env` when it starts. Use this for API keys in the Codex desktop app, because desktop plugin processes may not inherit shell startup files:
+MCP 服务启动时还会读取 `~/.config/android-use/env`。在 Codex 桌面端里，插件进程不一定继承 shell 启动文件，因此 API key 建议放在这个文件中：
 
 ```bash
 ANDROID_USE_AGENT_PROVIDER=openai-compatible
@@ -85,9 +88,9 @@ ANDROID_USE_VLM_MODEL=doubao-seedream-5.0-lite
 ANDROID_USE_VLM_API_KEY=your_ark_api_key
 ```
 
-`ANDROID_USE_VLM_BASE_URL` may be either a base URL or a complete `/chat/completions` URL.
+`ANDROID_USE_VLM_BASE_URL` 可以是基础 URL，也可以是完整的 `/chat/completions` URL。
 
-## Local Smoke Test
+## 本地自检
 
 ```bash
 python3 scripts/smoke_test_mcp.py
@@ -95,61 +98,107 @@ python3 scripts/test_android_use_mcp.py
 python3 scripts/android_use_mcp.py
 ```
 
-For normal interactive operation, use the default visible scrcpy desktop window. The MCP server opens one visible scrcpy window for one physical device by default when Android tools are used, preferring `ANDROID_USE_SCRCPY_RESIDENT_SERIALS`, `ANDROID_USE_SERIAL`, or `ANDROID_SERIAL` when set. If the user manually closes the scrcpy window after it has been visible, the resident monitor leaves it closed. The next Android tool call clears that manual-close marker and opens a fresh scrcpy window. `android_agent_run` and `android_agent_step` also ensure that window before executing unless `show_scrcpy=false` is passed, and they reuse an existing visible scrcpy process for the same device instead of starting a duplicate.
+更完整的检查建议运行：
 
-To show the device inside Codex, call `android_show_screen` for a current screenshot or `android_start_screen_viewer` for an auto-refreshing local web page.
+```bash
+./doctor.sh
+```
 
-For Codex-embedded video, call `android_start_webrtc_viewer` explicitly and open the returned localhost URL in Codex. This is not started by default. It uses scrcpy's H.264 recording stream through a local WebRTC server with low-latency defaults (`max_size=960`, `bit_rate=4M`, `max_fps=30`, no PyAV buffering, stale-frame dropping) and requires the plugin virtualenv dependencies:
+正常交互时优先使用默认 scrcpy 桌面窗口。Android 工具被调用时，MCP 服务会为一个物理设备打开一个可见 scrcpy 窗口，优先使用 `ANDROID_USE_SCRCPY_RESIDENT_SERIALS`、`ANDROID_USE_SERIAL` 或 `ANDROID_SERIAL` 指定的设备。用户手动关闭已经稳定显示的 scrcpy 窗口后，常驻监控不会马上重新拉起；下一次 Android 工具调用会清除手动关闭标记并重新打开窗口。`android_agent_run` 和 `android_agent_step` 默认也会在执行动作前确保该窗口存在，除非显式传入 `show_scrcpy=false`。
+
+要在 Codex 中查看设备画面，可以调用：
+
+- `android_show_screen`：返回当前截图；
+- `android_start_screen_viewer`：打开本地自动刷新截图页面；
+- `android_start_webrtc_viewer`：仅在明确需要 Codex 内嵌视频时调用。
+
+WebRTC 不会默认启动。它通过本地 WebRTC 服务转发 scrcpy 的 H.264 录制流，默认低延迟参数为 `max_size=960`、`bit_rate=4M`、`max_fps=30`，并依赖插件虚拟环境中的 `aiortc`、`aiohttp`、`av`：
 
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install aiortc aiohttp av
 ```
 
-The MCP server uses newline-delimited JSON-RPC over stdio and has no third-party Python dependencies.
+MCP 服务使用基于 stdio 的 newline-delimited JSON-RPC，不需要额外 Python 三方依赖。
 
-`android_start_scrcpy` disables scrcpy audio by default and launches through a small supervisor so startup-time scrcpy exits are retried. Once the window has been visible, closing it manually is respected and it will not be relaunched until the next Android tool call. It also starts scrcpy with `keyboard=sdk` and `prefer_text=true` by default so typing in the scrcpy window uses text injection instead of fragile raw key combinations. Pass `audio=true` if you explicitly need audio forwarding, `keep_alive=false` for a one-off manual launch, `keyboard=uhid` if you need physical-keyboard behavior, or `legacy_paste=true` if normal clipboard paste fails on a device.
+## scrcpy 行为
 
-The resident monitor never starts WebRTC. Set `ANDROID_USE_SCRCPY_RESIDENT_SERIALS` to a comma-separated serial list only when multiple resident windows are wanted. Set `ANDROID_USE_SCRCPY_RESIDENT=0` to disable the background monitor, `ANDROID_USE_SCRCPY_ON_TOOL_CALL=0` to stop Android tool calls from opening scrcpy, or `ANDROID_USE_SCRCPY_RESIDENT_INTERVAL_SEC` to change the watchdog interval. Use `android_scrcpy_resident_status` to check the monitor and its last launch result.
+`android_start_scrcpy` 默认：
 
-## Fast Repeat Workflows
+- 禁用音频，降低资源占用；
+- 使用可拖动的视频窗口；
+- 通过 supervisor 重试启动阶段闪退；
+- 使用 `keyboard=sdk` 和 `prefer_text=true`，让 scrcpy 窗口输入文字时尽量走文本注入；
+- 窗口稳定显示后，如果用户手动关闭，会尊重这次关闭；
+- 下一次 Android 工具调用时再重新打开 scrcpy；
+- 复用同一设备已有的可见 scrcpy 进程，避免打开多个窗口。
 
-For app flows you run often, prefer deterministic recipes over repeated visual reasoning:
+常用开关：
 
-1. Start a recording with `android_start_recording`.
-2. Drive the app through deterministic tools such as `android_tap_text`, `android_tap`, `android_swipe`, `android_type_text`, `android_open_app`, and `android_press_key`.
-3. Stop with `android_stop_recording`; this writes `.android-use/recordings/<id>/trace.json`.
-4. Convert the trace with `android_create_recipe`.
-5. Replay with `android_replay_recipe`.
+- `audio=true`：显式打开音频转发；
+- `keep_alive=false`：一次性手动启动，不走常驻；
+- `keyboard=uhid`：使用物理键盘行为；
+- `legacy_paste=true`：设备普通粘贴失败时启用旧粘贴路径；
+- `ANDROID_USE_SCRCPY_RESIDENT=0`：关闭后台常驻监控；
+- `ANDROID_USE_SCRCPY_ON_TOOL_CALL=0`：禁止 Android 工具调用时自动打开 scrcpy；
+- `ANDROID_USE_SCRCPY_RESIDENT_INTERVAL_SEC`：调整监控间隔；
+- `android_scrcpy_resident_status`：查看监控状态和最后一次启动结果。
 
-Recipes store selector candidates first (`resource-id`, content description, visible text) and keep coordinate fallback for cases where the selector is missing. `android_record_checkpoint` can capture page fingerprints after manual scrcpy navigation, but manual gestures are not yet converted into actions automatically.
+后台常驻监控永远不会启动 WebRTC。只有确实想要多个常驻窗口时，才设置 `ANDROID_USE_SCRCPY_RESIDENT_SERIALS` 为逗号分隔的多个设备序列号。
 
-To build a static app map from source code, call `android_index_source` with an Android source directory. It scans Kotlin, Java, XML, TypeScript/JavaScript, and Dart files for activities, routes, resource ids, labels, content descriptions, and test tags, then writes `.android-use/app-maps/app-map-*.json`.
+## 高频流程复放
 
-## WebView Fast Path
+经常重复的 App 流程，优先用确定性 recipe，减少视觉模型等待：
 
-For hybrid apps whose WebViews are visible in Chrome's `chrome://inspect/#devices`, use the WebView tools before visual reasoning:
+1. 用 `android_start_recording` 开始录制。
+2. 用 `android_tap_text`、`android_tap`、`android_swipe`、`android_type_text`、`android_open_app`、`android_press_key` 等确定性工具操作 App。
+3. 用 `android_stop_recording` 停止录制，生成 `.android-use/recordings/<id>/trace.json`。
+4. 用 `android_create_recipe` 转成 recipe。
+5. 用 `android_replay_recipe` 复放。
 
-- `android_webview_pages` forwards `webview_devtools_remote*` sockets and lists DevTools targets with title, URL, size, and `webSocketDebuggerUrl`.
-- `android_webview_eval` evaluates JavaScript in the selected WebView via Chrome DevTools Protocol.
-- `android_open_url` routes Xiaoluxue app-only H5 URLs (`stu.xiaoluxue.com` and `*.xiaoluxue.cn`) through the Xiaoluxue student app instead of handing them to a browser.
-- `xiaoluxue_open_app_url` opens a Xiaoluxue H5 URL through the app vessel WebView route, waits for the matching runtime URL, and can install the runtime bridge in one call.
-- `xiaoluxue_runtime_status` reuses cached WebView DevTools forwards when possible, validates the live runtime URL, and installs `window.__androidUse.xiaoluxue` helpers for snapshots, safe overlay reveal, widget jumps, text clicks, and playback-rate setup.
-- Xiaoluxue course pages can use `xiaoluxue_course_snapshot` to read widgets and media state, `xiaoluxue_set_speed` to select a playback speed, and `xiaoluxue_goto_widget` to jump by widget index, name, or `last=true`.
-- `xiaoluxue_switch_env` opens the Galaxy Zhixue config app (`com.xiaoluxue.ai.config`), selects the student `API 环境` such as `test`, submits it, and reopens Xiaoluxue student by default.
-- Native Xiaoluxue study-map pages can use `xiaoluxue_open_native_subject` to jump through the app-only `xlx://router/study/subject` route, `xiaoluxue_map_snapshot` to read subject/chapter/visible indexes/actions, and `xiaoluxue_map_fast_path` for one-pass actions such as `1.5 题型突破`, `错题`, `笔记本`, `学习任务`, and `薄弱知识`. When `subject_id` or `subject` is provided, `xiaoluxue_map_fast_path` routes to the subject map first; known presets such as `语文 1.5 题型突破` skip slow `uiautomator dump` entirely.
-- `xiaoluxue_course_fast_path` is the one-call shortcut for the common flow: open a guide widget when needed, set speed to 2x, then jump to the last widget by default.
-- `xiaoluxue_open_knowledge_guide` defaults to preserving the current Xiaoluxue H5 host, so a known shortcut opened from a `stu.test.xiaoluxue.cn` session stays on the test H5 host instead of falling back to production.
-- Xiaoluxue `/exercise` pages can use `xiaoluxue_exercise_snapshot` to read question/options/buttons/progress, `xiaoluxue_exercise_action` for one semantic click, and `xiaoluxue_exercise_fast_path` for "select option -> submit -> continue" style flows.
+recipe 会优先保存 selector 候选，包括 `resource-id`、content description、可见文本；selector 找不到时才退回缩放后的坐标。`android_record_checkpoint` 可以在手动 scrcpy 操作后记录页面指纹，但手动手势目前还不会自动转换成 recipe 动作。
 
-`xiaoluxue_goto_widget` defaults to `mode=reload`, which applies `redirectWidgetIndex` so the H5 course state initializes at the target widget. Use `mode=scroll` only for fast visual positioning because it does not trigger the course `goto` state machine.
+如果用户提供 Android 源码，可以调用 `android_index_source` 建静态索引。它会扫描 Kotlin、Java、XML、TypeScript/JavaScript、Dart 文件中的 activity、route、resource id、label、content description 和 test tag，并写入 `.android-use/app-maps/app-map-*.json`。
 
-## Design Reference
+## WebView 快路径
 
-This plugin borrows the high-level operator loop used by Agent TARS and UI-TARS Desktop: UI/screenshot observation, multimodal reasoning, UI-TARS mobile `Thought`/`Action` output, small adb actions, and feedback. It supports Agent TARS-style modes:
+混合 App 的 WebView 如果能在 Chrome 的 `chrome://inspect/#devices` 中看到，优先走 WebView 工具，不要先走截图或视觉模型：
 
-- `uiautomator`: text/UI-tree grounding only, fastest and works without a VLM.
-- `visual-grounding`: screenshot plus model action prediction. Providers: OpenAI Responses computer tool (`openai-computer`), OpenAI multimodal Responses (`openai-vision`), or OpenAI-compatible chat completions (`openai-compatible`).
-- `hybrid`: UIAutomator first, then visual-grounding fallback.
+- `android_webview_pages`：转发 `webview_devtools_remote*` socket，并列出 title、URL、尺寸和 `webSocketDebuggerUrl`。
+- `android_webview_eval`：通过 Chrome DevTools Protocol 在目标 WebView 中执行 JavaScript。
+- `android_open_url`：识别小鹿爱学 App 专用 H5 URL，包括 `stu.xiaoluxue.com` 和 `*.xiaoluxue.cn`，并通过小鹿爱学学生端打开，而不是交给普通浏览器。
+- `xiaoluxue_open_app_url`：通过 App vessel WebView route 打开小鹿爱学 H5 URL，等待匹配的运行时 URL，并可一次性注入 runtime bridge。
+- `xiaoluxue_runtime_status`：复用缓存的 WebView DevTools 转发，校验运行时 URL，并安装 `window.__androidUse.xiaoluxue` 辅助方法，用于快照、显示隐藏层、跳转 widget、文本点击和设置播放速度。
 
-It does not vendor Agent TARS/UI-TARS code.
+小鹿爱学课程页工具：
+
+- `xiaoluxue_course_snapshot`：读取 widget 和媒体状态；
+- `xiaoluxue_set_speed`：设置播放速度；
+- `xiaoluxue_goto_widget`：按 widget index、名称或 `last=true` 跳转；
+- `xiaoluxue_course_fast_path`：常用一键流程，必要时打开知识讲解、设置 2x、默认跳到最后一个 widget；
+- `xiaoluxue_open_knowledge_guide`：默认保留当前小鹿爱学 H5 host，测试环境下会继续停留在 `stu.test.xiaoluxue.cn`，不会回落到生产 host。
+
+小鹿爱学原生地图页工具：
+
+- `xiaoluxue_switch_env`：打开银河智学配置 App `com.xiaoluxue.ai.config`，选择学生端 `API 环境`，例如 `test`，提交后默认重开小鹿爱学；
+- `xiaoluxue_open_native_subject`：通过 App 专用 `xlx://router/study/subject` 路由进入原生学科地图；
+- `xiaoluxue_map_snapshot`：读取当前学科、章节、可见 index 和可见动作；
+- `xiaoluxue_map_fast_path`：一键执行 `1.5 题型突破`、`错题`、`笔记本`、`学习任务`、`薄弱知识` 等操作。传入 `subject_id` 或 `subject` 时会先路由到对应学科；已知预设如 `语文 1.5 题型突破` 会避开慢速 `uiautomator dump`。
+
+小鹿爱学 `/exercise` 页工具：
+
+- `xiaoluxue_exercise_snapshot`：读取题干、选项、按钮和进度；
+- `xiaoluxue_exercise_action`：执行一次语义点击；
+- `xiaoluxue_exercise_fast_path`：适合 “选项 -> 提交 -> 继续” 这类流程。
+
+`xiaoluxue_goto_widget` 默认使用 `mode=reload`，通过 `redirectWidgetIndex` 让 H5 课程状态直接初始化到目标 widget。只有为了快速视觉定位时才用 `mode=scroll`，因为它不会触发课程内部的 `goto` 状态机。
+
+## 设计参考
+
+插件借鉴了 Agent TARS 和 UI-TARS Desktop 的高层操作循环：观察 UI/截图、模型推理、输出移动端 `Thought`/`Action`、执行小步 adb 动作、再观察反馈。支持三种模式：
+
+- `uiautomator`：只用文本/UI 树定位，速度最快，不需要视觉模型；
+- `visual-grounding`：截图加模型动作预测，可选 OpenAI Responses computer tool、OpenAI 多模态 Responses，或 OpenAI-compatible chat completions；
+- `hybrid`：先走 UIAutomator，失败再走视觉模型。
+
+本项目不会内置 Agent TARS/UI-TARS 代码。
