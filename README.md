@@ -183,7 +183,8 @@ recipe 会优先保存 selector 候选，包括 `resource-id`、content descript
 - `xiaoluxue_switch_env`：打开银河智学配置 App `com.xiaoluxue.ai.config`，选择学生端 `API 环境`，例如 `test`，提交后默认重开小鹿爱学；
 - `xiaoluxue_open_native_subject`：通过 App 专用 `xlx://router/study/subject` 路由进入原生学科地图；
 - `xiaoluxue_map_snapshot`：读取当前学科、章节、可见 index 和可见动作；
-- `xiaoluxue_map_fast_path`：一键执行 `1.5 题型突破`、`错题`、`笔记本`、`学习任务`、`薄弱知识` 等操作。传入 `subject_id` 或 `subject` 时会先路由到对应学科；已知预设如 `语文 1.5 题型突破` 会避开慢速 `uiautomator dump`。
+- `xiaoluxue_map_fast_path`：一键执行 `1.5 题型突破`、`专属精练`、`错题`、`笔记本`、`学习任务`、`薄弱知识` 等操作。传入 `subject_id` 或 `subject` 时会先路由到对应学科；已知预设如 `语文 1.5 题型突破`、以及当前选中课节的 `题型突破/专属精练` 会避开慢速 `uiautomator dump`，并自动点开练习入口。
+- `xiaoluxue_lesson_fast_path`：在原生 `题型突破` 列表页快速点击首个卡片的 `直接练`，也支持结果页 `continue_answer` 快速进入下一题答题页；这条路径会临时压低 Android 动画倍率、点击可跳过的过渡页按钮，并用 raw screenshot 轮询题目区就绪，避免固定等待动画。也可以让 `xiaoluxue_map_fast_path` 设置 `enter_direct_practice=true` 后连续进入题目页。
 
 小鹿爱学 `/exercise` 页工具：
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import struct
 import subprocess
 import sys
 import tempfile
@@ -11,6 +12,23 @@ import unittest
 from pathlib import Path
 
 import android_use_mcp as mcp
+
+
+def make_raw_screenshot(
+    width: int,
+    height: int,
+    *,
+    fill: tuple[int, int, int, int] = (255, 255, 255, 255),
+    rects: list[tuple[int, int, int, int, tuple[int, int, int, int]]] | None = None,
+) -> bytes:
+    pixels = bytearray(fill * (width * height))
+    for x1, y1, x2, y2, color in rects or []:
+        for y in range(max(y1, 0), min(y2, height)):
+            row = y * width * 4
+            for x in range(max(x1, 0), min(x2, width)):
+                offset = row + x * 4
+                pixels[offset : offset + 4] = bytes(color)
+    return struct.pack("<IIII", width, height, 1, 0) + bytes(pixels)
 
 
 class AndroidUseMcpTests(unittest.TestCase):
@@ -160,11 +178,16 @@ abc123 unauthorized usb:336592896X
 
     def test_xiaoluxue_map_instruction_and_action_normalization(self) -> None:
         self.assertTrue(mcp.xiaoluxue_instruction_looks_like_map("进入 1.5 题型突破"))
+        self.assertTrue(mcp.xiaoluxue_instruction_looks_like_map("进入数学的巩固练习，随便一节课"))
         self.assertFalse(mcp.xiaoluxue_instruction_looks_like_map("首页 -> 数学 1.1.11 知识讲解 2x"))
         self.assertEqual(mcp.normalize_xiaoluxue_map_index("进入 1.5 题型突破"), "1.5")
         self.assertEqual(mcp.normalize_xiaoluxue_map_action("打开 1.5 错题"), "wrong")
         self.assertEqual(mcp.normalize_xiaoluxue_map_action("打开 1.5 笔记本"), "notebook")
         self.assertEqual(mcp.normalize_xiaoluxue_map_action("看报告"), "report")
+        self.assertEqual(mcp.normalize_xiaoluxue_map_action("进入数学 专属精练"), "expand")
+        self.assertEqual(mcp.normalize_xiaoluxue_map_action("进入数学 巩固练习"), "expand")
+        self.assertEqual(mcp.normalize_xiaoluxue_lesson_action("直接练"), "direct_practice")
+        self.assertEqual(mcp.normalize_xiaoluxue_lesson_action("继续到下一题"), "continue_answer")
         self.assertEqual(mcp.normalize_xiaoluxue_subject_id("进入语文 1.5 题型突破"), 1)
         self.assertEqual(mcp.normalize_xiaoluxue_subject_id("打开 subject_id=2 地图"), 2)
         self.assertEqual(
@@ -183,6 +206,88 @@ abc123 unauthorized usb:336592896X
                 "route_if_subject": True,
             },
         )
+        self.assertEqual(
+            mcp.xiaoluxue_map_fast_action_from_instruction("进入数学 1.5 题型突破 直接练"),
+            {
+                "action": "xiaoluxue_map_fast_path",
+                "instruction": "进入数学 1.5 题型突破 直接练",
+                "action_name": "practise",
+                "source": "xiaoluxue-native-map",
+                "index": "1.5",
+                "subject_id": 2,
+                "route_if_subject": True,
+                "enter_direct_practice": True,
+            },
+        )
+        self.assertEqual(
+            mcp.xiaoluxue_map_fast_action_from_instruction("进入数学 专属精练"),
+            {
+                "action": "xiaoluxue_map_fast_path",
+                "instruction": "进入数学 专属精练",
+                "action_name": "expand",
+                "source": "xiaoluxue-native-map",
+                "subject_id": 2,
+                "route_if_subject": True,
+            },
+        )
+        self.assertEqual(
+            mcp.xiaoluxue_lesson_fast_action_from_instruction("进入 直接练"),
+            {
+                "action": "xiaoluxue_lesson_fast_path",
+                "instruction": "进入 直接练",
+                "action_name": "direct_practice",
+                "source": "xiaoluxue-native-lesson",
+            },
+        )
+        self.assertEqual(
+            mcp.xiaoluxue_lesson_fast_action_from_instruction("继续到下一题"),
+            {
+                "action": "xiaoluxue_lesson_fast_path",
+                "instruction": "继续到下一题",
+                "action_name": "continue_answer",
+                "source": "xiaoluxue-native-lesson",
+            },
+        )
+
+    def test_lesson_answer_ready_stats_detects_native_answer_page(self) -> None:
+        ready_raw = make_raw_screenshot(
+            200,
+            120,
+            rects=[
+                (5, 6, 42, 12, (60, 60, 60, 255)),
+                (105, 18, 190, 24, (70, 70, 70, 255)),
+                (105, 34, 190, 40, (70, 70, 70, 255)),
+                (105, 50, 190, 56, (70, 70, 70, 255)),
+            ],
+        )
+        blank_raw = make_raw_screenshot(200, 120)
+
+        self.assertTrue(mcp.raw_screenshot_lesson_answer_stats(ready_raw)["ready"])
+        self.assertFalse(mcp.raw_screenshot_lesson_answer_stats(blank_raw)["ready"])
+
+    def test_lesson_card_list_stats_detects_challenge_card_list(self) -> None:
+        card_raw = make_raw_screenshot(
+            200,
+            120,
+            fill=(220, 245, 252, 255),
+            rects=[
+                (76, 8, 125, 13, (65, 65, 65, 255)),
+                (62, 42, 129, 99, (255, 255, 255, 255)),
+                (65, 88, 125, 98, (48, 180, 240, 255)),
+            ],
+        )
+        answer_raw = make_raw_screenshot(
+            200,
+            120,
+            rects=[
+                (5, 6, 42, 12, (60, 60, 60, 255)),
+                (105, 18, 190, 24, (70, 70, 70, 255)),
+                (105, 34, 190, 40, (70, 70, 70, 255)),
+            ],
+        )
+
+        self.assertTrue(mcp.raw_screenshot_lesson_card_list_stats(card_raw)["ready"])
+        self.assertFalse(mcp.raw_screenshot_lesson_card_list_stats(answer_raw)["ready"])
 
     def test_xiaoluxue_map_snapshot_detects_selected_index(self) -> None:
         xml = """<hierarchy rotation="0">
@@ -192,6 +297,8 @@ abc123 unauthorized usb:336592896X
     <node text="" content-desc="" resource-id="" class="android.widget.FrameLayout" bounds="[851,453][1149,866]" clickable="true" enabled="true">
       <node text="" content-desc="" resource-id="com.xiaoluxue.ai.student:id/practiseItem" class="android.view.ViewGroup" bounds="[914,344][1086,496]" clickable="true" enabled="true" />
       <node text="题型突破" content-desc="" resource-id="com.xiaoluxue.ai.student:id/title" class="android.widget.TextView" bounds="[948,420][1052,457]" clickable="false" enabled="true" />
+      <node text="" content-desc="" resource-id="com.xiaoluxue.ai.student:id/expandItem" class="android.view.ViewGroup" bounds="[1112,536][1284,688]" clickable="true" enabled="true" />
+      <node text="专属精练" content-desc="" resource-id="com.xiaoluxue.ai.student:id/title" class="android.widget.TextView" bounds="[1146,612][1250,649]" clickable="false" enabled="true" />
       <node text="1.5" content-desc="" resource-id="com.xiaoluxue.ai.student:id/index" class="android.widget.TextView" bounds="[872,667][1128,705]" clickable="false" enabled="true" />
       <node text="" content-desc="" resource-id="com.xiaoluxue.ai.student:id/wrong_textbook" class="android.widget.FrameLayout" bounds="[851,781][1000,866]" clickable="true" enabled="true" />
       <node text="笔记本" content-desc="" resource-id="com.xiaoluxue.ai.student:id/textbook_text" class="android.widget.TextView" bounds="[1008,784][1141,853]" clickable="false" enabled="true" />
@@ -209,9 +316,11 @@ abc123 unauthorized usb:336592896X
         self.assertEqual(snapshot["selected_index"], "1.5")
         self.assertEqual(snapshot["visible_indexes"], ["1.5"])
         self.assertTrue(snapshot["visible_actions"]["practise"])
+        self.assertTrue(snapshot["visible_actions"]["expand"])
         self.assertTrue(snapshot["visible_actions"]["wrong"])
         index_node = mcp.find_xiaoluxue_map_index_node(nodes, "1.5")
         self.assertEqual(mcp.xiaoluxue_map_predicted_action_point(index_node, "practise"), {"x": 1000, "y": 420})
+        self.assertEqual(mcp.xiaoluxue_map_predicted_action_point(index_node, "expand"), {"x": 1198, "y": 612})
 
     def test_select_webview_page_prefers_visible_attached_page(self) -> None:
         pages = [
@@ -462,6 +571,7 @@ abc123 unauthorized usb:336592896X
         self.assertIn("xiaoluxue_map_snapshot", tool_names)
         self.assertIn("xiaoluxue_open_native_subject", tool_names)
         self.assertIn("xiaoluxue_map_fast_path", tool_names)
+        self.assertIn("xiaoluxue_lesson_fast_path", tool_names)
         self.assertIn("xiaoluxue_switch_env", tool_names)
         self.assertIn("xiaoluxue_exercise_snapshot", tool_names)
         self.assertIn("xiaoluxue_exercise_action", tool_names)
@@ -531,7 +641,19 @@ abc123 unauthorized usb:336592896X
                 {
                     "kind": "action",
                     "action": "xiaoluxue_map_fast_path",
-                    "arguments": {"index": "1.5", "subject_id": 1, "route_if_subject": True, "action_name": "practise"},
+                    "arguments": {
+                        "index": "1.5",
+                        "subject_id": 1,
+                        "route_if_subject": True,
+                        "action_name": "practise",
+                        "enter_direct_practice": True,
+                    },
+                    "result": {"ok": True},
+                },
+                {
+                    "kind": "action",
+                    "action": "xiaoluxue_lesson_fast_path",
+                    "arguments": {"action_name": "direct_practice", "after_direct_practice_wait_sec": 0.2},
                     "result": {"ok": True},
                 },
                 {
@@ -574,12 +696,17 @@ abc123 unauthorized usb:336592896X
                 "subject_id": 1,
                 "action_name": "practise",
                 "route_if_subject": True,
+                "enter_direct_practice": True,
             },
         )
-        self.assertEqual(recipe["steps"][4], {"action": "xiaoluxue_open_native_subject", "subject": "语文", "route_wait_sec": 0.85})
-        self.assertEqual(recipe["steps"][5], {"action": "xiaoluxue_switch_env", "env": "test", "open_student": True})
-        self.assertEqual(recipe["steps"][6], {"action": "xiaoluxue_exercise_action", "action_name": "select_option", "option_key": "B"})
-        self.assertEqual(recipe["steps"][7], {"action": "xiaoluxue_exercise_fast_path", "option_key": "C", "submit": True})
+        self.assertEqual(
+            recipe["steps"][4],
+            {"action": "xiaoluxue_lesson_fast_path", "action_name": "direct_practice", "after_direct_practice_wait_sec": 0.2},
+        )
+        self.assertEqual(recipe["steps"][5], {"action": "xiaoluxue_open_native_subject", "subject": "语文", "route_wait_sec": 0.85})
+        self.assertEqual(recipe["steps"][6], {"action": "xiaoluxue_switch_env", "env": "test", "open_student": True})
+        self.assertEqual(recipe["steps"][7], {"action": "xiaoluxue_exercise_action", "action_name": "select_option", "option_key": "B"})
+        self.assertEqual(recipe["steps"][8], {"action": "xiaoluxue_exercise_fast_path", "option_key": "C", "submit": True})
 
     def test_normalize_xiaoluxue_env(self) -> None:
         key, url, label = mcp.normalize_xiaoluxue_env("测试环境")
