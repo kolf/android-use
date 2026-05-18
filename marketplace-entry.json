@@ -1,5 +1,9 @@
 {
   "name": "android-use-plugins",
+  "displayName": "Android",
+  "icon": "./plugins/android-use-plugins/assets/android.png",
+  "composerIcon": "./plugins/android-use-plugins/assets/android.png",
+  "logo": "./plugins/android-use-plugins/assets/android.png",
   "source": {
     "source": "local",
     "path": "./plugins/android-use-plugins"
@@ -8,5 +12,12 @@
     "installation": "AVAILABLE",
     "authentication": "ON_INSTALL"
   },
-  "category": "Developer Tools"
+  "category": "Developer Tools",
+  "interface": {
+    "displayName": "Android",
+    "shortDescription": "在 Codex 中控制 Android 设备",
+    "icon": "./plugins/android-use-plugins/assets/android.png",
+    "composerIcon": "./plugins/android-use-plugins/assets/android.png",
+    "logo": "./plugins/android-use-plugins/assets/android.png"
+  }
 }

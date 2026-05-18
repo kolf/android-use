@@ -46,6 +46,7 @@ plugin = json.loads(Path(".codex-plugin/plugin.json").read_text())
 assert plugin["name"] == "android-use-plugins", plugin["name"]
 assert plugin["interface"]["displayName"] == "Android", plugin["interface"]["displayName"]
 assert plugin.get("icon") == "./assets/android.png", plugin.get("icon")
+assert plugin["interface"]["icon"] == "./assets/android.png", plugin["interface"].get("icon")
 assert plugin["interface"]["composerIcon"] == "./assets/android.png", plugin["interface"].get("composerIcon")
 assert plugin["interface"]["logo"] == "./assets/android.png", plugin["interface"].get("logo")
 mcp = json.loads(Path(".mcp.json").read_text())
@@ -71,6 +72,13 @@ legacy = [item.get("name") for item in plugins if isinstance(item, dict) and ite
 assert not legacy, f"legacy android plugin entries still present in {path}: {legacy}"
 entry = matches[-1]
 assert entry.get("source", {}).get("path") == f"./plugins/{name}", entry
+expected_icon = f"./plugins/{name}/assets/android.png"
+assert entry.get("displayName") == "Android", entry
+assert entry.get("icon") == expected_icon, entry
+assert entry.get("interface", {}).get("displayName") == "Android", entry
+assert entry.get("interface", {}).get("icon") == expected_icon, entry
+assert entry.get("interface", {}).get("composerIcon") == expected_icon, entry
+assert entry.get("interface", {}).get("logo") == expected_icon, entry
 print(f"ok   marketplace entry: {path}")
 PY
 else

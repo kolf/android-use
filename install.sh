@@ -106,11 +106,23 @@ from pathlib import Path
 
 path = Path(os.environ["MARKETPLACE_PATH"]).expanduser()
 plugin_name = os.environ["PLUGIN_NAME"]
+icon_path = f"./plugins/{plugin_name}/assets/android.png"
 entry = {
     "name": plugin_name,
+    "displayName": "Android",
+    "icon": icon_path,
+    "composerIcon": icon_path,
+    "logo": icon_path,
     "source": {"source": "local", "path": f"./plugins/{plugin_name}"},
     "policy": {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
     "category": "Developer Tools",
+    "interface": {
+        "displayName": "Android",
+        "shortDescription": "在 Codex 中控制 Android 设备",
+        "icon": icon_path,
+        "composerIcon": icon_path,
+        "logo": icon_path,
+    },
 }
 legacy_plugin_names = {"android-use", "xiaoluxue-android-use"}
 if path.exists():

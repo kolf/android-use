@@ -47,6 +47,7 @@
       "为我的手机打开 scrcpy 窗口"
     ],
     "brandColor": "#16A34A",
+    "icon": "./assets/android.png",
     "composerIcon": "./assets/android.png",
     "logo": "./assets/android.png",
     "screenshots": []
