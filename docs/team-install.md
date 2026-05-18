@@ -20,7 +20,7 @@ dist/android-use-plugins.zip
 
 把这个压缩包发给用户。用户不需要 Git。
 
-用户收到压缩包后，可以直接对 Codex/Cortex 说：
+用户收到压缩包后，可以直接对 Codex 说：
 
 ```text
 请帮我解压 android-use-plugins.zip，进入解压后的目录，执行 ./install.sh 安装 Android 插件，然后执行 ./doctor.sh 做环境检查。
@@ -57,7 +57,7 @@ brew install --cask android-platform-tools
 brew install scrcpy
 ```
 
-不会安装时，直接让 Codex/Cortex 做：
+不会安装时，直接让 Codex 做：
 
 ```text
 请帮我安装 Android Platform Tools 和 scrcpy，并验证 adb version、scrcpy --version。

@@ -17,7 +17,7 @@
 
 ## 一句话安装
 
-如果你已经拿到了 `android-use-plugins.zip` 压缩包，可以直接把压缩包交给 Codex/Cortex，然后说：
+如果你已经拿到了 `android-use-plugins.zip` 压缩包，可以直接把压缩包交给 Codex，然后说：
 
 ```text
 请帮我解压 android-use-plugins.zip，进入解压后的目录，执行 ./install.sh 安装 Android 插件，然后运行 ./doctor.sh 检查环境。
@@ -69,7 +69,7 @@ scrcpy --version
 brew install scrcpy
 ```
 
-如果你不会安装 Homebrew 或不想碰命令行，可以直接让 Codex/Cortex 做：
+如果你不会安装 Homebrew 或不想碰命令行，可以直接让 Codex 做：
 
 ```text
 请帮我安装 Android Platform Tools 和 scrcpy，并验证 adb version、scrcpy --version 都能执行。
@@ -123,7 +123,7 @@ ANMB9X5A10G00857 device product:ELN-W09 model:ELN_W09
 dist/android-use-plugins.zip
 ```
 
-把这个压缩包发给用户。用户收到后，让 Codex/Cortex 执行：
+把这个压缩包发给用户。用户收到后，让 Codex 执行：
 
 ```text
 请帮我解压 android-use-plugins.zip，进入解压后的目录，执行 ./install.sh 安装，然后执行 ./doctor.sh 检查。安装完成后提醒我重启 Codex 并启用 Android 插件。
@@ -345,7 +345,7 @@ export ANDROID_USE_SERIAL=设备序列号
 
 ### 可以不用 USB 线吗
 
-可以用 adb wireless，但第一次配置通常还是需要 USB 线。小白用户建议先用 USB 跑通，稳定后再让 Codex/Cortex 帮你配置无线调试。
+可以用 adb wireless，但第一次配置通常还是需要 USB 线。小白用户建议先用 USB 跑通，稳定后再让 Codex 帮你配置无线调试。
 
 ### WebRTC 要不要开
 
