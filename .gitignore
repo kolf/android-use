@@ -4,6 +4,7 @@
 .venv/
 Library/
 tools/
+dist/
 __pycache__/
 *.py[cod]
 .DS_Store

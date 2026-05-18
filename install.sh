@@ -20,13 +20,57 @@ require_command() {
   fi
 }
 
+copy_local_bundle() {
+  info "Installing from local bundle: $SOURCE_DIR"
+  mkdir -p "$INSTALL_DIR"
+  SOURCE_DIR="$SOURCE_DIR" INSTALL_DIR="$INSTALL_DIR" python3 - <<'PY'
+import shutil
+import os
+from pathlib import Path
+
+source = Path(os.environ["SOURCE_DIR"])
+target = Path(os.environ["INSTALL_DIR"])
+items = [
+    ".codex-plugin",
+    ".mcp.json",
+    "README.md",
+    "scripts",
+    "skills",
+    "assets",
+    "docs",
+    "install.sh",
+    "doctor.sh",
+    "package.sh",
+    "marketplace-entry.json",
+    "marketplace.example.json",
+    ".gitignore",
+]
+
+for name in items:
+    src = source / name
+    if not src.exists():
+        continue
+    dst = target / name
+    if src.is_dir():
+        shutil.copytree(src, dst, dirs_exist_ok=True)
+    else:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+PY
+}
+
 install_or_update_plugin() {
   mkdir -p "$PLUGIN_ROOT"
   if [ "$SOURCE_DIR" = "$INSTALL_DIR" ]; then
     info "Plugin is already at $INSTALL_DIR"
     return
   fi
+  if [ -f "$SOURCE_DIR/.codex-plugin/plugin.json" ]; then
+    copy_local_bundle
+    return
+  fi
   if [ -d "$INSTALL_DIR/.git" ]; then
+    require_command git
     info "Updating $INSTALL_DIR"
     git -C "$INSTALL_DIR" pull --ff-only
     return
@@ -36,6 +80,7 @@ install_or_update_plugin() {
     printf 'Move it away or set ANDROID_USE_PLUGIN_INSTALL_DIR.\n' >&2
     return 1
   fi
+  require_command git
   if git clone "$REPO_URL" "$INSTALL_DIR"; then
     return
   fi
@@ -139,7 +184,6 @@ PY
 }
 
 main() {
-  require_command git
   require_command python3
   if ! command -v adb >/dev/null 2>&1; then
     info "adb not found. Install Android platform tools, e.g. brew install --cask android-platform-tools"
