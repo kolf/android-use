@@ -3,11 +3,47 @@ set -euo pipefail
 
 PLUGIN_NAME="android-use-plugins"
 REPO_URL="${ANDROID_USE_PLUGIN_REPO_URL:-https://gitlab.xiaoluxue.cn/shixiankang/android-use.git}"
-PLUGIN_ROOT="${ANDROID_USE_PLUGIN_ROOT:-$HOME/.agents/plugins}"
-INSTALL_DIR="${ANDROID_USE_PLUGIN_INSTALL_DIR:-$PLUGIN_ROOT/$PLUGIN_NAME}"
-MARKETPLACE_PATH="${ANDROID_USE_PLUGIN_MARKETPLACE:-$HOME/.agents/plugins/marketplace.json}"
 CODEX_CONFIG_PATH="${ANDROID_USE_CODEX_CONFIG:-$HOME/.codex/config.toml}"
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+detect_plugin_root() {
+  local detected=""
+  if command -v python3 >/dev/null 2>&1 && [ -f "$CODEX_CONFIG_PATH" ]; then
+    detected="$(CODEX_CONFIG_PATH="$CODEX_CONFIG_PATH" python3 - <<'PY' || true
+import os
+from pathlib import Path
+
+path = Path(os.environ["CODEX_CONFIG_PATH"]).expanduser()
+section = None
+source = None
+for raw in path.read_text().splitlines():
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    if line.startswith("[") and line.endswith("]"):
+        section = line.strip("[]").strip()
+        continue
+    if section == "marketplaces.local" and "=" in line:
+        key, value = line.split("=", 1)
+        if key.strip() != "source":
+            continue
+        source = value.strip().strip('"')
+        break
+if source:
+    print(str(Path(source).expanduser() / "plugins"))
+PY
+)"
+    if [ -n "$detected" ]; then
+      printf '%s\n' "$detected"
+      return
+    fi
+  fi
+  printf '%s\n' "$HOME/plugins"
+}
+
+PLUGIN_ROOT="${ANDROID_USE_PLUGIN_ROOT:-$(detect_plugin_root)}"
+INSTALL_DIR="${ANDROID_USE_PLUGIN_INSTALL_DIR:-$PLUGIN_ROOT/$PLUGIN_NAME}"
+MARKETPLACE_PATH="${ANDROID_USE_PLUGIN_MARKETPLACE:-$(dirname "$PLUGIN_ROOT")/marketplace.json}"
 
 info() {
   printf '[android-use-plugins] %s\n' "$*"

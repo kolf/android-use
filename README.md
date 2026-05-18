@@ -141,13 +141,13 @@ cd android-use
 `install.sh` 会把插件复制到：
 
 ```text
-~/.agents/plugins/android-use-plugins
+~/plugins/android-use-plugins
 ```
 
 并更新：
 
 ```text
-~/.agents/plugins/marketplace.json
+~/marketplace.json
 ```
 
 ## 有 Git 的安装方式
@@ -155,8 +155,8 @@ cd android-use
 开发同学也可以从 Git 仓库安装：
 
 ```bash
-git clone https://gitlab.xiaoluxue.cn/shixiankang/android-use.git ~/.agents/plugins/android-use-plugins
-cd ~/.agents/plugins/android-use-plugins
+git clone https://gitlab.xiaoluxue.cn/shixiankang/android-use.git ~/plugins/android-use-plugins
+cd ~/plugins/android-use-plugins
 ./install.sh
 ./doctor.sh
 ```
@@ -168,7 +168,7 @@ cd ~/.agents/plugins/android-use-plugins
 先运行：
 
 ```bash
-cd ~/.agents/plugins/android-use-plugins
+cd ~/plugins/android-use-plugins
 ./doctor.sh
 ```
 
@@ -294,7 +294,7 @@ recipe 会优先使用 selector，找不到时才退回坐标。
 先确认：
 
 ```bash
-cat ~/.agents/plugins/marketplace.json
+cat ~/marketplace.json
 ```
 
 里面应该有：
@@ -323,7 +323,7 @@ adb devices -l
 
 ```bash
 scrcpy --version
-cd ~/.agents/plugins/android-use-plugins
+cd ~/plugins/android-use-plugins
 ./doctor.sh
 ```
 

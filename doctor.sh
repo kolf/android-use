@@ -3,7 +3,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_NAME="android-use-plugins"
-MARKETPLACE_PATH="${ANDROID_USE_PLUGIN_MARKETPLACE:-$HOME/.agents/plugins/marketplace.json}"
+CODEX_CONFIG_PATH="${ANDROID_USE_CODEX_CONFIG:-$HOME/.codex/config.toml}"
+MARKETPLACE_PATH="${ANDROID_USE_PLUGIN_MARKETPLACE:-$HOME/marketplace.json}"
 cd "$ROOT"
 
 ok() {
@@ -83,6 +84,45 @@ print(f"ok   marketplace entry: {path}")
 PY
 else
   warn "marketplace not found: $MARKETPLACE_PATH"
+fi
+
+if [ -f "$CODEX_CONFIG_PATH" ]; then
+  CODEX_CONFIG_PATH="$CODEX_CONFIG_PATH" PLUGIN_NAME="$PLUGIN_NAME" python3 - <<'PY'
+import os
+from pathlib import Path
+
+path = Path(os.environ["CODEX_CONFIG_PATH"]).expanduser()
+name = os.environ["PLUGIN_NAME"]
+section = None
+local_source = None
+enabled = False
+for raw in path.read_text().splitlines():
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    if line.startswith("[") and line.endswith("]"):
+        section = line.strip("[]").strip()
+        continue
+    if section == "marketplaces.local" and "=" in line:
+        key, value = line.split("=", 1)
+        if key.strip() != "source":
+            continue
+        local_source = value.strip().strip('"')
+    if section == f'plugins."{name}@local"' and line.startswith("enabled"):
+        _, value = line.split("=", 1)
+        enabled = value.strip().lower() == "true"
+
+if enabled:
+    assert local_source, f"{path}: marketplaces.local.source is missing"
+    plugin_dir = Path(local_source).expanduser() / "plugins" / name
+    manifest_path = plugin_dir / ".codex-plugin" / "plugin.json"
+    assert manifest_path.exists(), f"enabled plugin is not installed where Codex reads it: {manifest_path}"
+    print(f"ok   Codex local plugin path: {plugin_dir}")
+else:
+    print(f"warn {name}@local is not enabled in {path}")
+PY
+else
+  warn "Codex config not found: $CODEX_CONFIG_PATH"
 fi
 
 ok "doctor finished"

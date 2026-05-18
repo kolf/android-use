@@ -100,13 +100,13 @@ cd android-use
 安装脚本会把插件安装到：
 
 ```text
-~/.agents/plugins/android-use-plugins
+~/plugins/android-use-plugins
 ```
 
 并更新：
 
 ```text
-~/.agents/plugins/marketplace.json
+~/marketplace.json
 ```
 
 ## 有 Git 的安装方式
@@ -114,8 +114,8 @@ cd android-use
 开发同学可以使用：
 
 ```bash
-git clone https://gitlab.xiaoluxue.cn/shixiankang/android-use.git ~/.agents/plugins/android-use-plugins
-cd ~/.agents/plugins/android-use-plugins
+git clone https://gitlab.xiaoluxue.cn/shixiankang/android-use.git ~/plugins/android-use-plugins
+cd ~/plugins/android-use-plugins
 ./install.sh
 ./doctor.sh
 ```
@@ -140,7 +140,7 @@ cd ~/.agents/plugins/android-use-plugins
 确认：
 
 ```bash
-cat ~/.agents/plugins/marketplace.json
+cat ~/marketplace.json
 ```
 
 里面应该包含 `android-use-plugins`。确认后重启 Codex。
@@ -161,7 +161,7 @@ adb devices -l
 
 ```bash
 scrcpy --version
-cd ~/.agents/plugins/android-use-plugins
+cd ~/plugins/android-use-plugins
 ./doctor.sh
 ```
 
