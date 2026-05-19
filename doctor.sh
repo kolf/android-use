@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_NAME="android-use-plugins"
 CODEX_CONFIG_PATH="${ANDROID_USE_CODEX_CONFIG:-$HOME/.codex/config.toml}"
 MARKETPLACE_PATH="${ANDROID_USE_PLUGIN_MARKETPLACE:-$HOME/marketplace.json}"
+AGENTS_MARKETPLACE_PATH="${ANDROID_USE_AGENTS_PLUGIN_MARKETPLACE:-$HOME/.agents/plugins/marketplace.json}"
 cd "$ROOT"
 
 ok() {
@@ -33,7 +34,18 @@ fi
 if command -v scrcpy >/dev/null 2>&1; then
   ok "scrcpy: $(scrcpy --version | head -1)"
 else
-  warn "scrcpy not found. Install with: brew install scrcpy"
+  fail "scrcpy not found. Install with: brew install scrcpy"
+fi
+
+ENV_FILE="${ANDROID_USE_ENV_FILE:-$HOME/.config/android-use/env}"
+if [ -f "$ENV_FILE" ]; then
+  if grep -Eq '^(export[[:space:]]+)?ANDROID_USE_WIRELESS_HOST=' "$ENV_FILE" || grep -Eq '^(export[[:space:]]+)?ANDROID_USE_SERIAL=.*:' "$ENV_FILE"; then
+    ok "wireless adb config: $ENV_FILE"
+  else
+    warn "android-use env exists but no wireless adb config: $ENV_FILE"
+  fi
+else
+  warn "wireless adb config not found; run android_wireless_pair once if you want cable-free use"
 fi
 
 [ -f "$ROOT/.codex-plugin/plugin.json" ] || fail ".codex-plugin/plugin.json missing"
@@ -58,8 +70,10 @@ PY
 python3 -m py_compile "$ROOT/scripts/android_use_mcp.py" "$ROOT/scripts/test_android_use_mcp.py"
 python3 "$ROOT/scripts/test_android_use_mcp.py"
 
-if [ -f "$MARKETPLACE_PATH" ]; then
-  MARKETPLACE_PATH="$MARKETPLACE_PATH" PLUGIN_NAME="$PLUGIN_NAME" python3 - <<'PY'
+check_marketplace() {
+  local marketplace_path="$1"
+  if [ -f "$marketplace_path" ]; then
+    MARKETPLACE_PATH="$marketplace_path" PLUGIN_NAME="$PLUGIN_NAME" python3 - <<'PY'
 import json
 import os
 from pathlib import Path
@@ -80,10 +94,23 @@ assert entry.get("interface", {}).get("displayName") == "Android", entry
 assert entry.get("interface", {}).get("icon") == expected_icon, entry
 assert entry.get("interface", {}).get("composerIcon") == expected_icon, entry
 assert entry.get("interface", {}).get("logo") == expected_icon, entry
+plugin_candidates = [
+    path.parent / "plugins" / name,
+    path.parent / name,
+]
+assert any((candidate / ".codex-plugin" / "plugin.json").exists() for candidate in plugin_candidates), (
+    f"{name} plugin directory not found for {path}; checked: {plugin_candidates}"
+)
 print(f"ok   marketplace entry: {path}")
 PY
-else
-  warn "marketplace not found: $MARKETPLACE_PATH"
+  else
+    warn "marketplace not found: $marketplace_path"
+  fi
+}
+
+check_marketplace "$MARKETPLACE_PATH"
+if [ "$AGENTS_MARKETPLACE_PATH" != "$MARKETPLACE_PATH" ]; then
+  check_marketplace "$AGENTS_MARKETPLACE_PATH"
 fi
 
 if [ -f "$CODEX_CONFIG_PATH" ]; then

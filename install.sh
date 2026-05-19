@@ -44,6 +44,9 @@ PY
 PLUGIN_ROOT="${ANDROID_USE_PLUGIN_ROOT:-$(detect_plugin_root)}"
 INSTALL_DIR="${ANDROID_USE_PLUGIN_INSTALL_DIR:-$PLUGIN_ROOT/$PLUGIN_NAME}"
 MARKETPLACE_PATH="${ANDROID_USE_PLUGIN_MARKETPLACE:-$(dirname "$PLUGIN_ROOT")/marketplace.json}"
+AGENTS_PLUGIN_ROOT="${ANDROID_USE_AGENTS_PLUGIN_ROOT:-$HOME/.agents/plugins}"
+AGENTS_INSTALL_DIR="${ANDROID_USE_AGENTS_PLUGIN_INSTALL_DIR:-$AGENTS_PLUGIN_ROOT/$PLUGIN_NAME}"
+AGENTS_MARKETPLACE_PATH="${ANDROID_USE_AGENTS_PLUGIN_MARKETPLACE:-$AGENTS_PLUGIN_ROOT/marketplace.json}"
 
 info() {
   printf '[android-use-plugins] %s\n' "$*"
@@ -56,16 +59,17 @@ require_command() {
   fi
 }
 
-copy_local_bundle() {
-  info "Installing from local bundle: $SOURCE_DIR"
-  mkdir -p "$INSTALL_DIR"
-  SOURCE_DIR="$SOURCE_DIR" INSTALL_DIR="$INSTALL_DIR" python3 - <<'PY'
+copy_bundle_contents() {
+  local source_dir="$1"
+  local install_dir="$2"
+  mkdir -p "$install_dir"
+  COPY_SOURCE_DIR="$source_dir" COPY_INSTALL_DIR="$install_dir" python3 - <<'PY'
 import shutil
 import os
 from pathlib import Path
 
-source = Path(os.environ["SOURCE_DIR"])
-target = Path(os.environ["INSTALL_DIR"])
+source = Path(os.environ["COPY_SOURCE_DIR"])
+target = Path(os.environ["COPY_INSTALL_DIR"])
 items = [
     ".codex-plugin",
     ".mcp.json",
@@ -93,6 +97,11 @@ for name in items:
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
 PY
+}
+
+copy_local_bundle() {
+  info "Installing from local bundle: $SOURCE_DIR"
+  copy_bundle_contents "$SOURCE_DIR" "$INSTALL_DIR"
 }
 
 install_or_update_plugin() {
@@ -134,8 +143,9 @@ install_or_update_plugin() {
 }
 
 write_marketplace() {
-  mkdir -p "$(dirname "$MARKETPLACE_PATH")"
-  MARKETPLACE_PATH="$MARKETPLACE_PATH" PLUGIN_NAME="$PLUGIN_NAME" python3 - <<'PY'
+  local marketplace_path="${1:-$MARKETPLACE_PATH}"
+  mkdir -p "$(dirname "$marketplace_path")"
+  MARKETPLACE_PATH="$marketplace_path" PLUGIN_NAME="$PLUGIN_NAME" python3 - <<'PY'
 import json
 import os
 from pathlib import Path
@@ -212,6 +222,14 @@ print(path)
 PY
 }
 
+install_agents_compat() {
+  if [ "$INSTALL_DIR" = "$AGENTS_INSTALL_DIR" ]; then
+    return 0
+  fi
+  info "Installing compatibility copy: $AGENTS_INSTALL_DIR"
+  copy_bundle_contents "$INSTALL_DIR" "$AGENTS_INSTALL_DIR"
+}
+
 migrate_codex_config() {
   [ -f "$CODEX_CONFIG_PATH" ] || return 0
   CODEX_CONFIG_PATH="$CODEX_CONFIG_PATH" PLUGIN_NAME="$PLUGIN_NAME" python3 - <<'PY'
@@ -233,16 +251,19 @@ PY
 
 main() {
   require_command python3
+  require_command scrcpy
   if ! command -v adb >/dev/null 2>&1; then
     info "adb not found. Install Android platform tools, e.g. brew install --cask android-platform-tools"
   fi
-  if ! command -v scrcpy >/dev/null 2>&1; then
-    info "scrcpy not found. Install it, e.g. brew install scrcpy"
-  fi
   install_or_update_plugin
-  marketplace="$(write_marketplace)"
+  marketplace="$(write_marketplace "$MARKETPLACE_PATH")"
+  install_agents_compat
+  agents_marketplace="$(write_marketplace "$AGENTS_MARKETPLACE_PATH")"
   config="$(migrate_codex_config || true)"
   info "Marketplace updated: $marketplace"
+  if [ "$agents_marketplace" != "$marketplace" ]; then
+    info "Agents marketplace updated: $agents_marketplace"
+  fi
   if [ -n "${config:-}" ]; then
     info "Codex config migrated: $config"
   fi

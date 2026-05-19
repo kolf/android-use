@@ -31,7 +31,7 @@
 - Codex 桌面端；
 - Python 3，执行 `python3 --version` 能看到版本；
 - Android 调试工具 `adb`；
-- 可选：`scrcpy`，用于弹出安卓设备镜像窗口；
+- `scrcpy`，用于弹出安卓设备镜像窗口；
 - 一根支持数据传输的 USB 线。
 
 安卓设备上需要：
@@ -105,6 +105,37 @@ ANMB9X5A10G00857 device product:ELN-W09 model:ELN_W09
 
 如果没有设备，优先检查 USB 线是不是数据线、设备是否开启 USB 调试、连接方式是否选择了文件传输。
 
+## 只配对一次，后面不用数据线
+
+Android 11 及以上设备可以使用「无线调试」。首次配对成功后，插件会保存设备地址，后续启动时自动无线重连。
+
+第一次配对：
+
+1. 确保电脑和平板在同一个 Wi-Fi。
+2. 打开平板「设置」。
+3. 进入「开发者选项」。
+4. 打开「无线调试」。
+5. 点「使用配对码配对设备」。
+6. 把页面上的 IP、配对端口和配对码告诉 Codex，例如：
+
+```text
+[@Android] 无线配对 host=172.27.31.51 pair_port=42123 code=123456
+```
+
+插件会执行配对、自动连接，并把配置写到：
+
+```text
+~/.config/android-use/env
+```
+
+后续不用插数据线，直接让 Codex 重连：
+
+```text
+[@Android] 无线重连
+```
+
+如果平板 IP 经常变，建议在路由器里给平板做 DHCP 保留；否则插件会尽量通过 `adb mdns services` 自动发现新的连接端口。
+
 ## 没有 Git 怎么安装插件
 
 小白用户不需要安装 Git。推荐用压缩包发给用户。
@@ -136,16 +167,18 @@ cd android-use
 ./doctor.sh
 ```
 
-`install.sh` 会把插件复制到：
+`install.sh` 会把插件复制到常规位置，并额外同步一份到兼容位置：
 
 ```text
 ~/plugins/android-use-plugins
+~/.agents/plugins/android-use-plugins
 ```
 
-并更新：
+并更新两个 marketplace 文件：
 
 ```text
 ~/marketplace.json
+~/.agents/plugins/marketplace.json
 ```
 
 ## 有 Git 的安装方式
@@ -293,9 +326,10 @@ recipe 会优先使用 selector，找不到时才退回坐标。
 
 ```bash
 cat ~/marketplace.json
+cat ~/.agents/plugins/marketplace.json
 ```
 
-里面应该有：
+其中至少一个文件里应该有：
 
 ```text
 android-use-plugins

@@ -44,6 +44,51 @@ abc123 unauthorized usb:336592896X
         self.assertEqual(devices[0]["details"]["model"], "sdk_gphone64_arm64")
         self.assertEqual(devices[1]["state"], "unauthorized")
 
+    def test_parse_adb_mdns_services(self) -> None:
+        output = """List of discovered mdns services
+adb-ANMB._adb-tls-connect._tcp.    172.27.31.51:37123
+adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
+"""
+        services = mcp.parse_adb_mdns_services(output, host="172.27.31.51")
+
+        self.assertEqual(services, [
+            {
+                "service": "adb-ANMB._adb-tls-connect._tcp.    172.27.31.51:37123",
+                "host": "172.27.31.51",
+                "port": 37123,
+                "serial": "172.27.31.51:37123",
+            }
+        ])
+
+    def test_choose_serial_dedupes_usb_and_wireless_same_device(self) -> None:
+        original_list_devices = mcp.list_devices
+        original_shell = mcp.shell
+        original_auto_reconnect = mcp.auto_reconnect_wireless_if_needed
+        original_env = {
+            "ANDROID_USE_SERIAL": mcp.os.environ.get("ANDROID_USE_SERIAL"),
+            "ANDROID_SERIAL": mcp.os.environ.get("ANDROID_SERIAL"),
+        }
+        try:
+            mcp.os.environ.pop("ANDROID_USE_SERIAL", None)
+            mcp.os.environ.pop("ANDROID_SERIAL", None)
+            mcp.list_devices = lambda: [
+                {"serial": "ANMB9X5A10G00857", "state": "device"},
+                {"serial": "172.27.31.51:5555", "state": "device"},
+            ]
+            mcp.shell = lambda serial, command, timeout=30: "ANMB9X5A10G00857"
+            mcp.auto_reconnect_wireless_if_needed = lambda: None
+
+            self.assertEqual(mcp.choose_serial(), "172.27.31.51:5555")
+        finally:
+            mcp.list_devices = original_list_devices
+            mcp.shell = original_shell
+            mcp.auto_reconnect_wireless_if_needed = original_auto_reconnect
+            for key, value in original_env.items():
+                if value is None:
+                    mcp.os.environ.pop(key, None)
+                else:
+                    mcp.os.environ[key] = value
+
     def test_parse_screen_size_prefers_override(self) -> None:
         size = mcp.parse_screen_size("Physical size: 1080x2400\nOverride size: 720x1600")
 
@@ -384,6 +429,25 @@ abc123 unauthorized usb:336592896X
         self.assertIsNotNone(process)
         self.assertIn("scrcpy_supervisor.py", process or "")
 
+    def test_start_scrcpy_reuses_existing_visible_window(self) -> None:
+        original_choose = mcp.choose_serial
+        original_visible = mcp.scrcpy_visible_process_for_serial
+        original_prune = mcp.prune_duplicate_scrcpy_processes
+        try:
+            mcp.choose_serial = lambda _serial=None: "device-1"
+            mcp.scrcpy_visible_process_for_serial = lambda _serial: "123 scrcpy --serial device-1"
+            mcp.prune_duplicate_scrcpy_processes = lambda _serial: [100]
+
+            content = mcp.tool_start_scrcpy({"serial": "device-1"})
+        finally:
+            mcp.choose_serial = original_choose
+            mcp.scrcpy_visible_process_for_serial = original_visible
+            mcp.prune_duplicate_scrcpy_processes = original_prune
+
+        payload = json.loads(content[0]["text"])
+        self.assertEqual(payload["skipped"], "already-running")
+        self.assertEqual(payload["stopped_duplicate_pids"], [100])
+
     def test_map_openai_computer_actions(self) -> None:
         screen = {"width": 1440, "height": 2560}
         click = mcp.map_openai_computer_action({"type": "click", "x": 100, "y": 200}, screen)
@@ -431,6 +495,7 @@ abc123 unauthorized usb:336592896X
 
     def test_connected_device_serials_prefers_one_physical_device(self) -> None:
         original_list_devices = mcp.list_devices
+        original_shell = mcp.shell
         original_env = {
             "ANDROID_USE_SCRCPY_RESIDENT_SERIALS": mcp.os.environ.get("ANDROID_USE_SCRCPY_RESIDENT_SERIALS"),
             "ANDROID_USE_SERIAL": mcp.os.environ.get("ANDROID_USE_SERIAL"),
@@ -443,6 +508,7 @@ abc123 unauthorized usb:336592896X
                 {"serial": "ANMB9X5A10G00857", "state": "device"},
                 {"serial": "emulator-5554", "state": "device"},
             ]
+            mcp.shell = lambda serial, command, timeout=30: serial
 
             self.assertEqual(mcp.connected_device_serials(), ["ANMB9X5A10G00857"])
 
@@ -450,6 +516,7 @@ abc123 unauthorized usb:336592896X
             self.assertEqual(mcp.connected_device_serials(), ["emulator-5554"])
         finally:
             mcp.list_devices = original_list_devices
+            mcp.shell = original_shell
             for key, value in original_env.items():
                 if value is None:
                     mcp.os.environ.pop(key, None)

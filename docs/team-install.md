@@ -36,11 +36,8 @@ dist/android-use-plugins.zip
 - Codex 桌面端；
 - Python 3；
 - Android Platform Tools，也就是 `adb`；
+- `scrcpy`，用于显示安卓设备镜像窗口；
 - 一根能传数据的 USB 线。
-
-建议：
-
-- `scrcpy`，用于显示安卓设备镜像窗口。
 
 检查命令：
 
@@ -86,6 +83,31 @@ adb devices -l
 
 如果完全看不到设备，检查 USB 线是否支持数据传输、设备是否选择文件传输模式、USB 调试是否开启。
 
+## 只配对一次，后面不用数据线
+
+Android 11 及以上设备可以开启「无线调试」。首次配对成功后，插件会保存设备地址，后面会自动无线重连。
+
+第一次配对：
+
+1. 确保电脑和平板在同一个 Wi-Fi。
+2. 打开平板「设置」。
+3. 进入「开发者选项」。
+4. 打开「无线调试」。
+5. 点「使用配对码配对设备」。
+6. 把页面上的 IP、配对端口和配对码告诉 Codex，例如：
+
+```text
+[@Android] 无线配对 host=172.27.31.51 pair_port=42123 code=123456
+```
+
+后续不用插数据线，直接说：
+
+```text
+[@Android] 无线重连
+```
+
+如果 IP 经常变，建议让网络管理员在路由器上给平板做 DHCP 保留。
+
 ## 手动安装步骤
 
 如果用户自己会打开终端：
@@ -97,16 +119,18 @@ cd android-use
 ./doctor.sh
 ```
 
-安装脚本会把插件安装到：
+安装脚本会把插件安装到常规位置，并额外同步一份到兼容位置：
 
 ```text
 ~/plugins/android-use-plugins
+~/.agents/plugins/android-use-plugins
 ```
 
-并更新：
+并更新两个 marketplace 文件：
 
 ```text
 ~/marketplace.json
+~/.agents/plugins/marketplace.json
 ```
 
 ## 有 Git 的安装方式
@@ -141,9 +165,10 @@ cd ~/plugins/android-use-plugins
 
 ```bash
 cat ~/marketplace.json
+cat ~/.agents/plugins/marketplace.json
 ```
 
-里面应该包含 `android-use-plugins`。确认后重启 Codex。
+其中至少一个文件里应该包含 `android-use-plugins`。确认后重启 Codex。
 
 ### 设备不可控
 

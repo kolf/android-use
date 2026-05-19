@@ -52,6 +52,8 @@ def main() -> int:
             "android_start_webrtc_viewer",
             "android_agent_step",
             "android_start_scrcpy",
+            "android_wireless_pair",
+            "android_wireless_reconnect",
         }
         missing = sorted(required.difference(tool_names))
         if missing:

@@ -81,7 +81,7 @@ def parse_env_assignment(line: str) -> tuple[str, str] | None:
     value = value.strip()
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
         return None
-    if key != "OPENAI_API_KEY" and not key.startswith("ANDROID_USE_"):
+    if key not in {"OPENAI_API_KEY", "ANDROID_SERIAL"} and not key.startswith("ANDROID_USE_"):
         return None
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
         value = value[1:-1]
@@ -104,6 +104,51 @@ def load_user_env_file(path: Path = USER_ENV_FILE) -> None:
 
 
 load_user_env_file()
+
+
+def read_user_env_values(path: Path = USER_ENV_FILE) -> dict[str, str]:
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return {}
+    values: dict[str, str] = {}
+    for line in lines:
+        assignment = parse_env_assignment(line)
+        if assignment:
+            key, value = assignment
+            values[key] = value
+    return values
+
+
+def quote_env_value(value: str) -> str:
+    return shlex.quote(str(value))
+
+
+def update_user_env_file(updates: dict[str, str], path: Path = USER_ENV_FILE) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        lines = path.read_text().splitlines()
+    except FileNotFoundError:
+        lines = []
+    seen: set[str] = set()
+    next_lines: list[str] = []
+    for line in lines:
+        assignment = parse_env_assignment(line)
+        if not assignment:
+            next_lines.append(line)
+            continue
+        key, _old_value = assignment
+        if key in updates:
+            next_lines.append(f"{key}={quote_env_value(updates[key])}")
+            seen.add(key)
+        else:
+            next_lines.append(line)
+    for key, value in updates.items():
+        if key not in seen:
+            next_lines.append(f"{key}={quote_env_value(value)}")
+    path.write_text("\n".join(next_lines).rstrip() + "\n")
+    for key, value in updates.items():
+        os.environ[key] = value
 
 
 def adb_binary() -> str:
@@ -215,6 +260,173 @@ def list_devices() -> list[dict[str, Any]]:
     return parse_adb_devices(output)
 
 
+def is_tcp_serial(serial: str) -> bool:
+    return bool(re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}:\d+", serial)) or serial.startswith("[")
+
+
+def configured_serial() -> str | None:
+    return os.environ.get("ANDROID_USE_SERIAL") or os.environ.get("ANDROID_SERIAL")
+
+
+def device_identity(serial: str) -> str:
+    for prop in ("ro.serialno", "ro.boot.serialno"):
+        try:
+            value = shell(serial, f"getprop {prop}", timeout=3).strip()
+        except Exception:
+            value = ""
+        if value:
+            return value
+    return serial
+
+
+def dedupe_connected_devices(devices: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for device in devices:
+        serial = str(device.get("serial") or "")
+        identity = device_identity(serial) if serial else serial
+        grouped.setdefault(identity, []).append(device)
+    preferred_config = configured_serial()
+    deduped: list[dict[str, Any]] = []
+    for group in grouped.values():
+        chosen = None
+        if preferred_config:
+            chosen = next((device for device in group if device.get("serial") == preferred_config), None)
+        if chosen is None:
+            chosen = next((device for device in group if is_tcp_serial(str(device.get("serial") or ""))), None)
+        deduped.append(chosen or group[0])
+    return deduped
+
+
+def parse_host_port(value: str) -> tuple[str, int] | None:
+    raw = value.strip()
+    match = re.fullmatch(r"(.+):(\d+)", raw)
+    if not match:
+        return None
+    host, port_text = match.groups()
+    try:
+        port = int(port_text)
+    except ValueError:
+        return None
+    if not host or port <= 0:
+        return None
+    return host.strip("[]"), port
+
+
+def parse_adb_mdns_services(output: str, *, host: str | None = None) -> list[dict[str, Any]]:
+    services: list[dict[str, Any]] = []
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if "_adb-tls-connect._tcp" not in line:
+            continue
+        endpoints = re.findall(r"((?:\d{1,3}\.){3}\d{1,3}|[A-Za-z0-9_.-]+):(\d+)", line)
+        for endpoint_host, port_text in endpoints:
+            if host and endpoint_host != host:
+                continue
+            services.append({"service": line, "host": endpoint_host, "port": int(port_text), "serial": f"{endpoint_host}:{port_text}"})
+    return services
+
+
+def adb_mdns_connect_services(host: str | None = None) -> list[dict[str, Any]]:
+    try:
+        stdout, _stderr = run_command([adb_binary(), "mdns", "services"], timeout=8)
+    except AndroidUseError:
+        return []
+    return parse_adb_mdns_services(decode_bytes(stdout), host=host)
+
+
+def adb_connect_serial(host: str, port: int) -> dict[str, Any]:
+    target = f"{host}:{int(port)}"
+    stdout, stderr = run_command([adb_binary(), "connect", target], timeout=15)
+    output = "\n".join(part for part in [decode_bytes(stdout), decode_bytes(stderr)] if part)
+    connected = any(device.get("serial") == target and device.get("state") == "device" for device in list_devices())
+    if not connected and not re.search(r"\bconnected to\b|\balready connected to\b", output, re.I):
+        raise AndroidUseError(f"adb connect did not authorize {target}\n{output}")
+    return {"serial": target, "host": host, "port": int(port), "output": output, "connected": connected}
+
+
+def save_wireless_config(host: str, port: int, serial: str) -> None:
+    update_user_env_file(
+        {
+            "ANDROID_USE_WIRELESS_HOST": host,
+            "ANDROID_USE_WIRELESS_PORT": str(int(port)),
+            "ANDROID_USE_SERIAL": serial,
+            "ANDROID_SERIAL": serial,
+            "ANDROID_USE_SCRCPY_RESIDENT_SERIALS": serial,
+        }
+    )
+
+
+def wireless_config_from_env() -> tuple[str | None, int | None, str | None]:
+    values = {**read_user_env_values(), **os.environ}
+    serial = values.get("ANDROID_USE_SERIAL") or values.get("ANDROID_SERIAL")
+    host = values.get("ANDROID_USE_WIRELESS_HOST")
+    port_text = values.get("ANDROID_USE_WIRELESS_PORT")
+    if serial and not host:
+        parsed = parse_host_port(serial)
+        if parsed:
+            host, parsed_port = parsed
+            port_text = port_text or str(parsed_port)
+    port = int(port_text) if port_text and str(port_text).isdigit() else None
+    return host, port, serial
+
+
+def wireless_reconnect(
+    *,
+    host: str | None = None,
+    port: int | None = None,
+    serial: str | None = None,
+    save: bool = True,
+    start_scrcpy: bool = False,
+) -> dict[str, Any]:
+    env_host, env_port, env_serial = wireless_config_from_env()
+    host = host or env_host
+    port = int(port or env_port or 0) or None
+    serial = serial or env_serial
+    if serial and (not host or not port):
+        parsed = parse_host_port(serial)
+        if parsed:
+            host = host or parsed[0]
+            port = port or parsed[1]
+    if not host:
+        raise AndroidUseError("Wireless host is not configured. Run android_wireless_pair first or pass host.")
+
+    candidates: list[tuple[str, int]] = []
+    if port:
+        candidates.append((host, int(port)))
+    for service in adb_mdns_connect_services(host):
+        candidate = (str(service["host"]), int(service["port"]))
+        if candidate not in candidates:
+            candidates.append(candidate)
+    if not candidates:
+        raise AndroidUseError(f"No wireless ADB connect port found for {host}. Enable Wireless debugging and try again.")
+
+    errors: list[str] = []
+    for candidate_host, candidate_port in candidates:
+        try:
+            connected = adb_connect_serial(candidate_host, candidate_port)
+            if save:
+                save_wireless_config(candidate_host, candidate_port, str(connected["serial"]))
+            scrcpy_result = None
+            if start_scrcpy:
+                scrcpy_result = ensure_default_scrcpy_window(str(connected["serial"]), {"show_scrcpy": True})
+            return {"ok": True, **connected, "saved": save, "scrcpy": scrcpy_result}
+        except Exception as exc:
+            errors.append(f"{candidate_host}:{candidate_port}: {exc}")
+    raise AndroidUseError("Wireless reconnect failed.\n" + "\n".join(errors[-5:]))
+
+
+def auto_reconnect_wireless_if_needed() -> None:
+    if not env_flag("ANDROID_USE_WIRELESS_AUTO_CONNECT", True):
+        return
+    host, port, serial = wireless_config_from_env()
+    if not host and not serial:
+        return
+    try:
+        wireless_reconnect(host=host, port=port, serial=serial, save=True, start_scrcpy=False)
+    except Exception:
+        return
+
+
 def choose_serial(serial: str | None = None) -> str:
     devices = list_devices()
     connected = [device for device in devices if device.get("state") == "device"]
@@ -223,9 +435,25 @@ def choose_serial(serial: str | None = None) -> str:
         for device in connected:
             if device.get("serial") == serial:
                 return serial
+        if parse_host_port(serial):
+            with contextlib.suppress(Exception):
+                reconnect = wireless_reconnect(serial=serial, save=True, start_scrcpy=False)
+                if reconnect.get("serial"):
+                    return str(reconnect["serial"])
         known = ", ".join(device.get("serial", "?") for device in devices) or "none"
         raise AndroidUseError(f"Android device '{serial}' is not connected and authorized. Known devices: {known}")
 
+    if not connected:
+        auto_reconnect_wireless_if_needed()
+        devices = list_devices()
+        connected = [device for device in devices if device.get("state") == "device"]
+    env_serial = configured_serial()
+    if env_serial:
+        for device in connected:
+            if device.get("serial") == env_serial:
+                return env_serial
+    if connected:
+        connected = dedupe_connected_devices(connected)
     if not connected:
         raise AndroidUseError("No authorized Android device found. Run `adb devices -l` and authorize USB debugging.")
     if len(connected) > 1:
@@ -1830,16 +2058,23 @@ def image_content(png: bytes) -> dict[str, str]:
 def check_dependencies(_args: dict[str, Any]) -> list[dict[str, Any]]:
     adb_path = shutil.which(adb_binary()) or adb_binary()
     scrcpy_path = shutil.which(scrcpy_binary()) or scrcpy_binary()
+    adb_available = shutil.which(adb_binary()) is not None or Path(adb_binary()).exists()
+    scrcpy_available = shutil.which(scrcpy_binary()) is not None or Path(scrcpy_binary()).exists()
+    wireless_host, wireless_port, wireless_serial = wireless_config_from_env()
     payload: dict[str, Any] = {
+        "ok": adb_available and scrcpy_available,
         "adb": {
             "command": adb_binary(),
             "path": adb_path,
-            "available": shutil.which(adb_binary()) is not None or Path(adb_binary()).exists(),
+            "available": adb_available,
+            "required": True,
         },
         "scrcpy": {
             "command": scrcpy_binary(),
             "path": scrcpy_path,
-            "available": shutil.which(scrcpy_binary()) is not None or Path(scrcpy_binary()).exists(),
+            "available": scrcpy_available,
+            "required": True,
+            "install_hint": "brew install scrcpy",
         },
         "vlm": {
             "provider": os.environ.get("ANDROID_USE_AGENT_PROVIDER", "openai-compatible"),
@@ -1848,6 +2083,14 @@ def check_dependencies(_args: dict[str, Any]) -> list[dict[str, Any]]:
             "model": os.environ.get("ANDROID_USE_VLM_MODEL"),
             "coordinate_mode": infer_coordinate_mode(os.environ.get("ANDROID_USE_VLM_MODEL")),
             "timeout_sec": float(os.environ.get("ANDROID_USE_VLM_TIMEOUT", "45")),
+        },
+        "wireless": {
+            "auto_connect": env_flag("ANDROID_USE_WIRELESS_AUTO_CONNECT", True),
+            "host": wireless_host,
+            "port": wireless_port,
+            "serial": wireless_serial,
+            "env_file": str(USER_ENV_FILE),
+            "configured": bool(wireless_host or wireless_serial),
         },
         "openai": {
             "api_key_configured": bool(os.environ.get("ANDROID_USE_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")),
@@ -1882,6 +2125,53 @@ def tool_list_devices(args: dict[str, Any]) -> list[dict[str, Any]]:
                 except AndroidUseError as exc:
                     device["state_error"] = str(exc)
     return [text_content({"devices": devices})]
+
+
+def tool_wireless_pair(args: dict[str, Any]) -> list[dict[str, Any]]:
+    host = str(args.get("host") or "").strip()
+    pair_port = int(args.get("pair_port") or 0)
+    code = str(args.get("code") or "").strip()
+    connect_port = int(args.get("connect_port") or 0) or None
+    save = bool(args.get("save", True))
+    start_scrcpy = bool(args.get("start_scrcpy", True))
+    if not host:
+        raise AndroidUseError("host is required, for example 172.27.31.51")
+    if pair_port <= 0:
+        raise AndroidUseError("pair_port is required. Use the port shown beside the pairing code.")
+    if not code:
+        raise AndroidUseError("code is required. It is the temporary Wireless debugging pairing code.")
+
+    target = f"{host}:{pair_port}"
+    stdout, stderr = run_command([adb_binary(), "pair", target, code], timeout=30)
+    pair_output = "\n".join(part for part in [decode_bytes(stdout), decode_bytes(stderr)] if part)
+    reconnect_result = wireless_reconnect(
+        host=host,
+        port=connect_port,
+        save=save,
+        start_scrcpy=start_scrcpy,
+    )
+    return [
+        text_content(
+            {
+                "ok": True,
+                "paired": True,
+                "pair_target": target,
+                "pair_output": pair_output,
+                "reconnect": reconnect_result,
+                "env_file": str(USER_ENV_FILE) if save else None,
+            }
+        )
+    ]
+
+
+def tool_wireless_reconnect(args: dict[str, Any]) -> list[dict[str, Any]]:
+    host = str(args.get("host") or "").strip() or None
+    port = int(args.get("port") or 0) or None
+    serial = str(args.get("serial") or "").strip() or None
+    save = bool(args.get("save", True))
+    start_scrcpy = bool(args.get("start_scrcpy", True))
+    result = wireless_reconnect(host=host, port=port, serial=serial, save=save, start_scrcpy=start_scrcpy)
+    return [text_content({"ok": True, **result, "env_file": str(USER_ENV_FILE) if save else None})]
 
 
 def tool_get_state(args: dict[str, Any]) -> list[dict[str, Any]]:
@@ -7124,20 +7414,64 @@ def host_process_lines() -> list[str]:
     return [line.strip() for line in decode_bytes(stdout).splitlines() if line.strip()]
 
 
+def host_process_rows() -> list[dict[str, Any]]:
+    try:
+        stdout, _stderr = run_command(["ps", "-axo", "pid=,ppid=,command="], timeout=3)
+    except AndroidUseError:
+        return []
+    rows: list[dict[str, Any]] = []
+    for raw_line in decode_bytes(stdout).splitlines():
+        match = re.match(r"\s*(\d+)\s+(\d+)\s+(.*)", raw_line)
+        if match:
+            rows.append({"pid": int(match.group(1)), "ppid": int(match.group(2)), "command": match.group(3).strip()})
+    return rows
+
+
+def is_visible_scrcpy_command(command: str, serial: str) -> bool:
+    if serial not in command:
+        return False
+    is_supervisor = "scrcpy_supervisor.py" in command
+    is_scrcpy_binary = re.search(r"(^|\s)(?:\S*/)?scrcpy(\s|$)", command) is not None
+    if not is_supervisor and not is_scrcpy_binary:
+        return False
+    if "--no-window" in command:
+        return False
+    if "android_webrtc_viewer.py" in command:
+        return False
+    return True
+
+
+def scrcpy_visible_processes_for_serial(serial: str) -> list[dict[str, Any]]:
+    return [row for row in host_process_rows() if is_visible_scrcpy_command(str(row.get("command") or ""), serial)]
+
+
 def scrcpy_visible_process_for_serial(serial: str) -> str | None:
     for line in host_process_lines():
         if serial not in line:
             continue
-        is_supervisor = "scrcpy_supervisor.py" in line
-        is_scrcpy_binary = re.search(r"(^|\s)(?:\S*/)?scrcpy(\s|$)", line) is not None
-        if not is_supervisor and not is_scrcpy_binary:
-            continue
-        if "--no-window" in line:
-            continue
-        if "android_webrtc_viewer.py" in line:
-            continue
-        return line
+        if is_visible_scrcpy_command(line, serial):
+            return line
     return None
+
+
+def prune_duplicate_scrcpy_processes(serial: str) -> list[int]:
+    rows = scrcpy_visible_processes_for_serial(serial)
+    supervisors = [row for row in rows if "scrcpy_supervisor.py" in str(row.get("command") or "")]
+    if len(supervisors) <= 1:
+        return []
+    supervisors.sort(key=lambda row: int(row["pid"]), reverse=True)
+    keep_pid = int(supervisors[0]["pid"])
+    stopped: list[int] = []
+    for row in supervisors[1:]:
+        pid = int(row["pid"])
+        if pid == keep_pid:
+            continue
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(pid, 15)
+            stopped.append(pid)
+    if stopped:
+        time.sleep(0.2)
+    return stopped
 
 
 def ensure_default_scrcpy_window(serial: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -7147,11 +7481,18 @@ def ensure_default_scrcpy_window(serial: str, args: dict[str, Any]) -> dict[str,
     with exclusive_file_lock(launch_lock, blocking=True) as locked:
         if not locked:
             return {"ok": False, "error": "could not acquire scrcpy launch lock"}
+        duplicate_pids = prune_duplicate_scrcpy_processes(serial)
         existing = scrcpy_visible_process_for_serial(serial)
         if existing:
             if not bool(args.get("respect_manual_close", False)):
                 clear_scrcpy_user_closed(serial)
-            return {"ok": True, "skipped": "already-running", "process": existing[:500], "launch_lock": str(launch_lock)}
+            return {
+                "ok": True,
+                "skipped": "already-running",
+                "process": existing[:500],
+                "stopped_duplicate_pids": duplicate_pids,
+                "launch_lock": str(launch_lock),
+            }
         user_closed = read_scrcpy_user_closed(serial)
         if user_closed and bool(args.get("respect_manual_close", False)):
             return {
@@ -7201,6 +7542,7 @@ def connected_device_serials() -> list[str]:
         wanted = [item.strip() for item in re.split(r"[,;\s]+", configured) if item.strip()]
         connected = {str(device.get("serial") or "") for device in devices}
         return [serial for serial in wanted if serial in connected]
+    devices = dedupe_connected_devices(devices)
     physical = [str(device.get("serial") or "") for device in devices if not str(device.get("serial") or "").startswith("emulator-")]
     if physical:
         return physical[:1]
@@ -7328,6 +7670,23 @@ def terminate_process(process: subprocess.Popen[bytes], *, timeout: float = 3) -
 
 def tool_start_scrcpy(args: dict[str, Any]) -> list[dict[str, Any]]:
     serial = choose_serial(args.get("serial"))
+    if not bool(args.get("force", False)):
+        duplicate_pids = prune_duplicate_scrcpy_processes(serial)
+        existing = scrcpy_visible_process_for_serial(serial)
+        if existing:
+            clear_scrcpy_user_closed(serial)
+            return [
+                text_content(
+                    {
+                        "ok": True,
+                        "serial": serial,
+                        "skipped": "already-running",
+                        "process": existing[:500],
+                        "stopped_duplicate_pids": duplicate_pids,
+                        "display": "scrcpy is already running for this device.",
+                    }
+                )
+            ]
     command, window_width, window_height, window_title = build_scrcpy_command(args, serial)
     clear_scrcpy_user_closed(serial)
 
@@ -8610,6 +8969,38 @@ TOOLS: dict[str, dict[str, Any]] = {
         },
         "handler": tool_list_devices,
     },
+    "android_wireless_pair": {
+        "description": "Pair an Android 11+ device over Wireless debugging once, connect it, save the wireless serial, and optionally open scrcpy.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "host": {"type": "string", "description": "Device IP address, for example 172.27.31.51."},
+                "pair_port": {"type": "integer", "description": "Pairing port shown beside the Wireless debugging pairing code."},
+                "code": {"type": "string", "description": "Temporary pairing code shown on the Android device."},
+                "connect_port": {"type": "integer", "description": "Optional Wireless debugging connection port. If omitted, adb mdns services is used."},
+                "save": {"type": "boolean", "default": True},
+                "start_scrcpy": {"type": "boolean", "default": True},
+            },
+            "required": ["host", "pair_port", "code"],
+            "additionalProperties": False,
+        },
+        "handler": tool_wireless_pair,
+    },
+    "android_wireless_reconnect": {
+        "description": "Reconnect to the last saved Wireless debugging device without USB, refreshing dynamic mDNS ports when needed.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "host": {"type": "string", "description": "Optional device IP address. Defaults to saved ANDROID_USE_WIRELESS_HOST."},
+                "port": {"type": "integer", "description": "Optional connect port. Defaults to saved port, then mDNS."},
+                "serial": {"type": "string", "description": "Optional adb serial such as 172.27.31.51:5555."},
+                "save": {"type": "boolean", "default": True},
+                "start_scrcpy": {"type": "boolean", "default": True},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_wireless_reconnect,
+    },
     "android_get_state": {
         "description": "Get state for an attached Android device, optionally including a screenshot.",
         "inputSchema": {
@@ -9498,6 +9889,11 @@ TOOLS: dict[str, dict[str, Any]] = {
                 },
                 "window_title": {"type": "string"},
                 "extra_args": {"type": "array", "items": {"type": "string"}},
+                "force": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Start a new scrcpy process even if one is already visible for the same serial.",
+                },
             },
             "additionalProperties": False,
         },
