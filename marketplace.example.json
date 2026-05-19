@@ -1,7 +1,7 @@
 {
-  "name": "android-use-plugins",
+  "name": "local",
   "interface": {
-    "displayName": "Android"
+    "displayName": "Local Plugins"
   },
   "plugins": [
     {
@@ -15,7 +15,7 @@
         "path": "./plugins/android-use-plugins"
       },
       "policy": {
-        "installation": "AVAILABLE",
+        "installation": "INSTALLED_BY_DEFAULT",
         "authentication": "ON_INSTALL"
       },
       "category": "Developer Tools",

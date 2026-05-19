@@ -26,7 +26,7 @@ dist/android-use-plugins.zip
 请帮我解压 android-use-plugins.zip，进入解压后的目录，执行 ./install.sh 安装 Android 插件，然后执行 ./doctor.sh 做环境检查。
 ```
 
-安装完成后，重启 Codex，在插件列表启用 `Android`。
+安装完成后，重启 Codex，插件列表里应该直接显示 `Android`。
 
 ## 电脑需要配置什么
 
@@ -124,6 +124,7 @@ cd android-use
 ```text
 ~/plugins/android-use-plugins
 ~/.agents/plugins/android-use-plugins
+~/.codex/plugins/cache/local/android-use-plugins/0.1.0
 ```
 
 并更新两个 marketplace 文件：
@@ -168,7 +169,23 @@ cat ~/marketplace.json
 cat ~/.agents/plugins/marketplace.json
 ```
 
-其中至少一个文件里应该包含 `android-use-plugins`。确认后重启 Codex。
+其中至少一个文件里应该包含 `android-use-plugins`。
+
+再确认 Codex 配置里已经启用：
+
+```bash
+grep -n 'android-use-plugins@local' ~/.codex/config.toml
+```
+
+如果没有输出，重新执行：
+
+```bash
+cd ~/plugins/android-use-plugins
+./install.sh
+./doctor.sh
+```
+
+然后重启 Codex，插件列表里应该直接显示 `Android`。
 
 ### 设备不可控
 

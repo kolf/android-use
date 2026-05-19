@@ -47,6 +47,8 @@ MARKETPLACE_PATH="${ANDROID_USE_PLUGIN_MARKETPLACE:-$(dirname "$PLUGIN_ROOT")/ma
 AGENTS_PLUGIN_ROOT="${ANDROID_USE_AGENTS_PLUGIN_ROOT:-$HOME/.agents/plugins}"
 AGENTS_INSTALL_DIR="${ANDROID_USE_AGENTS_PLUGIN_INSTALL_DIR:-$AGENTS_PLUGIN_ROOT/$PLUGIN_NAME}"
 AGENTS_MARKETPLACE_PATH="${ANDROID_USE_AGENTS_PLUGIN_MARKETPLACE:-$AGENTS_PLUGIN_ROOT/marketplace.json}"
+LOCAL_MARKETPLACE_SOURCE="$(dirname "$PLUGIN_ROOT")"
+CODEX_CACHE_INSTALL_DIR="${ANDROID_USE_CODEX_PLUGIN_CACHE_DIR:-$HOME/.codex/plugins/cache/local/$PLUGIN_NAME/0.1.0}"
 
 info() {
   printf '[android-use-plugins] %s\n' "$*"
@@ -104,20 +106,30 @@ copy_local_bundle() {
   copy_bundle_contents "$SOURCE_DIR" "$INSTALL_DIR"
 }
 
+clear_quarantine() {
+  local target_dir="$1"
+  if command -v xattr >/dev/null 2>&1 && [ -e "$target_dir" ]; then
+    xattr -dr com.apple.quarantine "$target_dir" 2>/dev/null || true
+  fi
+}
+
 install_or_update_plugin() {
   mkdir -p "$PLUGIN_ROOT"
   if [ "$SOURCE_DIR" = "$INSTALL_DIR" ]; then
     info "Plugin is already at $INSTALL_DIR"
+    clear_quarantine "$INSTALL_DIR"
     return
   fi
   if [ -f "$SOURCE_DIR/.codex-plugin/plugin.json" ]; then
     copy_local_bundle
+    clear_quarantine "$INSTALL_DIR"
     return
   fi
   if [ -d "$INSTALL_DIR/.git" ]; then
     require_command git
     info "Updating $INSTALL_DIR"
     git -C "$INSTALL_DIR" pull --ff-only
+    clear_quarantine "$INSTALL_DIR"
     return
   fi
   if [ -e "$INSTALL_DIR" ]; then
@@ -127,6 +139,7 @@ install_or_update_plugin() {
   fi
   require_command git
   if git clone "$REPO_URL" "$INSTALL_DIR"; then
+    clear_quarantine "$INSTALL_DIR"
     return
   fi
   info "Git clone failed, installing from local checkout"
@@ -140,6 +153,7 @@ install_or_update_plugin() {
     info "Cloning $REPO_URL to $INSTALL_DIR"
     git clone "$REPO_URL" "$INSTALL_DIR"
   fi
+  clear_quarantine "$INSTALL_DIR"
 }
 
 write_marketplace() {
@@ -160,7 +174,7 @@ entry = {
     "composerIcon": icon_path,
     "logo": icon_path,
     "source": {"source": "local", "path": f"./plugins/{plugin_name}"},
-    "policy": {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
+    "policy": {"installation": "INSTALLED_BY_DEFAULT", "authentication": "ON_INSTALL"},
     "category": "Developer Tools",
     "interface": {
         "displayName": "Android",
@@ -178,16 +192,16 @@ if path.exists():
         raise SystemExit(f"Invalid JSON in {path}")
 else:
     payload = {
-        "name": "android-use-plugins",
-        "interface": {"displayName": "Android"},
+        "name": "local",
+        "interface": {"displayName": "Local Plugins"},
         "plugins": [],
     }
 
-if payload.get("name") in (None, "", "xiaoluxue-codex-plugins", "[TODO: marketplace-name]"):
-    payload["name"] = "android-use-plugins"
+if payload.get("name") in (None, "", "xiaoluxue-codex-plugins", "android-use-plugins", "[TODO: marketplace-name]"):
+    payload["name"] = "local"
 interface = payload.setdefault("interface", {})
-if interface.get("displayName") in (None, "", "Xiaoluxue Codex Plugins", "[TODO: Marketplace Display Name]"):
-    interface["displayName"] = "Android"
+if interface.get("displayName") in (None, "", "Xiaoluxue Codex Plugins", "Android", "[TODO: Marketplace Display Name]"):
+    interface["displayName"] = "Local Plugins"
 plugins = payload.setdefault("plugins", [])
 if not isinstance(plugins, list):
     raise SystemExit(f"{path}: plugins must be a list")
@@ -230,22 +244,82 @@ install_agents_compat() {
   copy_bundle_contents "$INSTALL_DIR" "$AGENTS_INSTALL_DIR"
 }
 
-migrate_codex_config() {
-  [ -f "$CODEX_CONFIG_PATH" ] || return 0
-  CODEX_CONFIG_PATH="$CODEX_CONFIG_PATH" PLUGIN_NAME="$PLUGIN_NAME" python3 - <<'PY'
+install_codex_cache_compat() {
+  if [ "$INSTALL_DIR" = "$CODEX_CACHE_INSTALL_DIR" ]; then
+    return 0
+  fi
+  info "Installing Codex cache copy: $CODEX_CACHE_INSTALL_DIR"
+  copy_bundle_contents "$INSTALL_DIR" "$CODEX_CACHE_INSTALL_DIR"
+  clear_quarantine "$CODEX_CACHE_INSTALL_DIR"
+}
+
+configure_codex_config() {
+  mkdir -p "$(dirname "$CODEX_CONFIG_PATH")"
+  touch "$CODEX_CONFIG_PATH"
+  CODEX_CONFIG_PATH="$CODEX_CONFIG_PATH" PLUGIN_NAME="$PLUGIN_NAME" LOCAL_MARKETPLACE_SOURCE="$LOCAL_MARKETPLACE_SOURCE" python3 - <<'PY'
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 
 path = Path(os.environ["CODEX_CONFIG_PATH"]).expanduser()
 plugin_name = os.environ["PLUGIN_NAME"]
+local_source = str(Path(os.environ["LOCAL_MARKETPLACE_SOURCE"]).expanduser())
 text = path.read_text()
 original = text
 for legacy_name in ("android-use", "xiaoluxue-android-use"):
     text = text.replace(f'[plugins."{legacy_name}@local"]', f'[plugins."{plugin_name}@local"]')
     text = text.replace(f'[plugins."{legacy_name}@local".', f'[plugins."{plugin_name}@local".')
-if text != original:
-    path.write_text(text)
-    print(path)
+
+lines = text.splitlines()
+
+def section_bounds(header):
+    start = None
+    for index, line in enumerate(lines):
+        if line.strip() == header:
+            start = index
+            break
+    if start is None:
+        return None
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        stripped = lines[index].strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            end = index
+            break
+    return start, end
+
+def ensure_key(section_header, key, value):
+    bounds = section_bounds(section_header)
+    if bounds is None:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.extend([section_header, f'{key} = {value}'])
+        return True
+    start, end = bounds
+    for index in range(start + 1, end):
+        stripped = lines[index].strip()
+        if stripped.startswith(f"{key} ") or stripped.startswith(f"{key}="):
+            desired = f'{key} = {value}'
+            if lines[index] != desired:
+                lines[index] = desired
+                return True
+            return False
+    lines.insert(start + 1, f'{key} = {value}')
+    return True
+
+changed = text != original
+changed = ensure_key("[marketplaces.local]", "source", f'"{local_source}"') or changed
+changed = ensure_key("[marketplaces.local]", "source_type", '"local"') or changed
+changed = ensure_key(
+    "[marketplaces.local]",
+    "last_updated",
+    f'"{datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")}"',
+) or changed
+changed = ensure_key(f'[plugins."{plugin_name}@local"]', "enabled", "true") or changed
+
+if changed:
+    path.write_text("\n".join(lines).rstrip() + "\n")
+print(path)
 PY
 }
 
@@ -258,17 +332,20 @@ main() {
   install_or_update_plugin
   marketplace="$(write_marketplace "$MARKETPLACE_PATH")"
   install_agents_compat
+  clear_quarantine "$AGENTS_INSTALL_DIR"
+  install_codex_cache_compat
   agents_marketplace="$(write_marketplace "$AGENTS_MARKETPLACE_PATH")"
-  config="$(migrate_codex_config || true)"
+  config="$(configure_codex_config || true)"
   info "Marketplace updated: $marketplace"
   if [ "$agents_marketplace" != "$marketplace" ]; then
     info "Agents marketplace updated: $agents_marketplace"
   fi
   if [ -n "${config:-}" ]; then
-    info "Codex config migrated: $config"
+    info "Codex config updated: $config"
   fi
   info "Plugin path: $INSTALL_DIR"
-  info "Restart Codex, then enable Android from the local plugin marketplace."
+  info "Codex cache path: $CODEX_CACHE_INSTALL_DIR"
+  info "Restart Codex, then Android should appear in the plugin list."
   info "Run ./doctor.sh after restart if the plugin does not appear or cannot control a device."
 }
 

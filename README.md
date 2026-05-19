@@ -21,7 +21,7 @@
 请帮我解压 android-use-plugins.zip，进入解压后的目录，执行 ./install.sh 安装 Android 插件，然后运行 ./doctor.sh 检查环境。
 ```
 
-安装完成后，重启 Codex，在插件列表里启用 `Android`。
+安装完成后，重启 Codex，插件列表里应该直接显示 `Android`。
 
 ## 需要准备什么
 
@@ -155,7 +155,7 @@ dist/android-use-plugins.zip
 把这个压缩包发给用户。用户收到后，让 Codex 执行：
 
 ```text
-请帮我解压 android-use-plugins.zip，进入解压后的目录，执行 ./install.sh 安装，然后执行 ./doctor.sh 检查。安装完成后提醒我重启 Codex 并启用 Android 插件。
+请帮我解压 android-use-plugins.zip，进入解压后的目录，执行 ./install.sh 安装，然后执行 ./doctor.sh 检查。安装完成后提醒我重启 Codex，插件列表里应该直接显示 Android。
 ```
 
 如果用户自己会用终端，也可以手动：
@@ -172,6 +172,7 @@ cd android-use
 ```text
 ~/plugins/android-use-plugins
 ~/.agents/plugins/android-use-plugins
+~/.codex/plugins/cache/local/android-use-plugins/0.1.0
 ```
 
 并更新两个 marketplace 文件：
@@ -192,7 +193,7 @@ cd ~/plugins/android-use-plugins
 ./doctor.sh
 ```
 
-完成后重启 Codex，在插件列表里启用 `Android`。
+完成后重启 Codex，插件列表里应该直接显示 `Android`。
 
 ## 安装后怎么确认可用
 
@@ -335,7 +336,21 @@ cat ~/.agents/plugins/marketplace.json
 android-use-plugins
 ```
 
-然后重启 Codex，再去插件列表启用 `Android`。
+再确认 Codex 配置里已经启用：
+
+```bash
+grep -n 'android-use-plugins@local' ~/.codex/config.toml
+```
+
+如果没有输出，重新执行：
+
+```bash
+cd ~/plugins/android-use-plugins
+./install.sh
+./doctor.sh
+```
+
+然后重启 Codex，插件列表里应该直接显示 `Android`。
 
 ### adb 找不到设备
 

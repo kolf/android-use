@@ -6,6 +6,7 @@ PLUGIN_NAME="android-use-plugins"
 CODEX_CONFIG_PATH="${ANDROID_USE_CODEX_CONFIG:-$HOME/.codex/config.toml}"
 MARKETPLACE_PATH="${ANDROID_USE_PLUGIN_MARKETPLACE:-$HOME/marketplace.json}"
 AGENTS_MARKETPLACE_PATH="${ANDROID_USE_AGENTS_PLUGIN_MARKETPLACE:-$HOME/.agents/plugins/marketplace.json}"
+CODEX_CACHE_PLUGIN_PATH="${ANDROID_USE_CODEX_PLUGIN_CACHE_DIR:-$HOME/.codex/plugins/cache/local/$PLUGIN_NAME/0.1.0}"
 cd "$ROOT"
 
 ok() {
@@ -70,6 +71,12 @@ PY
 python3 -m py_compile "$ROOT/scripts/android_use_mcp.py" "$ROOT/scripts/test_android_use_mcp.py"
 python3 "$ROOT/scripts/test_android_use_mcp.py"
 
+if [ -f "$CODEX_CACHE_PLUGIN_PATH/.codex-plugin/plugin.json" ]; then
+  ok "Codex cache plugin: $CODEX_CACHE_PLUGIN_PATH"
+else
+  warn "Codex cache plugin not found yet: $CODEX_CACHE_PLUGIN_PATH"
+fi
+
 check_marketplace() {
   local marketplace_path="$1"
   if [ -f "$marketplace_path" ]; then
@@ -87,6 +94,7 @@ legacy = [item.get("name") for item in plugins if isinstance(item, dict) and ite
 assert not legacy, f"legacy android plugin entries still present in {path}: {legacy}"
 entry = matches[-1]
 assert entry.get("source", {}).get("path") == f"./plugins/{name}", entry
+assert entry.get("policy", {}).get("installation") == "INSTALLED_BY_DEFAULT", entry
 expected_icon = f"./plugins/{name}/assets/android.png"
 assert entry.get("displayName") == "Android", entry
 assert entry.get("icon") == expected_icon, entry
@@ -146,7 +154,7 @@ if enabled:
     assert manifest_path.exists(), f"enabled plugin is not installed where Codex reads it: {manifest_path}"
     print(f"ok   Codex local plugin path: {plugin_dir}")
 else:
-    print(f"warn {name}@local is not enabled in {path}")
+    raise AssertionError(f"{name}@local is not enabled in {path}; run ./install.sh")
 PY
 else
   warn "Codex config not found: $CODEX_CONFIG_PATH"
