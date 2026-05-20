@@ -1664,7 +1664,7 @@ def recipe_from_trace(trace: dict[str, Any], recipe_name: str | None = None) -> 
             step.update(
                 {
                     key: args[key]
-                    for key in ("action_name", "option_key", "option_index", "option_text", "button_text")
+                    for key in ("action_name", "option_key", "option_index", "option_text", "answer_text", "button_text")
                     if key in args
                 }
             )
@@ -1676,6 +1676,7 @@ def recipe_from_trace(trace: dict[str, Any], recipe_name: str | None = None) -> 
                         "option_key",
                         "option_index",
                         "option_text",
+                        "answer_text",
                         "submit",
                         "continue_after_submit",
                         "action_name",
@@ -1742,15 +1743,14 @@ def execute_recipe_step(serial: str, step: dict[str, Any], *, dry_run: bool = Fa
         if step.get("text_redacted"):
             raise AndroidUseError("Recipe text is redacted; edit the recipe and provide `text` before replay.")
         text = str(step.get("text", ""))
-        if step.get("clear_first"):
-            adb(["shell", "input", "keyevent", "KEYCODE_MOVE_END"], serial=serial, timeout=10)
-            for _ in range(int(step.get("clear_count", 80))):
-                adb(["shell", "input", "keyevent", "KEYCODE_DEL"], serial=serial, timeout=10)
-        if text:
-            adb(["shell", "input", "text", escape_input_text(text)], serial=serial, timeout=15)
-        if step.get("enter"):
-            adb(["shell", "input", "keyevent", "KEYCODE_ENTER"], serial=serial, timeout=10)
-        return {"ok": True, "action": "type_text", "chars": len(text)}
+        method = type_focused_text_fast(
+            serial,
+            text,
+            clear_first=bool(step.get("clear_first")),
+            clear_count=int(step.get("clear_count", 80)),
+            enter=bool(step.get("enter")),
+        )
+        return {"ok": True, "action": "type_text", "chars": len(text), "method": method}
     if action == "press_key":
         key = keycode(step["key"])
         adb(["shell", "input", "keyevent", key], serial=serial, timeout=10)
@@ -2030,6 +2030,371 @@ def escape_input_text(text: str) -> str:
     for char in ['"', "'", "\\", "&", "<", ">", "(", ")", "|", ";", "*", "~", "`"]:
         escaped = escaped.replace(char, "\\" + char)
     return escaped
+
+
+def current_input_method(serial: str) -> str:
+    try:
+        return shell(serial, "settings get secure default_input_method", timeout=3).strip()
+    except AndroidUseError:
+        return ""
+
+
+def input_method_looks_like_adb_keyboard(value: str) -> bool:
+    normalized = value.casefold()
+    return "adbkeyboard" in normalized or "adb_keyboard" in normalized or "adbime" in normalized
+
+
+def fast_input_ime_enabled() -> bool:
+    return env_flag("ANDROID_USE_FAST_INPUT_IME", True)
+
+
+def restore_ime_after_fast_input() -> bool:
+    return env_flag("ANDROID_USE_RESTORE_IME_AFTER_TYPE", False)
+
+
+def fast_input_min_chars() -> int:
+    raw = os.environ.get("ANDROID_USE_FAST_INPUT_MIN_CHARS", "24")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 24
+
+
+def text_needs_unicode_input(text: str) -> bool:
+    return any(ord(char) > 0x7F for char in text)
+
+
+def should_try_fast_ime(text: str, *, clear_first: bool = False) -> bool:
+    if not fast_input_ime_enabled():
+        return False
+    if not text and not clear_first:
+        return False
+    return text_needs_unicode_input(text) or "\n" in text or len(text) >= fast_input_min_chars()
+
+
+def webview_direct_input_enabled() -> bool:
+    return env_flag("ANDROID_USE_WEBVIEW_DIRECT_INPUT", True)
+
+
+def webview_direct_input_expression(
+    text: str,
+    *,
+    clear_first: bool = False,
+    enter: bool = False,
+    prefer_answer_box: bool = False,
+) -> str:
+    config_json = json.dumps(
+        {
+            "text": text,
+            "clearFirst": clear_first,
+            "enter": enter,
+            "preferAnswerBox": prefer_answer_box,
+        },
+        ensure_ascii=False,
+    )
+    return r"""
+(async () => {
+  const config = __CONFIG__;
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const rect = (el) => {
+    const r = el.getBoundingClientRect();
+    return { x: r.x, y: r.y, width: r.width, height: r.height, top: r.top, right: r.right, bottom: r.bottom, left: r.left };
+  };
+  const visible = (el) => {
+    if (!el || !el.getBoundingClientRect) return false;
+    const r = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight && style.visibility !== "hidden" && style.display !== "none";
+  };
+  const textOf = (el) => (el?.innerText || el?.textContent || "").trim().replace(/\s+/g, " ");
+  const editable = (el) => {
+    if (!el) return false;
+    const tag = String(el.tagName || "").toLowerCase();
+    return tag === "input" || tag === "textarea" || el.isContentEditable || el.getAttribute?.("contenteditable") === "true";
+  };
+  const reactFiber = (el) => {
+    if (!el) return null;
+    const key = Object.keys(el).find((key) => key.startsWith("__reactFiber$") || key.startsWith("__reactInternalInstance$"));
+    return key ? el[key] : null;
+  };
+  const findReactFunctionProp = (root, propName) => {
+    const seen = new Set();
+    const elements = [];
+    if (root) elements.push(root);
+    if (root?.querySelectorAll) elements.push(...root.querySelectorAll("*"));
+    elements.push(document.activeElement);
+    for (const startEl of elements.filter(Boolean)) {
+      let fiber = reactFiber(startEl);
+      let depth = 0;
+      while (fiber && depth < 50) {
+        if (!seen.has(fiber)) {
+          seen.add(fiber);
+          const props = fiber.memoizedProps || fiber.pendingProps || {};
+          if (typeof props[propName] === "function") return { fiber, props, element: startEl };
+        }
+        fiber = fiber.return;
+        depth += 1;
+      }
+    }
+    return null;
+  };
+  const setNativeValue = (el, value) => {
+    if (el.isContentEditable || el.getAttribute?.("contenteditable") === "true") {
+      el.focus();
+      el.textContent = value;
+      el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      return;
+    }
+    const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const descriptor = Object.getOwnPropertyDescriptor(proto, "value");
+    el.focus();
+    if (descriptor?.set) descriptor.set.call(el, value);
+    else el.value = value;
+    el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+  };
+  const dispatchEnter = (el) => {
+    if (!config.enter || !el) return;
+    for (const type of ["keydown", "keypress", "keyup"]) {
+      el.dispatchEvent(new KeyboardEvent(type, { bubbles: true, cancelable: true, key: "Enter", code: "Enter", keyCode: 13, which: 13 }));
+    }
+  };
+  const answerRoots = [
+    ...document.querySelectorAll(".math-field-answer-box"),
+    ...document.querySelectorAll("[class*='math-field'][class*='answer']"),
+    ...document.querySelectorAll("[class*='answer-box']"),
+  ].filter(visible);
+  const active = document.activeElement;
+  const activeEditable = editable(active) ? active : null;
+  const activeRoot = active?.closest?.(".math-field-answer-box,[class*='math-field'][class*='answer'],[class*='answer-box']") || null;
+  const answerRoot = (activeRoot && visible(activeRoot)) ? activeRoot : answerRoots[0];
+  const root = config.preferAnswerBox ? (answerRoot || activeEditable) : (activeEditable || answerRoot);
+  if (!root) {
+    return { ok: false, reason: "no focused DOM input or visible answer box", activeTag: active?.tagName || "" };
+  }
+
+  const latexTarget = findReactFunctionProp(root, "onLatexChange");
+  if (latexTarget) {
+    const current = typeof latexTarget.props.content === "string" ? latexTarget.props.content : "";
+    const value = config.clearFirst ? String(config.text) : current + String(config.text);
+    latexTarget.props.onLatexChange(value);
+    dispatchEnter(root);
+    await sleep(80);
+    const box = answerRoot || root;
+    return { ok: true, method: "react_onLatexChange", target: "math_answer_box", chars: String(config.text).length, value, renderedText: textOf(box).slice(0, 500), rect: box ? rect(box) : null };
+  }
+
+  const field = editable(root) ? root : root.querySelector?.("textarea,input,[contenteditable='true']");
+  if (field) {
+    const current = field.isContentEditable ? textOf(field) : String(field.value || "");
+    const value = config.clearFirst ? String(config.text) : current + String(config.text);
+    setNativeValue(field, value);
+    dispatchEnter(field);
+    await sleep(80);
+    return { ok: true, method: "dom_value", target: String(field.tagName || "").toLowerCase(), chars: String(config.text).length, value, renderedText: textOf(root).slice(0, 500), rect: rect(field) };
+  }
+
+  const changeTarget = findReactFunctionProp(root, "onChange");
+  if (changeTarget) {
+    const value = String(config.text);
+    changeTarget.props.onChange({ target: { value }, currentTarget: { value } });
+    dispatchEnter(root);
+    await sleep(80);
+    return { ok: true, method: "react_onChange", target: "react_input", chars: value.length, value, renderedText: textOf(root).slice(0, 500), rect: rect(root) };
+  }
+  return { ok: false, reason: "DOM input target not writable", activeTag: active?.tagName || "", rootText: textOf(root).slice(0, 120) };
+})()
+""".replace("__CONFIG__", config_json)
+
+
+def candidate_webview_pages_for_input(serial: str) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for page in (
+        XIAOLUXUE_PAGE_CACHE.get((serial, "exercise")),
+        XIAOLUXUE_PAGE_CACHE.get((serial, "course")),
+        XIAOLUXUE_PAGE_CACHE.get((serial, "any")),
+    ):
+        if page and page.get("webSocketDebuggerUrl"):
+            key = str(page.get("id") or page.get("webSocketDebuggerUrl") or "")
+            if key not in seen:
+                candidates.append(page)
+                seen.add(key)
+    try:
+        pages = discover_webview_pages(serial)
+        page = select_webview_page(pages)
+        key = str(page.get("id") or page.get("webSocketDebuggerUrl") or "")
+        if key not in seen:
+            candidates.append(page)
+    except AndroidUseError:
+        pass
+    return candidates
+
+
+def type_webview_text_fast(
+    serial: str,
+    text: str,
+    *,
+    clear_first: bool = False,
+    enter: bool = False,
+    prefer_answer_box: bool = False,
+) -> str | None:
+    for page in candidate_webview_pages_for_input(serial):
+        expression = webview_direct_input_expression(
+            text,
+            clear_first=clear_first,
+            enter=enter,
+            prefer_answer_box=prefer_answer_box or xiaoluxue_url_kind(str(page.get("url") or "")) == "exercise",
+        )
+        try:
+            result = cdp_eval_value(page, expression, timeout=3)
+        except AndroidUseError:
+            continue
+        if isinstance(result, dict) and result.get("ok"):
+            return f"webview_dom_{result.get('method') or 'direct'}"
+    return None
+
+
+def list_input_methods(serial: str) -> list[str]:
+    try:
+        output = shell(serial, "ime list -s", timeout=5)
+    except AndroidUseError:
+        return []
+    return [line.strip() for line in output.splitlines() if line.strip()]
+
+
+def find_adb_keyboard_ime(serial: str) -> str | None:
+    configured = os.environ.get("ANDROID_USE_ADB_KEYBOARD_IME")
+    if configured:
+        return configured
+    for ime in list_input_methods(serial):
+        if input_method_looks_like_adb_keyboard(ime):
+            return ime
+    return None
+
+
+def set_input_method(serial: str, ime: str) -> None:
+    shell(serial, f"ime set {shlex.quote(ime)} >/dev/null", timeout=5)
+
+
+def adb_keyboard_broadcast_text(
+    serial: str,
+    text: str,
+    *,
+    clear_first: bool = False,
+    enter: bool = False,
+) -> bool:
+    if not input_method_looks_like_adb_keyboard(current_input_method(serial)):
+        return False
+    commands: list[str] = []
+    if clear_first:
+        commands.append("am broadcast -a ADB_CLEAR_TEXT >/dev/null")
+    if text:
+        commands.append(f"am broadcast -a ADB_INPUT_TEXT --es msg {shlex.quote(text)} >/dev/null")
+    if enter:
+        commands.append("am broadcast -a ADB_INPUT_KEYCODE --ei code 66 >/dev/null")
+    if commands:
+        shell(serial, " && ".join(commands), timeout=8)
+    return True
+
+
+def switch_to_adb_keyboard_and_broadcast_text(
+    serial: str,
+    text: str,
+    *,
+    clear_first: bool = False,
+    enter: bool = False,
+) -> str | None:
+    original_ime = current_input_method(serial)
+    if input_method_looks_like_adb_keyboard(original_ime):
+        if adb_keyboard_broadcast_text(serial, text, clear_first=clear_first, enter=enter):
+            return "adb_keyboard_broadcast"
+        return None
+
+    ime = find_adb_keyboard_ime(serial)
+    if not ime:
+        return None
+
+    set_input_method(serial, ime)
+    try:
+        if not adb_keyboard_broadcast_text(serial, text, clear_first=clear_first, enter=enter):
+            return None
+    finally:
+        if original_ime and restore_ime_after_fast_input() and original_ime != ime:
+            with contextlib.suppress(AndroidUseError):
+                set_input_method(serial, original_ime)
+    return "adb_keyboard_switch_restore" if restore_ime_after_fast_input() else "adb_keyboard_switch"
+
+
+def input_keyevent_list(command: str, count: int) -> str | None:
+    if count <= 0:
+        return None
+    return f"input keyevent {' '.join([command] * count)}"
+
+
+def adb_shell_batch_type_text(
+    serial: str,
+    text: str,
+    *,
+    clear_first: bool = False,
+    clear_count: int = 80,
+    enter: bool = False,
+) -> None:
+    commands: list[str] = []
+    if clear_first:
+        commands.append("input keyevent KEYCODE_MOVE_END")
+        delete_command = input_keyevent_list("KEYCODE_DEL", max(0, clear_count))
+        if delete_command:
+            commands.append(delete_command)
+    if text:
+        commands.append(f"input text {shlex.quote(escape_input_text(text))}")
+    if enter:
+        commands.append("input keyevent KEYCODE_ENTER")
+    if commands:
+        shell(serial, " && ".join(commands), timeout=15)
+
+
+def type_focused_text_fast(
+    serial: str,
+    text: str,
+    *,
+    clear_first: bool = False,
+    clear_count: int = 80,
+    enter: bool = False,
+) -> str:
+    if webview_direct_input_enabled():
+        with contextlib.suppress(AndroidUseError):
+            method = type_webview_text_fast(
+                serial,
+                text,
+                clear_first=clear_first,
+                enter=enter,
+            )
+            if method:
+                return method
+    if should_try_fast_ime(text, clear_first=clear_first):
+        with contextlib.suppress(AndroidUseError):
+            method = switch_to_adb_keyboard_and_broadcast_text(
+                serial,
+                text,
+                clear_first=clear_first,
+                enter=enter,
+            )
+            if method:
+                return method
+    else:
+        with contextlib.suppress(AndroidUseError):
+            if adb_keyboard_broadcast_text(serial, text, clear_first=clear_first, enter=enter):
+                return "adb_keyboard_broadcast"
+    adb_shell_batch_type_text(
+        serial,
+        text,
+        clear_first=clear_first,
+        clear_count=clear_count,
+        enter=enter,
+    )
+    return "adb_shell_batch"
 
 
 def action_result(action: str, serial: str, extra: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -2317,24 +2682,31 @@ def tool_type_text(args: dict[str, Any]) -> list[dict[str, Any]]:
     serial = choose_serial(args.get("serial"))
     text = str(args["text"])
     before = capture_record_snapshot(serial) if active_recording(serial) else None
-    if args.get("clear_first"):
-        adb(["shell", "input", "keyevent", "KEYCODE_MOVE_END"], serial=serial, timeout=10)
-        for _ in range(int(args.get("clear_count", 80))):
-            adb(["shell", "input", "keyevent", "KEYCODE_DEL"], serial=serial, timeout=10)
-    if text:
-        adb(["shell", "input", "text", escape_input_text(text)], serial=serial, timeout=15)
-    if args.get("enter"):
-        adb(["shell", "input", "keyevent", "KEYCODE_ENTER"], serial=serial, timeout=10)
+    clear_first = bool(args.get("clear_first"))
+    clear_count = int(args.get("clear_count", 80))
+    enter = bool(args.get("enter"))
+    method = type_focused_text_fast(
+        serial,
+        text,
+        clear_first=clear_first,
+        clear_count=clear_count,
+        enter=enter,
+    )
     action_args = {
         "text": text,
-        "clear_first": bool(args.get("clear_first")),
-        "clear_count": int(args.get("clear_count", 80)),
-        "enter": bool(args.get("enter")),
+        "clear_first": clear_first,
+        "clear_count": clear_count,
+        "enter": enter,
     }
     payload = action_result(
         "type_text",
         serial,
-        {"chars": len(text), "clear_first": action_args["clear_first"], "enter": action_args["enter"]},
+        {
+            "chars": len(text),
+            "clear_first": action_args["clear_first"],
+            "enter": action_args["enter"],
+            "method": method,
+        },
     )
     append_recording_step(serial, "type_text", action_args, payload, before=before)
     return [text_content(payload)]
@@ -6943,6 +7315,15 @@ def xiaoluxue_exercise_snapshot_expression() -> str:
     .map(text)
     .filter((value) => value && /(\d+\s*\/\s*\d+|第\s*\d+|进度|已答|未答)/.test(value))
     .slice(0, 40);
+  const answerBoxes = [...document.querySelectorAll(".math-field-answer-box,[class*='answer-box']")]
+    .filter(visible)
+    .map((el, index) => ({
+      index: index + 1,
+      text: text(el).slice(0, 500),
+      className: String(el.className || ""),
+      rect: rect(el),
+    }))
+    .slice(0, 20);
   const findAction = (labels) => buttons.find((button) => !button.disabled && labels.some((label) => button.text === label || button.text.includes(label)));
   const params = Object.fromEntries(new URL(location.href).searchParams.entries());
   return {
@@ -6956,6 +7337,8 @@ def xiaoluxue_exercise_snapshot_expression() -> str:
     questionText: questionBlocks[0]?.text || "",
     questionBlocks,
     options,
+    answerBoxes,
+    answerText: answerBoxes[0]?.text || "",
     buttons,
     actions: {
       canSubmit: Boolean(findAction(["提交"])),
@@ -6978,6 +7361,7 @@ def xiaoluxue_exercise_action_expression(args: dict[str, Any]) -> str:
         "optionKey": str(args.get("option_key") or "").strip(),
         "optionIndex": int(args["option_index"]) if args.get("option_index") is not None else None,
         "optionText": str(args.get("option_text") or "").strip(),
+        "answerText": str(args["answer_text"]) if args.get("answer_text") is not None else None,
         "buttonText": str(args.get("button_text") or "").strip(),
     }
     config_json = json.dumps(config, ensure_ascii=False)
@@ -7015,6 +7399,83 @@ def xiaoluxue_exercise_action_expression(args: dict[str, Any]) -> str:
   }};
   const pack = (el, extra = {{}}) => el ? {{ text: text(el), rect: rect(el), className: String(el.className || ""), ...extra }} : null;
   const buttons = () => [...document.querySelectorAll("button,[role='button']")].filter((el) => visible(el) && !disabled(el));
+  const reactFiber = (el) => {{
+    if (!el) return null;
+    const key = Object.keys(el).find((key) => key.startsWith("__reactFiber$") || key.startsWith("__reactInternalInstance$"));
+    return key ? el[key] : null;
+  }};
+  const findReactFunctionProp = (root, propName) => {{
+    const seen = new Set();
+    const elements = [];
+    if (root) elements.push(root);
+    if (root?.querySelectorAll) elements.push(...root.querySelectorAll("*"));
+    elements.push(document.activeElement);
+    for (const startEl of elements.filter(Boolean)) {{
+      let fiber = reactFiber(startEl);
+      let depth = 0;
+      while (fiber && depth < 40) {{
+        if (!seen.has(fiber)) {{
+          seen.add(fiber);
+          const props = fiber.memoizedProps || fiber.pendingProps || {{}};
+          if (typeof props[propName] === "function") return {{ fiber, props, element: startEl }};
+        }}
+        fiber = fiber.return;
+        depth += 1;
+      }}
+    }}
+    return null;
+  }};
+  const setNativeValue = (el, value) => {{
+    const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const descriptor = Object.getOwnPropertyDescriptor(proto, "value");
+    if (descriptor?.set) descriptor.set.call(el, value);
+    else el.value = value;
+    el.dispatchEvent(new Event("input", {{ bubbles: true }}));
+    el.dispatchEvent(new Event("change", {{ bubbles: true }}));
+  }};
+  const fillAnswer = async () => {{
+    if (config.answerText === null || config.answerText === undefined) {{
+      return {{ ok: false, reason: "answer_text is required" }};
+    }}
+    const answerText = String(config.answerText);
+    const roots = [
+      ...document.querySelectorAll(".math-field-answer-box"),
+      ...document.querySelectorAll("[class*='math-field'][class*='answer']"),
+      ...document.querySelectorAll("[class*='answer-box']"),
+      document.activeElement,
+      ...document.querySelectorAll("textarea,input,[contenteditable='true']"),
+    ].filter(Boolean);
+    const root = roots.find((el) => el === document.activeElement || visible(el)) || roots[0] || document.body;
+    const found = findReactFunctionProp(root, "onLatexChange");
+    if (found) {{
+      found.props.onLatexChange(answerText);
+      await sleep(100);
+      const box = document.querySelector(".math-field-answer-box") || root;
+      return {{
+        ok: true,
+        method: "react_onLatexChange",
+        chars: answerText.length,
+        answerText,
+        renderedText: box ? text(box).slice(0, 500) : "",
+        rect: box ? rect(box) : null,
+      }};
+    }}
+    const field = roots.find((el) => el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement);
+    if (field) {{
+      field.focus();
+      setNativeValue(field, answerText);
+      await sleep(100);
+      return {{
+        ok: true,
+        method: "native_input_event",
+        chars: answerText.length,
+        answerText,
+        renderedText: text(root).slice(0, 500),
+        rect: root ? rect(root) : null,
+      }};
+    }}
+    return {{ ok: false, reason: "answer input not found" }};
+  }};
   const clickButton = (labels, mode = "contains") => {{
     const candidates = buttons();
     const exact = candidates.find((el) => labels.some((label) => text(el) === label));
@@ -7048,7 +7509,9 @@ def xiaoluxue_exercise_action_expression(args: dict[str, Any]) -> str:
   }};
   const actionName = String(config.actionName || "next");
   let result;
-  if (actionName === "select_option" || actionName === "answer") {{
+  if (actionName === "fill_answer" || actionName === "input_answer") {{
+    result = {{ actionName, ...(await fillAnswer()) }};
+  }} else if (actionName === "select_option" || actionName === "answer") {{
     result = {{ actionName, ...(clickOption()) }};
   }} else if (actionName === "submit") {{
     result = {{ actionName, ...(clickButton(["提交"])) }};
@@ -7084,7 +7547,7 @@ def tool_xiaoluxue_exercise_action(args: dict[str, Any]) -> list[dict[str, Any]]
     result = cdp_eval_value(page, xiaoluxue_exercise_action_expression(args), timeout=min(float(args.get("timeout_sec", 10)), 60))
     recorded_args = {
         key: args[key]
-        for key in ("action_name", "option_key", "option_index", "option_text", "button_text")
+        for key in ("action_name", "option_key", "option_index", "option_text", "answer_text", "button_text")
         if key in args
     }
     append_recording_step(
@@ -7102,8 +7565,17 @@ def run_xiaoluxue_exercise_fast_path(serial: str, args: dict[str, Any], *, recor
     page = xiaoluxue_exercise_page(serial)
     steps: list[dict[str, Any]] = []
 
+    has_answer_text = args.get("answer_text") is not None
     has_option = any(args.get(key) is not None and str(args.get(key)).strip() for key in ("option_key", "option_index", "option_text"))
+    if has_answer_text:
+        answer_args = {**args, "action_name": "fill_answer"}
+        answer_result = cdp_eval_value(page, xiaoluxue_exercise_action_expression(answer_args), timeout=timeout)
+        steps.append({"action": "fill_answer", "result": answer_result})
+        if wait_sec:
+            time.sleep(wait_sec)
+
     if has_option:
+        page = xiaoluxue_exercise_page(serial)
         select_args = {**args, "action_name": "select_option"}
         select_result = cdp_eval_value(page, xiaoluxue_exercise_action_expression(select_args), timeout=timeout)
         steps.append({"action": "select_option", "result": select_result})
@@ -7120,7 +7592,7 @@ def run_xiaoluxue_exercise_fast_path(serial: str, args: dict[str, Any], *, recor
             page = xiaoluxue_exercise_page(serial)
             continue_result = cdp_eval_value(page, xiaoluxue_exercise_action_expression({"action_name": "continue"}), timeout=timeout)
             steps.append({"action": "continue", "result": continue_result})
-    elif not has_option:
+    elif not has_option and not has_answer_text:
         action_name = str(args.get("action_name") or ("button_text" if args.get("button_text") else "next"))
         action_args = {**args, "action_name": action_name}
         action_result_value = cdp_eval_value(page, xiaoluxue_exercise_action_expression(action_args), timeout=timeout)
@@ -7144,6 +7616,7 @@ def run_xiaoluxue_exercise_fast_path(serial: str, args: dict[str, Any], *, recor
                 "option_key",
                 "option_index",
                 "option_text",
+                "answer_text",
                 "submit",
                 "continue_after_submit",
                 "action_name",
@@ -9097,7 +9570,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_swipe,
     },
     "android_type_text": {
-        "description": "Type simple text through adb shell input text.",
+        "description": "Type text into the focused field using the fastest available path: direct WebView DOM assignment for debuggable WebView inputs, ADB Keyboard IME for Unicode/long text, or batched adb shell input for short ASCII.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -9699,7 +10172,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_xiaoluxue_exercise_snapshot,
     },
     "xiaoluxue_exercise_action": {
-        "description": "Run one semantic action on a Xiaoluxue /exercise page: select an option, submit, continue, next, uncertain, give up, or click a button by text.",
+        "description": "Run one semantic action on a Xiaoluxue /exercise page: fill an answer input, select an option, submit, continue, next, uncertain, give up, or click a button by text.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -9707,11 +10180,23 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "action_name": {
                     "type": "string",
                     "default": "next",
-                    "enum": ["select_option", "answer", "submit", "next", "continue", "uncertain", "give_up", "button_text"],
+                    "enum": [
+                        "select_option",
+                        "answer",
+                        "fill_answer",
+                        "input_answer",
+                        "submit",
+                        "next",
+                        "continue",
+                        "uncertain",
+                        "give_up",
+                        "button_text",
+                    ],
                 },
                 "option_key": {"type": "string", "description": "Option key such as A, B, C, D, TRUE, FALSE, 正确, or 错误."},
                 "option_index": {"type": "integer", "description": "1-based visible option index."},
                 "option_text": {"type": "string", "description": "Substring of the option text to select."},
+                "answer_text": {"type": "string", "description": "Text or LaTeX content to fill into the visible answer input box through the WebView DOM fast path."},
                 "button_text": {"type": "string", "description": "Visible button text used when action_name is button_text."},
                 "timeout_sec": {"type": "number", "default": 10},
             },
@@ -9720,7 +10205,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_xiaoluxue_exercise_action,
     },
     "xiaoluxue_exercise_fast_path": {
-        "description": "Run the Xiaoluxue /exercise fast path. It can select an option, optionally submit, optionally continue, or default to next/continue.",
+        "description": "Run the Xiaoluxue /exercise fast path. It can fill answer_text through direct WebView DOM assignment, select an option, optionally submit, optionally continue, or default to next/continue.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -9728,6 +10213,7 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "option_key": {"type": "string"},
                 "option_index": {"type": "integer", "description": "1-based visible option index."},
                 "option_text": {"type": "string"},
+                "answer_text": {"type": "string", "description": "Text or LaTeX content to fill into the visible answer input box through the WebView DOM fast path."},
                 "submit": {"type": "boolean", "default": False},
                 "continue_after_submit": {"type": "boolean", "default": False},
                 "action_name": {

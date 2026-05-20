@@ -100,6 +100,119 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
         self.assertEqual(mcp.keycode(66), "66")
         self.assertEqual(mcp.keycode("camera"), "KEYCODE_CAMERA")
 
+    def test_type_text_uses_adb_keyboard_switch_for_unicode(self) -> None:
+        original_current_ime = mcp.current_input_method
+        original_list_imes = mcp.list_input_methods
+        original_set_ime = mcp.set_input_method
+        original_shell = mcp.shell
+        original_env = {
+            "ANDROID_USE_WEBVIEW_DIRECT_INPUT": mcp.os.environ.get("ANDROID_USE_WEBVIEW_DIRECT_INPUT"),
+            "ANDROID_USE_FAST_INPUT_IME": mcp.os.environ.get("ANDROID_USE_FAST_INPUT_IME"),
+            "ANDROID_USE_RESTORE_IME_AFTER_TYPE": mcp.os.environ.get("ANDROID_USE_RESTORE_IME_AFTER_TYPE"),
+        }
+        state = {"ime": "com.google.android.inputmethod.pinyin/.PinyinIME"}
+        commands: list[str] = []
+        try:
+            mcp.os.environ["ANDROID_USE_WEBVIEW_DIRECT_INPUT"] = "0"
+            mcp.os.environ["ANDROID_USE_FAST_INPUT_IME"] = "1"
+            mcp.os.environ["ANDROID_USE_RESTORE_IME_AFTER_TYPE"] = "0"
+            mcp.current_input_method = lambda serial: state["ime"]
+            mcp.list_input_methods = lambda serial: ["com.github.uiautomator/.AdbKeyboard"]
+            mcp.set_input_method = lambda serial, ime: state.update({"ime": ime}) or commands.append(f"ime set {ime}")
+            mcp.shell = lambda serial, command, timeout=30: commands.append(command) or ""
+
+            method = mcp.type_focused_text_fast("device-1", "你好", clear_first=True, enter=True)
+        finally:
+            mcp.current_input_method = original_current_ime
+            mcp.list_input_methods = original_list_imes
+            mcp.set_input_method = original_set_ime
+            mcp.shell = original_shell
+            for key, value in original_env.items():
+                if value is None:
+                    mcp.os.environ.pop(key, None)
+                else:
+                    mcp.os.environ[key] = value
+
+        self.assertEqual(method, "adb_keyboard_switch")
+        self.assertEqual(state["ime"], "com.github.uiautomator/.AdbKeyboard")
+        self.assertTrue(any("ADB_CLEAR_TEXT" in command for command in commands))
+        self.assertTrue(any("ADB_INPUT_TEXT" in command and "你好" in command for command in commands))
+
+    def test_type_text_batch_fallback_uses_one_shell_call_for_clear(self) -> None:
+        original_broadcast = mcp.adb_keyboard_broadcast_text
+        original_shell = mcp.shell
+        original_env = {"ANDROID_USE_WEBVIEW_DIRECT_INPUT": mcp.os.environ.get("ANDROID_USE_WEBVIEW_DIRECT_INPUT")}
+        commands: list[str] = []
+        try:
+            mcp.os.environ["ANDROID_USE_WEBVIEW_DIRECT_INPUT"] = "0"
+            mcp.adb_keyboard_broadcast_text = lambda *args, **kwargs: False
+            mcp.shell = lambda serial, command, timeout=30: commands.append(command) or ""
+
+            method = mcp.type_focused_text_fast("device-1", "hello world", clear_first=True, clear_count=3, enter=True)
+        finally:
+            mcp.adb_keyboard_broadcast_text = original_broadcast
+            mcp.shell = original_shell
+            for key, value in original_env.items():
+                if value is None:
+                    mcp.os.environ.pop(key, None)
+                else:
+                    mcp.os.environ[key] = value
+
+        self.assertEqual(method, "adb_shell_batch")
+        self.assertEqual(len(commands), 1)
+        self.assertIn("input keyevent KEYCODE_MOVE_END", commands[0])
+        self.assertIn("input keyevent KEYCODE_DEL KEYCODE_DEL KEYCODE_DEL", commands[0])
+        self.assertIn("input text hello%sworld", commands[0])
+        self.assertIn("input keyevent KEYCODE_ENTER", commands[0])
+
+    def test_type_text_prefers_webview_dom_input(self) -> None:
+        original_type_webview = mcp.type_webview_text_fast
+        original_shell_batch = mcp.adb_shell_batch_type_text
+        original_env = {"ANDROID_USE_WEBVIEW_DIRECT_INPUT": mcp.os.environ.get("ANDROID_USE_WEBVIEW_DIRECT_INPUT")}
+        calls: list[dict[str, object]] = []
+        try:
+            mcp.os.environ["ANDROID_USE_WEBVIEW_DIRECT_INPUT"] = "1"
+
+            def fake_type_webview(serial: str, text: str, **kwargs: object) -> str:
+                calls.append({"serial": serial, "text": text, **kwargs})
+                return "webview_dom_dom_value"
+
+            mcp.type_webview_text_fast = fake_type_webview
+            mcp.adb_shell_batch_type_text = lambda *args, **kwargs: self.fail("keyboard fallback should not run")
+            method = mcp.type_focused_text_fast("device-1", "hello", clear_first=True, enter=True)
+        finally:
+            mcp.type_webview_text_fast = original_type_webview
+            mcp.adb_shell_batch_type_text = original_shell_batch
+            for key, value in original_env.items():
+                if value is None:
+                    mcp.os.environ.pop(key, None)
+                else:
+                    mcp.os.environ[key] = value
+
+        self.assertEqual(method, "webview_dom_dom_value")
+        self.assertEqual(calls, [{"serial": "device-1", "text": "hello", "clear_first": True, "enter": True}])
+
+    def test_recipe_type_text_uses_fast_typing_path(self) -> None:
+        original_type_fast = mcp.type_focused_text_fast
+        calls: list[dict[str, object]] = []
+        try:
+            def fake_type_fast(serial: str, text: str, **kwargs: object) -> str:
+                calls.append({"serial": serial, "text": text, **kwargs})
+                return "fake_fast"
+
+            mcp.type_focused_text_fast = fake_type_fast
+            result = mcp.execute_recipe_step(
+                "device-1",
+                {"action": "type_text", "text": "hello", "clear_first": True, "clear_count": 2, "enter": True},
+            )
+        finally:
+            mcp.type_focused_text_fast = original_type_fast
+
+        self.assertEqual(result["method"], "fake_fast")
+        self.assertEqual(calls, [
+            {"serial": "device-1", "text": "hello", "clear_first": True, "clear_count": 2, "enter": True}
+        ])
+
     def test_extract_json_object_from_markdown(self) -> None:
         action = mcp.extract_json_object('```json\n{"action":"tap","x":1,"y":2}\n```')
 
@@ -643,6 +756,41 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
         self.assertIn("xiaoluxue_exercise_snapshot", tool_names)
         self.assertIn("xiaoluxue_exercise_action", tool_names)
         self.assertIn("xiaoluxue_exercise_fast_path", tool_names)
+        exercise_action = next(tool for tool in mcp.tool_descriptors() if tool["name"] == "xiaoluxue_exercise_action")
+        action_props = exercise_action["inputSchema"]["properties"]
+        self.assertIn("answer_text", action_props)
+        self.assertIn("fill_answer", action_props["action_name"]["enum"])
+        exercise_fast = next(tool for tool in mcp.tool_descriptors() if tool["name"] == "xiaoluxue_exercise_fast_path")
+        self.assertIn("answer_text", exercise_fast["inputSchema"]["properties"])
+
+    def test_xiaoluxue_exercise_fast_path_fills_answer_text(self) -> None:
+        original_page = mcp.xiaoluxue_exercise_page
+        original_eval = mcp.cdp_eval_value
+        original_record = mcp.append_recording_step
+        calls: list[str] = []
+        try:
+            mcp.xiaoluxue_exercise_page = lambda serial: {"id": "page-1", "socket": "webview", "webSocketDebuggerUrl": "ws://test"}
+
+            def fake_eval(page: dict[str, object], expression: str, timeout: int | float = 10) -> dict[str, object]:
+                calls.append(expression)
+                if '"actionName": "fill_answer"' in expression:
+                    return {"ok": True, "method": "react_onLatexChange", "renderedText": "答案"}
+                return {"ready": True, "answerText": "答案"}
+
+            mcp.cdp_eval_value = fake_eval
+            mcp.append_recording_step = lambda *args, **kwargs: None
+            result = mcp.run_xiaoluxue_exercise_fast_path(
+                "device-1",
+                {"answer_text": "答案", "after_action_wait_sec": 0},
+                record=True,
+            )
+        finally:
+            mcp.xiaoluxue_exercise_page = original_page
+            mcp.cdp_eval_value = original_eval
+            mcp.append_recording_step = original_record
+
+        self.assertEqual(result["steps"][0]["action"], "fill_answer")
+        self.assertTrue(any('"answerText": "答案"' in expression for expression in calls))
 
     def test_recipe_from_trace_prefers_selectors(self) -> None:
         trace = {

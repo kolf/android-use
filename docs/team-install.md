@@ -158,6 +158,27 @@ cd ~/plugins/android-use-plugins
 
 默认会弹出一个 scrcpy 桌面窗口，方便人工观察和接管。插件默认只保留一个窗口，不会自动启动 WebRTC。
 
+## 输入速度
+
+插件会自动选择更快的输入方式：
+
+- 可调试 WebView 页面：优先直接给当前输入框赋值，不走键盘输入，适合小鹿爱学答题输入框；
+- 中文、长文本、清空后输入：优先使用 ADB Keyboard 广播；
+- 短英文：使用一次性批量 `adb shell input`；
+- 录制回放里的输入：也使用同一套快路径。
+
+如果不希望插件直接写 WebView DOM，可以在环境变量里写：
+
+```bash
+ANDROID_USE_WEBVIEW_DIRECT_INPUT=0
+```
+
+如果不希望插件自动切换输入法，可以在环境变量里写：
+
+```bash
+ANDROID_USE_FAST_INPUT_IME=0
+```
+
 ## 常见问题
 
 ### 插件列表没有 Android

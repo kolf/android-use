@@ -272,6 +272,33 @@ ANDROID_USE_AGENT_PROVIDER=openai-computer
 ANDROID_USE_OPENAI_COMPUTER_MODEL=gpt-5.5
 ```
 
+## 输入速度说明
+
+`android_type_text` 会自动选择更快的输入方式：
+
+- 可调试 WebView 页面会优先直接给当前输入框赋值，不走键盘输入，适合小鹿爱学答题输入框；
+- 如果设备装了 ADB Keyboard，中文、长文本、清空后输入会优先走 IME 广播；
+- 普通短英文会走一次性批量 `adb shell input`；
+- 录制 recipe 回放里的输入也会复用同一套快路径。
+
+如果不希望插件直接写 WebView DOM：
+
+```bash
+ANDROID_USE_WEBVIEW_DIRECT_INPUT=0
+```
+
+如果不希望插件自动切换输入法，可以在环境变量里关闭：
+
+```bash
+ANDROID_USE_FAST_INPUT_IME=0
+```
+
+如果希望每次输入后恢复原输入法：
+
+```bash
+ANDROID_USE_RESTORE_IME_AFTER_TYPE=1
+```
+
 ## 常用功能
 
 在 Codex 对话中可以这样说：
@@ -303,7 +330,7 @@ ANDROID_USE_OPENAI_COMPUTER_MODEL=gpt-5.5
 - WebView 能在 Chrome `chrome://inspect/#devices` 里看到时，优先用插件的 WebView 工具，而不是视觉模型；
 - 原生地图页优先用 `xiaoluxue_open_native_subject`、`xiaoluxue_map_fast_path`、`xiaoluxue_map_snapshot`；
 - 课程页优先用 `xiaoluxue_course_fast_path`；
-- `/exercise` 页优先用 `xiaoluxue_exercise_fast_path`。
+- `/exercise` 页优先用 `xiaoluxue_exercise_fast_path`，输入答案时传 `answer_text`，插件会直接写入 WebView 输入框。
 
 ## 录制和复放常用流程
 
