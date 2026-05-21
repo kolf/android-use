@@ -54,11 +54,76 @@ info() {
   printf '[android-use-plugins] %s\n' "$*"
 }
 
+warn() {
+  printf '[android-use-plugins] warn %s\n' "$*" >&2
+}
+
+fail() {
+  printf '[android-use-plugins] fail %s\n' "$*" >&2
+  exit 1
+}
+
 require_command() {
   if ! command -v "$1" >/dev/null 2>&1; then
     printf 'Missing required command: %s\n' "$1" >&2
     return 1
   fi
+}
+
+env_flag() {
+  local value="${1:-}"
+  case "$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')" in
+    0|false|no|off) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+AUTO_INSTALL_DEPS="${ANDROID_USE_AUTO_INSTALL_DEPS:-1}"
+BREW_INSTALL_LOG="${ANDROID_USE_BREW_INSTALL_LOG:-/tmp/android-use-install-deps.log}"
+
+brew_available() {
+  command -v brew >/dev/null 2>&1
+}
+
+brew_install_quiet() {
+  local label="$1"
+  shift
+  if ! brew_available; then
+    fail "需要安装 $label，但未找到 Homebrew。请先安装 Homebrew，或让 Codex 帮你安装后重新执行 ./install.sh。"
+  fi
+  info "正在自动安装 $label，安装日志：$BREW_INSTALL_LOG"
+  mkdir -p "$(dirname "$BREW_INSTALL_LOG")"
+  {
+    printf '\n==== %s ====\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+    printf 'brew %s\n' "$*"
+    brew "$@"
+  } >>"$BREW_INSTALL_LOG" 2>&1 || {
+    warn "$label 安装失败，最近日志如下："
+    tail -n 40 "$BREW_INSTALL_LOG" >&2 || true
+    exit 1
+  }
+}
+
+ensure_command_with_brew() {
+  local command_name="$1"
+  local label="$2"
+  shift 2
+  if command -v "$command_name" >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! env_flag "$AUTO_INSTALL_DEPS"; then
+    fail "缺少 $label。已关闭自动安装，请手动安装后重试。"
+  fi
+  brew_install_quiet "$label" "$@"
+  if ! command -v "$command_name" >/dev/null 2>&1; then
+    fail "$label 安装完成后仍找不到命令：$command_name。请打开新终端或检查 PATH。"
+  fi
+}
+
+ensure_system_dependencies() {
+  ensure_command_with_brew python3 "Python 3" install python
+  ensure_command_with_brew adb "Android Platform Tools (adb)" install --cask android-platform-tools
+  ensure_command_with_brew scrcpy "scrcpy" install scrcpy
 }
 
 copy_bundle_contents() {
@@ -324,11 +389,7 @@ PY
 }
 
 main() {
-  require_command python3
-  require_command scrcpy
-  if ! command -v adb >/dev/null 2>&1; then
-    info "adb not found. Install Android platform tools, e.g. brew install --cask android-platform-tools"
-  fi
+  ensure_system_dependencies
   install_or_update_plugin
   marketplace="$(write_marketplace "$MARKETPLACE_PATH")"
   install_agents_compat

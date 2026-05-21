@@ -23,7 +23,7 @@ fail() {
 }
 
 command -v python3 >/dev/null 2>&1 && ok "python3: $(python3 --version 2>&1)" || fail "python3 not found"
-command -v git >/dev/null 2>&1 && ok "git: $(git --version)" || fail "git not found"
+command -v git >/dev/null 2>&1 && ok "git: $(git --version)" || warn "git not found; zip install does not require Git"
 
 if command -v adb >/dev/null 2>&1; then
   ok "adb: $(command -v adb)"

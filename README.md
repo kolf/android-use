@@ -34,6 +34,8 @@
 - `scrcpy`，用于弹出安卓设备镜像窗口；
 - 一根支持数据传输的 USB 线。
 
+执行 `./install.sh` 时，脚本会默认自动安装缺失的 Python 3、adb 和 scrcpy。自动安装依赖需要电脑上已有 Homebrew。
+
 安卓设备上需要：
 
 - 已安装要调试的 App；
@@ -43,34 +45,37 @@
 
 ## 安装电脑依赖
 
-先检查电脑有没有 `adb`：
+通常不需要手动安装依赖，直接执行安装脚本即可：
 
 ```bash
+./install.sh
+```
+
+安装脚本会默认静默补齐缺失依赖：
+
+- 缺少 Python 3 时，自动执行 `brew install python`；
+- 缺少 `adb` 时，自动执行 `brew install --cask android-platform-tools`；
+- 缺少 `scrcpy` 时，自动执行 `brew install scrcpy`；
+- 安装日志写入 `/tmp/android-use-install-deps.log`，失败时才展示最近日志。
+
+如果你想手动检查：
+
+```bash
+python3 --version
 adb version
-```
-
-如果提示找不到命令，可以安装 Android Platform Tools：
-
-```bash
-brew install --cask android-platform-tools
-```
-
-再检查有没有 `scrcpy`：
-
-```bash
 scrcpy --version
 ```
 
-如果提示找不到命令，可以安装：
+如果不希望安装脚本自动安装依赖，可以这样执行：
 
 ```bash
-brew install scrcpy
+ANDROID_USE_AUTO_INSTALL_DEPS=0 ./install.sh
 ```
 
-如果你不会安装 Homebrew 或不想碰命令行，可以直接让 Codex 做：
+没有 Homebrew 时，可以直接让 Codex 先安装 Homebrew：
 
 ```text
-请帮我安装 Android Platform Tools 和 scrcpy，并验证 adb version、scrcpy --version 都能执行。
+请帮我安装 Homebrew，然后重新执行 Android 插件的 ./install.sh。
 ```
 
 ## 安卓设备怎么开启调试模式
