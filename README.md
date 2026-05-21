@@ -23,6 +23,8 @@
 
 安装完成后，重启 Codex，插件列表里应该直接显示 `Android`。
 
+第一次使用的同学可以先看图文教程：[Android 插件图文上手教程](docs/android-use-tutorial.md)。
+
 ## 需要准备什么
 
 电脑上需要：
