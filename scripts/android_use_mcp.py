@@ -862,6 +862,8 @@ def parse_ui_nodes(xml_text: str, *, limit: int = 300) -> list[dict[str, Any]]:
             "center": bounds_center(bounds),
             "clickable": clickable,
             "enabled": bool_attr(attrs.get("enabled")),
+            "checkable": bool_attr(attrs.get("checkable")),
+            "checked": bool_attr(attrs.get("checked")),
             "selected": bool_attr(attrs.get("selected")),
             "focused": bool_attr(attrs.get("focused")),
             "long_clickable": long_clickable,
@@ -1646,6 +1648,8 @@ def recipe_from_trace(trace: dict[str, Any], recipe_name: str | None = None) -> 
                     if key in args
                 }
             )
+        elif action == "xiaoluxue_login_fast_path":
+            step.update({key: args[key] for key in ("account", "account_chars", "password_chars", "password_redacted", "timeout_sec") if key in args})
         elif action == "xiaoluxue_switch_env":
             step.update(
                 {
@@ -1793,6 +1797,10 @@ def execute_recipe_step(serial: str, step: dict[str, Any], *, dry_run: bool = Fa
         return run_xiaoluxue_lesson_fast_path(serial, step, record=False)
     if action == "xiaoluxue_open_knowledge_guide":
         return run_xiaoluxue_open_knowledge_guide(serial, step, record=False)
+    if action == "xiaoluxue_login_fast_path":
+        if step.get("password_redacted") and not step.get("password"):
+            raise AndroidUseError("Recipe password is redacted; edit the recipe and provide `password` before replay.")
+        return run_xiaoluxue_login_fast_path(serial, step, record=False)
     if action == "xiaoluxue_switch_env":
         return run_xiaoluxue_switch_env(serial, step, record=False)
     if action == "xiaoluxue_exercise_action":
@@ -2835,9 +2843,12 @@ XIAOLUXUE_STUDENT_PACKAGE = "com.xiaoluxue.ai.student"
 XIAOLUXUE_STUDENT_LAUNCHER_COMPONENT = "com.xiaoluxue.ai.student/com.xiaoluxue.ai.student.LauncherActivity"
 XIAOLUXUE_CONFIG_PACKAGE = "com.xiaoluxue.ai.config"
 XIAOLUXUE_CONFIG_LAUNCHER_COMPONENT = "com.xiaoluxue.ai.config/com.xiaoluxue.ai.config.LauncherActivity"
+XIAOLUXUE_LOGIN_ACTIVITY = "com.xiaoluxue.ai.business.account.ui.LoginActivity"
 XIAOLUXUE_STUDY_SUBJECT_ACTIVITY = "com.xiaoluxue.ai.business.launcher.study.subject.StudySubjectActivity"
 XIAOLUXUE_LESSON_ACTIVITY = "com.xiaoluxue.ai.business.lesson.LessonActivity"
 XIAOLUXUE_SCHEME_PROXY_ACTIVITY = "com.xiaoluxue.ai.infra.framework.router.SchemeProxyActivity"
+XIAOLUXUE_STANDARD_BROWSER_ACTIVITY = "com.xiaoluxue.ai.infra.browser.vessel.StandardBrowserActivity"
+XIAOLUXUE_LEAK_ACTIVITY_MARKER = "leakcanary.internal.activity"
 XIAOLUXUE_VESSEL_WEBVIEW_ROUTE = "xlx://router/vessel/webview"
 XIAOLUXUE_STUDY_SUBJECT_ROUTE = "xlx://router/study/subject"
 XIAOLUXUE_GW_ORIGIN = "https://gw-stu.xiaoluxue.com"
@@ -2862,9 +2873,9 @@ XIAOLUXUE_SUBJECT_ALIASES: dict[str, int] = {
 XIAOLUXUE_NATIVE_MAP_ROUTE_PRESETS: dict[int, dict[str, dict[str, tuple[int, int]]]] = {
     1: {
         "1.5": {
-            "index": (1780, 670),
-            "practise": (1000, 420),
-            "expand": (1198, 501),
+            "index": (1508, 251),
+            "practise": (1116, 401),
+            "expand": (1314, 593),
             "wrong": (926, 820),
             "notebook": (1074, 820),
             "report": (1000, 708),
@@ -2985,6 +2996,51 @@ def select_xiaoluxue_webview_page(pages: list[dict[str, Any]], page_kind: str = 
     return page
 
 
+def xiaoluxue_page_hidden_behind_native(serial: str, page: dict[str, Any]) -> bool:
+    description = page.get("descriptionParsed") if isinstance(page.get("descriptionParsed"), dict) else {}
+    if description.get("visible") is not False:
+        return False
+    try:
+        focus = get_focused_window(serial) or ""
+    except Exception:
+        focus = ""
+    return XIAOLUXUE_STUDENT_PACKAGE in focus and XIAOLUXUE_STANDARD_BROWSER_ACTIVITY not in focus
+
+
+def xiaoluxue_ensure_foreground_webview(serial: str, page: dict[str, Any]) -> None:
+    if xiaoluxue_page_hidden_behind_native(serial, page):
+        try:
+            focus = get_focused_window(serial) or ""
+        except Exception:
+            focus = ""
+        raise AndroidUseError(f"Xiaoluxue WebView exists only in background; foreground is {focus or 'unknown'}.")
+
+
+def xiaoluxue_dismiss_debug_overlay_if_needed(
+    serial: str,
+    steps: list[dict[str, Any]] | None = None,
+    started_at: float | None = None,
+) -> bool:
+    try:
+        focus = get_focused_window(serial) or ""
+    except Exception:
+        focus = ""
+    if XIAOLUXUE_LEAK_ACTIVITY_MARKER not in focus:
+        return False
+    adb(["shell", "input", "keyevent", "BACK"], serial=serial, timeout=4)
+    if steps is not None:
+        steps.append(
+            {
+                "action": "back",
+                "reason": "dismiss-leakcanary-overlay",
+                "from_focus": focus,
+                "at_sec": round(time.monotonic() - float(started_at or time.monotonic()), 3),
+            }
+        )
+    time.sleep(0.18)
+    return True
+
+
 def xiaoluxue_vessel_webview_url(url: str) -> str:
     if not is_xiaoluxue_app_only_url(url):
         raise AndroidUseError(f"Not a Xiaoluxue app-only URL: {url}")
@@ -2996,12 +3052,24 @@ def xiaoluxue_vessel_webview_url(url: str) -> str:
 
 def xiaoluxue_route_app_url(serial: str, url: str, *, force_stop: bool = False) -> dict[str, Any]:
     route_url = xiaoluxue_vessel_webview_url(url)
-    stop_flag = "-S " if force_stop else ""
-    output = shell(
-        serial,
-        f"am start {stop_flag}-a android.intent.action.VIEW -d {shlex.quote(route_url)} -p {shlex.quote(XIAOLUXUE_STUDENT_PACKAGE)}",
-        timeout=3,
+    command = [
+        "shell",
+        "am",
+        "start",
+    ]
+    if force_stop:
+        command.append("-S")
+    command.extend(
+        [
+            "-n",
+            f"{XIAOLUXUE_STUDENT_PACKAGE}/{XIAOLUXUE_SCHEME_PROXY_ACTIVITY}",
+            "-a",
+            "android.intent.action.VIEW",
+            "-d",
+            route_url,
+        ]
     )
+    output = adb(command, serial=serial, timeout=3).decode("utf-8", errors="replace")
     return {
         "ok": True,
         "mode": "xiaoluxue-vessel-webview-route",
@@ -3102,18 +3170,23 @@ XIAOLUXUE_KNOWLEDGE_SHORTCUTS: dict[tuple[int, str], dict[str, Any]] = {
 
 
 def xiaoluxue_page(serial: str) -> dict[str, Any]:
+    xiaoluxue_dismiss_debug_overlay_if_needed(serial)
     cached = xiaoluxue_cached_runtime_page(serial, "course")
     if cached:
+        xiaoluxue_ensure_foreground_webview(serial, cached)
         return cached
     pages = discover_webview_pages(serial)
     page = select_xiaoluxue_webview_page(pages, "course")
+    xiaoluxue_ensure_foreground_webview(serial, page)
     xiaoluxue_remember_inferred_page(serial, page)
     return xiaoluxue_remember_page(serial, "course", page)
 
 
 def xiaoluxue_any_page(serial: str, *, open_app_if_needed: bool = True, timeout_sec: float = 5.0) -> dict[str, Any]:
+    xiaoluxue_dismiss_debug_overlay_if_needed(serial)
     cached = xiaoluxue_cached_runtime_page(serial, "any")
     if cached:
+        xiaoluxue_ensure_foreground_webview(serial, cached)
         return cached
     deadline = time.monotonic() + max(timeout_sec, 0.2)
     opened = False
@@ -3122,6 +3195,7 @@ def xiaoluxue_any_page(serial: str, *, open_app_if_needed: bool = True, timeout_
         pages = discover_webview_pages(serial)
         try:
             page = select_xiaoluxue_webview_page(pages, "any")
+            xiaoluxue_ensure_foreground_webview(serial, page)
             return xiaoluxue_remember_inferred_page(serial, page)
         except Exception as exc:
             last_error = exc
@@ -3237,11 +3311,20 @@ def xiaoluxue_wait_for_target_course_page(
             if xiaoluxue_url_kind(url) == "course":
                 last_course_page = page
                 if target_marker in url:
+                    checked_page = {**page, "runtimeHref": url}
+                    try:
+                        xiaoluxue_ensure_foreground_webview(serial, checked_page)
+                        xiaoluxue_remember_inferred_page(serial, page)
+                        return checked_page
+                    except Exception as exc:
+                        last_error = exc
                     try:
                         runtime_href = cdp_eval_value(page, "location.href", timeout=0.35)
                         if isinstance(runtime_href, str) and target_marker in runtime_href:
+                            checked_page = {**page, "runtimeHref": runtime_href}
+                            xiaoluxue_ensure_foreground_webview(serial, checked_page)
                             xiaoluxue_remember_inferred_page(serial, page)
-                            return {**page, "runtimeHref": runtime_href}
+                            return checked_page
                         if isinstance(runtime_href, str) and xiaoluxue_url_kind(runtime_href) == "course":
                             last_course_page = {**page, "runtimeHref": runtime_href}
                     except Exception as exc:
@@ -3252,6 +3335,11 @@ def xiaoluxue_wait_for_target_course_page(
             last_error = exc
         time.sleep(poll_interval)
     if last_course_page is not None:
+        last_href = str(last_course_page.get("runtimeHref") or last_course_page.get("url") or "")
+        if target_marker in last_href:
+            xiaoluxue_ensure_foreground_webview(serial, last_course_page)
+            xiaoluxue_remember_inferred_page(serial, last_course_page)
+            return last_course_page
         raise AndroidUseError(f"Xiaoluxue course WebView opened but target {target_marker} was not active.")
     if last_error:
         raise last_error
@@ -3304,13 +3392,26 @@ def xiaoluxue_open_vessel_course_page(
         f"{XIAOLUXUE_VESSEL_WEBVIEW_ROUTE}?url={urllib.parse.quote(target_url, safe='')}"
         "&full_screen=true&title_bar=false"
     )
-    stop_flag = "-S " if force_stop else ""
-    output = shell(
-        serial,
-        f"am start {stop_flag}-a android.intent.action.VIEW -d {shlex.quote(route_url)} -p {shlex.quote(XIAOLUXUE_STUDENT_PACKAGE)}",
-        timeout=3,
+    command = [
+        "shell",
+        "am",
+        "start",
+    ]
+    if force_stop:
+        command.append("-S")
+    command.extend(
+        [
+            "-n",
+            f"{XIAOLUXUE_STUDENT_PACKAGE}/{XIAOLUXUE_SCHEME_PROXY_ACTIVITY}",
+            "-a",
+            "android.intent.action.VIEW",
+            "-d",
+            route_url,
+        ]
     )
+    output = adb(command, serial=serial, timeout=3).decode("utf-8", errors="replace")
     page = xiaoluxue_wait_for_target_course_page(serial, deadline, knowledge_id=knowledge_id)
+    xiaoluxue_ensure_foreground_webview(serial, page)
     return {
         "attempted": True,
         "ok": True,
@@ -3334,6 +3435,8 @@ def xiaoluxue_try_native_course_sequence(
     *,
     label: str,
     tap_math: bool,
+    expected_knowledge_id: int | None = None,
+    dismiss_progress_popup: bool = True,
 ) -> dict[str, Any]:
     attempt: dict[str, Any] = {
         "label": label,
@@ -3344,19 +3447,59 @@ def xiaoluxue_try_native_course_sequence(
         if tap_math:
             xiaoluxue_native_tap(serial, XIAOLUXUE_NATIVE_MATH_CARD, window_info, f"{label}:math_card", steps, started_at)
             time.sleep(1.18)
-        xiaoluxue_native_tap(
-            serial,
-            XIAOLUXUE_NATIVE_PROGRESS_POPUP_CLOSE,
-            window_info,
-            f"{label}:dismiss_progress_popup",
-            steps,
-            started_at,
-        )
-        time.sleep(0.12)
+        if dismiss_progress_popup:
+            xiaoluxue_native_tap(
+                serial,
+                XIAOLUXUE_NATIVE_PROGRESS_POPUP_CLOSE,
+                window_info,
+                f"{label}:dismiss_progress_popup",
+                steps,
+                started_at,
+            )
+            time.sleep(0.06)
         xiaoluxue_native_tap(serial, XIAOLUXUE_NATIVE_GUIDE_BUBBLE, window_info, f"{label}:guide_bubble", steps, started_at)
-        time.sleep(0.32)
-        xiaoluxue_native_tap(serial, XIAOLUXUE_NATIVE_CONTINUE_BUTTON, window_info, f"{label}:continue", steps, started_at)
-        page = xiaoluxue_wait_for_site_page(serial, min(deadline, time.monotonic() + 1.8))
+        page: dict[str, Any] | None = None
+        last_continue_error: Exception | None = None
+        for continue_attempt in range(3):
+            time.sleep(0.08 if continue_attempt == 0 else 0.07)
+            xiaoluxue_native_tap(
+                serial,
+                XIAOLUXUE_NATIVE_CONTINUE_BUTTON,
+                window_info,
+                f"{label}:continue:{continue_attempt + 1}",
+                steps,
+                started_at,
+            )
+            try:
+                page_deadline = min(deadline, time.monotonic() + 0.24)
+                page = (
+                    xiaoluxue_wait_for_target_course_page(
+                        serial,
+                        page_deadline,
+                        knowledge_id=expected_knowledge_id,
+                    )
+                    if expected_knowledge_id
+                    else xiaoluxue_wait_for_site_page(serial, page_deadline)
+                )
+                break
+            except Exception as exc:
+                last_continue_error = exc
+        if page is None:
+            try:
+                page_deadline = min(deadline, time.monotonic() + 1.2)
+                page = (
+                    xiaoluxue_wait_for_target_course_page(
+                        serial,
+                        page_deadline,
+                        knowledge_id=expected_knowledge_id,
+                    )
+                    if expected_knowledge_id
+                    else xiaoluxue_wait_for_site_page(serial, page_deadline)
+                )
+            except Exception:
+                if last_continue_error is not None:
+                    raise last_continue_error
+                raise
         attempt["ok"] = True
         attempt["elapsed_sec"] = round(time.monotonic() - started_at, 3)
         attempt["page_id"] = page.get("id")
@@ -3381,6 +3524,8 @@ def xiaoluxue_open_native_course_entry(
         return {"attempted": False, "ok": False, "reason": "unsupported-native-shortcut"}
 
     deadline = started_at + max(timeout_sec, 1.0)
+    shortcut = XIAOLUXUE_KNOWLEDGE_SHORTCUTS.get((subject_id, normalized_index))
+    expected_knowledge_id = int(shortcut["knowledgeId"]) if shortcut and shortcut.get("knowledgeId") else None
     info = xiaoluxue_native_window_info(serial)
     focus = str(info.get("focus") or "")
     already_home = f"{XIAOLUXUE_STUDENT_PACKAGE}/com.xiaoluxue.ai.student.LauncherActivity" in focus
@@ -3390,6 +3535,30 @@ def xiaoluxue_open_native_course_entry(
 
     attempts: list[dict[str, Any]] = []
     page: dict[str, Any] | None = None
+
+    try:
+        route_info = xiaoluxue_open_native_subject_map(
+            serial,
+            {
+                "subject_id": subject_id,
+                "route_wait_sec": 1.15,
+                "route_settle_sec": 0.05,
+                "close_progress_popup": True,
+                "close_progress_taps": 1,
+                "close_progress_wait_sec": 0.05,
+            },
+            steps,
+            started_at,
+        )
+        routed_info = route_info.get("window_info") if isinstance(route_info, dict) else None
+        if isinstance(routed_info, dict):
+            info = routed_info
+        focus = str(info.get("focus") or "")
+        already_home = False
+        already_subject_map = True
+        start_result = {"mode": "subject-route", "focus": focus, "route": route_info}
+    except Exception as exc:
+        start_result["subject_route_error"] = str(exc)
 
     if not already_home and not already_subject_map:
         adb(["shell", "am", "start", "-n", XIAOLUXUE_STUDENT_LAUNCHER_COMPONENT], serial=serial, timeout=5)
@@ -3410,6 +3579,8 @@ def xiaoluxue_open_native_course_entry(
                 deadline,
                 label="home",
                 tap_math=True,
+                expected_knowledge_id=expected_knowledge_id,
+                dismiss_progress_popup=True,
             )
         )
     else:
@@ -3422,6 +3593,8 @@ def xiaoluxue_open_native_course_entry(
                 deadline,
                 label="subject_map",
                 tap_math=False,
+                expected_knowledge_id=expected_knowledge_id,
+                dismiss_progress_popup=not (start_result.get("mode") == "subject-route"),
             )
         )
     if attempts and attempts[-1].get("ok"):
@@ -3441,6 +3614,8 @@ def xiaoluxue_open_native_course_entry(
                 deadline,
                 label="fallback_home",
                 tap_math=True,
+                expected_knowledge_id=expected_knowledge_id,
+                dismiss_progress_popup=True,
             )
         )
         page_value = attempts[-1].get("page")
@@ -4464,6 +4639,149 @@ def tool_xiaoluxue_open_app_url(args: dict[str, Any]) -> list[dict[str, Any]]:
     return [text_content({"ok": True, "serial": serial, **result})]
 
 
+def xiaoluxue_login_resource_id(name: str) -> str:
+    return f"{XIAOLUXUE_STUDENT_PACKAGE}:id/{name}"
+
+
+def xiaoluxue_login_node_by_resource(nodes: list[dict[str, Any]], name: str) -> dict[str, Any] | None:
+    resource_id = xiaoluxue_login_resource_id(name)
+    for node in nodes:
+        if str(node.get("resource_id") or "") == resource_id:
+            return node
+    return None
+
+
+def xiaoluxue_login_input_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    resource_id = xiaoluxue_login_resource_id("edit_input")
+    inputs = [node for node in nodes if str(node.get("resource_id") or "") == resource_id and node.get("center")]
+    return sorted(inputs, key=lambda node: int((node.get("bounds") or {}).get("top") or 0))
+
+
+def xiaoluxue_login_click_node(serial: str, node: dict[str, Any] | None, description: str) -> dict[str, int]:
+    point = node_click_point(node) if node else None
+    if not point:
+        raise AndroidUseError(f"Could not find Xiaoluxue login control: {description}")
+    adb(["shell", "input", "tap", str(point["x"]), str(point["y"])], serial=serial, timeout=10)
+    return point
+
+
+def xiaoluxue_login_observe(serial: str) -> dict[str, Any]:
+    observation = observe_ui(serial, limit=260)
+    focus = str(observation.get("state", {}).get("focused_window") or "")
+    if XIAOLUXUE_LOGIN_ACTIVITY not in focus:
+        raise AndroidUseError(f"Current Xiaoluxue screen is not LoginActivity. focused_window={focus}")
+    return observation
+
+
+def run_xiaoluxue_login_fast_path(serial: str, args: dict[str, Any], *, record: bool) -> dict[str, Any]:
+    account = str(args.get("account") or "").strip()
+    password = str(args.get("password") or "")
+    if not account:
+        raise AndroidUseError("account is required.")
+    if not password:
+        raise AndroidUseError("password is required.")
+
+    started_at = time.monotonic()
+    timeout = min(float(args.get("timeout_sec", 5.0)), 30)
+    deadline = started_at + timeout
+    steps: list[dict[str, Any]] = []
+
+    focus = get_focused_window(serial) or ""
+    if XIAOLUXUE_LOGIN_ACTIVITY not in focus:
+        if bool(args.get("open_app_if_needed", True)):
+            adb(["shell", "monkey", "-p", XIAOLUXUE_STUDENT_PACKAGE, "-c", "android.intent.category.LAUNCHER", "1"], serial=serial, timeout=10)
+            time.sleep(min(max(float(args.get("after_open_wait_sec", 0.25)), 0), 2))
+            focus = get_focused_window(serial) or ""
+        if XIAOLUXUE_LOGIN_ACTIVITY not in focus:
+            already_in_student = f"{XIAOLUXUE_STUDENT_PACKAGE}/" in focus
+            return {
+                "ok": True,
+                "action": "xiaoluxue_login_fast_path",
+                "already_logged_in": already_in_student,
+                "focused_window": focus,
+                "elapsed_sec": round(time.monotonic() - started_at, 3),
+                "steps": steps,
+            }
+
+    observation = xiaoluxue_login_observe(serial)
+    nodes = observation["ui"]["nodes"]
+    inputs = xiaoluxue_login_input_nodes(nodes)
+    if len(inputs) < 2:
+        raise AndroidUseError(f"Expected account and password fields on Xiaoluxue login page, got {len(inputs)}.")
+
+    account_node = inputs[0]
+    current_account = str(account_node.get("text") or "").strip()
+    if current_account != account:
+        point = xiaoluxue_login_click_node(serial, account_node, "account input")
+        method = type_focused_text_fast(serial, account, clear_first=True, clear_count=40)
+        steps.append({"action": "fill_account", "chars": len(account), "method": method, "point": point})
+        observation = xiaoluxue_login_observe(serial)
+        nodes = observation["ui"]["nodes"]
+    else:
+        steps.append({"action": "fill_account", "skipped": "already-filled", "chars": len(account)})
+
+    inputs = xiaoluxue_login_input_nodes(nodes)
+    if len(inputs) < 2:
+        raise AndroidUseError("Password field disappeared from Xiaoluxue login page.")
+    password_node = inputs[1]
+    point = xiaoluxue_login_click_node(serial, password_node, "password input")
+    method = type_focused_text_fast(serial, password, clear_first=True, clear_count=max(20, len(password) + 8))
+    steps.append({"action": "fill_password", "chars": len(password), "method": method, "point": point})
+
+    observation = xiaoluxue_login_observe(serial)
+    nodes = observation["ui"]["nodes"]
+    agreement_node = xiaoluxue_login_node_by_resource(nodes, "cb_agreement")
+    if agreement_node and not bool(agreement_node.get("checked")):
+        point = xiaoluxue_login_click_node(serial, agreement_node, "agreement checkbox")
+        steps.append({"action": "check_agreement", "point": point})
+        observation = xiaoluxue_login_observe(serial)
+        nodes = observation["ui"]["nodes"]
+    else:
+        steps.append({"action": "check_agreement", "skipped": "already-checked" if agreement_node else "not-found"})
+
+    login_node = xiaoluxue_login_node_by_resource(nodes, "button") or find_ui_node(nodes, "登录", exact=True)
+    point = xiaoluxue_login_click_node(serial, login_node, "login button")
+    submitted_at = time.monotonic()
+    steps.append({"action": "submit", "point": point})
+
+    final_focus = ""
+    while time.monotonic() < deadline:
+        final_focus = get_focused_window(serial) or ""
+        if f"{XIAOLUXUE_STUDENT_PACKAGE}/" in final_focus and XIAOLUXUE_LOGIN_ACTIVITY not in final_focus:
+            result = {
+                "ok": True,
+                "action": "xiaoluxue_login_fast_path",
+                "already_logged_in": False,
+                "focused_window": final_focus,
+                "elapsed_sec": round(time.monotonic() - started_at, 3),
+                "submit_to_home_sec": round(time.monotonic() - submitted_at, 3),
+                "steps": steps,
+            }
+            if record:
+                append_recording_step(
+                    serial,
+                    "xiaoluxue_login_fast_path",
+                    {
+                        "account_chars": len(account),
+                        "password_chars": len(password),
+                        "password_redacted": True,
+                        "timeout_sec": timeout,
+                    },
+                    result,
+                )
+            return result
+        time.sleep(0.1)
+    raise AndroidUseError(
+        f"Xiaoluxue login did not reach home within {timeout:.1f}s. focused_window={final_focus or focus}"
+    )
+
+
+def tool_xiaoluxue_login_fast_path(args: dict[str, Any]) -> list[dict[str, Any]]:
+    serial = choose_serial(args.get("serial"))
+    result = run_xiaoluxue_login_fast_path(serial, args, record=True)
+    return [text_content({"ok": True, "serial": serial, **result})]
+
+
 def tool_xiaoluxue_course_snapshot(args: dict[str, Any]) -> list[dict[str, Any]]:
     serial = choose_serial(args.get("serial"))
     page = xiaoluxue_page(serial)
@@ -4649,69 +4967,124 @@ def run_xiaoluxue_open_knowledge_guide(serial: str, args: dict[str, Any], *, rec
     timings: dict[str, float] = {}
     native_entry_result: Any = {"attempted": False, "reason": "webview-already-available"}
     vessel_entry_result: Any = {"attempted": False, "reason": "webview-already-available"}
+    page: dict[str, Any] | None = None
     try:
         page = xiaoluxue_any_page(serial, open_app_if_needed=False, timeout_sec=0.2)
     except Exception as first_page_error:
         can_open_app = bool(args.get("open_app_if_needed", True))
         shortcut_target_url = str(shortcut.get("targetUrl") or "") if shortcut else ""
-        if can_open_app and shortcut_target_url and not bool(args.get("refresh_session", False)):
+        refresh_session_for_entry = bool(args.get("refresh_session", False))
+        prefer_native_entry_first = bool(
+            args.get(
+                "prefer_native_entry_first",
+                not bool(shortcut_target_url and not refresh_session_for_entry),
+            )
+        )
+        fallback_native_after_vessel = bool(args.get("fallback_native_after_vessel", prefer_native_entry_first))
+        entry_order = (
+            ("native", "vessel")
+            if prefer_native_entry_first
+            else ("vessel", "native")
+            if fallback_native_after_vessel
+            else ("vessel",)
+        )
+        for entry_mode in entry_order:
+            if page is not None:
+                break
+            if entry_mode == "native":
+                if not (can_open_app and native_entry_if_needed):
+                    continue
+                try:
+                    native_entry_timeout = min(max(float(args.get("native_entry_timeout_sec", 2.6)), 1.0), 5.0)
+                    native_entry_result = xiaoluxue_open_native_course_entry(
+                        serial,
+                        subject_id=subject_id,
+                        normalized_index=normalized_index,
+                        timeout_sec=min(max(deadline - time.monotonic(), 1), native_entry_timeout),
+                    )
+                    page = native_entry_result["page"]
+                except Exception as native_exc:
+                    native_entry_result = {"attempted": True, "ok": False, "error": str(native_exc)}
+            elif entry_mode == "vessel":
+                if not (can_open_app and shortcut_target_url and not bool(args.get("refresh_session", False))):
+                    continue
+                try:
+                    vessel_entry_timeout = min(max(float(args.get("vessel_entry_timeout_sec", 4.8)), 0.8), 8.0)
+                    vessel_entry_result = xiaoluxue_open_vessel_course_page(
+                        serial,
+                        target_url=shortcut_target_url,
+                        knowledge_id=int(shortcut["knowledgeId"]),
+                        timeout_sec=min(max(deadline - time.monotonic(), 0.5), vessel_entry_timeout),
+                        force_stop=bool(args.get("force_vessel_start", True)),
+                        bootstrap_scripts=(
+                            [
+                                xiaoluxue_fast_rate_expression(
+                                    rate,
+                                    int(shortcut.get("guideIndex", 0)),
+                                    activate_player=True,
+                                ),
+                                xiaoluxue_turbo_guide_player_expression(
+                                    guide_index=int(shortcut.get("guideIndex", 0)),
+                                    guide_name=str(shortcut.get("guideName") or "") or None,
+                                    avatar_url=str(shortcut.get("avatarUrl") or "") or None,
+                                    rate=rate,
+                                    enabled=bool(args.get("turbo_preview", True)),
+                                ),
+                                xiaoluxue_prefetch_guide_expression(
+                                    str(shortcut.get("guideCdnUrl") or "") or None,
+                                    str(shortcut.get("avatarUrl") or "") or None,
+                                ),
+                            ]
+                            if bool(args.get("preinject_vessel_bootstrap", False))
+                            else None
+                        ),
+                    )
+                    page = vessel_entry_result["page"]
+                except Exception as vessel_exc:
+                    vessel_entry_result = {"attempted": True, "ok": False, "error": str(vessel_exc)}
+        if page is None and can_open_app and native_entry_if_needed:
             try:
-                vessel_entry_result = xiaoluxue_open_vessel_course_page(
-                    serial,
-                    target_url=shortcut_target_url,
-                    knowledge_id=int(shortcut["knowledgeId"]),
-                    timeout_sec=min(max(deadline - time.monotonic(), 0.5), 2.5),
-                    force_stop=bool(args.get("force_vessel_start", True)),
-                    bootstrap_scripts=(
-                        [
-                            xiaoluxue_fast_rate_expression(
-                                rate,
-                                int(shortcut.get("guideIndex", 0)),
-                                activate_player=True,
-                            ),
-                            xiaoluxue_turbo_guide_player_expression(
-                                guide_index=int(shortcut.get("guideIndex", 0)),
-                                guide_name=str(shortcut.get("guideName") or "") or None,
-                                avatar_url=str(shortcut.get("avatarUrl") or "") or None,
-                                rate=rate,
-                                enabled=bool(args.get("turbo_preview", True)),
-                            ),
-                            xiaoluxue_prefetch_guide_expression(
-                                str(shortcut.get("guideCdnUrl") or "") or None,
-                                str(shortcut.get("avatarUrl") or "") or None,
-                            ),
-                        ]
-                        if bool(args.get("preinject_vessel_bootstrap", False))
-                        else None
-                    ),
-                )
-                page = vessel_entry_result["page"]
-            except Exception as vessel_exc:
-                vessel_entry_result = {"attempted": True, "ok": False, "error": str(vessel_exc)}
-        if "page" not in locals() and can_open_app and native_entry_if_needed:
-            try:
-                native_entry_result = xiaoluxue_open_native_course_entry(
-                    serial,
-                    subject_id=subject_id,
-                    normalized_index=normalized_index,
-                    timeout_sec=min(max(deadline - time.monotonic(), 1), 5),
-                )
-                page = native_entry_result["page"]
-            except Exception as native_exc:
-                native_entry_result = {"attempted": True, "ok": False, "error": str(native_exc)}
                 page = xiaoluxue_any_page(
                     serial,
                     open_app_if_needed=can_open_app,
                     timeout_sec=min(max(deadline - time.monotonic(), 0.5), 2),
                 )
-        elif "page" not in locals():
+            except Exception:
+                if isinstance(native_entry_result, dict) and native_entry_result.get("attempted"):
+                    raise AndroidUseError(str(native_entry_result.get("error") or first_page_error))
+                if isinstance(vessel_entry_result, dict) and vessel_entry_result.get("attempted"):
+                    raise AndroidUseError(str(vessel_entry_result.get("error") or first_page_error))
+                raise
+        elif page is None:
             raise first_page_error
+    if page is None:
+        raise AndroidUseError("Could not open Xiaoluxue knowledge guide page.")
     timings["select_page_sec"] = round(time.monotonic() - started_at, 3)
+    entry_page_url = str(page.get("runtimeHref") or page.get("url") or "")
+    entry_opened_target_course = bool(
+        (
+            isinstance(native_entry_result, dict)
+            and native_entry_result.get("ok")
+            or isinstance(vessel_entry_result, dict)
+            and vessel_entry_result.get("ok")
+        )
+        and resolved_knowledge_id is not None
+        and xiaoluxue_url_kind(entry_page_url) == "course"
+        and f"knowledgeId={resolved_knowledge_id}" in entry_page_url
+    )
     stop_loading_result: Any = None
-    try:
-        stop_loading_result = cdp_eval_value(page, xiaoluxue_stop_non_course_loading_expression(), timeout=0.6)
-    except Exception as exc:
-        stop_loading_result = {"ok": False, "error": str(exc)}
+    if entry_opened_target_course:
+        stop_loading_result = {
+            "ok": True,
+            "skipped": "entry-opened-target-course",
+            "before": {"readyState": "complete"},
+            "after": {"readyState": "complete"},
+        }
+    else:
+        try:
+            stop_loading_result = cdp_eval_value(page, xiaoluxue_stop_non_course_loading_expression(), timeout=0.6)
+        except Exception as exc:
+            stop_loading_result = {"ok": False, "error": str(exc)}
     stop_after = stop_loading_result.get("after") if isinstance(stop_loading_result, dict) and isinstance(stop_loading_result.get("after"), dict) else {}
     stop_before = stop_loading_result.get("before") if isinstance(stop_loading_result, dict) and isinstance(stop_loading_result.get("before"), dict) else {}
     runtime_route_safe = bool(stop_loading_result.get("ok")) and stop_after.get("readyState") != "loading"
@@ -4751,12 +5124,13 @@ def run_xiaoluxue_open_knowledge_guide(serial: str, args: dict[str, Any], *, rec
     if not isinstance(resolved, dict) or not resolved.get("targetUrl"):
         raise AndroidUseError("Could not resolve Xiaoluxue knowledge guide target.")
     current_h5_href = str(page.get("runtimeHref") or page.get("url") or "")
-    try:
-        runtime_href = cdp_eval_value(page, "location.href", timeout=0.3)
-        if isinstance(runtime_href, str):
-            current_h5_href = runtime_href
-    except Exception:
-        pass
+    if not entry_opened_target_course:
+        try:
+            runtime_href = cdp_eval_value(page, "location.href", timeout=0.3)
+            if isinstance(runtime_href, str):
+                current_h5_href = runtime_href
+        except Exception:
+            pass
     if bool(args.get("respect_current_h5_host", True)):
         rebased_target_url = xiaoluxue_rebase_h5_url(str(resolved["targetUrl"]), current_h5_href)
         if rebased_target_url != str(resolved["targetUrl"]):
@@ -4783,7 +5157,9 @@ def run_xiaoluxue_open_knowledge_guide(serial: str, args: dict[str, Any], *, rec
     rate_bootstrap_script = xiaoluxue_fast_rate_expression(rate, guide_index, activate_player=True)
     rate_bootstrap_result: Any = {"ok": True, "skipped": "current-document-client-route"}
     rate_prepare_result: Any = None
-    if runtime_route_safe:
+    if entry_opened_target_course:
+        rate_prepare_result = {"ok": True, "skipped": "entry-opened-target-course", "rate": rate}
+    elif runtime_route_safe:
         try:
             rate_prepare_result = cdp_eval_value(page, rate_bootstrap_script, timeout=1)
         except Exception as exc:
@@ -4791,17 +5167,20 @@ def run_xiaoluxue_open_knowledge_guide(serial: str, args: dict[str, Any], *, rec
     else:
         rate_prepare_result = {"ok": True, "skipped": "runtime-loading-page", "rate": rate}
     prefetch_result: Any = None
-    try:
-        prefetch_result = cdp_eval_value(
-            page,
-            xiaoluxue_prefetch_guide_expression(
-                str(resolved.get("guideCdnUrl") or "") or None,
-                str(resolved.get("avatarUrl") or "") or None,
-            ),
-            timeout=0.8,
-        )
-    except Exception as exc:
-        prefetch_result = {"ok": False, "error": str(exc)}
+    if entry_opened_target_course:
+        prefetch_result = {"ok": True, "skipped": "entry-opened-target-course"}
+    else:
+        try:
+            prefetch_result = cdp_eval_value(
+                page,
+                xiaoluxue_prefetch_guide_expression(
+                    str(resolved.get("guideCdnUrl") or "") or None,
+                    str(resolved.get("avatarUrl") or "") or None,
+                ),
+                timeout=0.8,
+            )
+        except Exception as exc:
+            prefetch_result = {"ok": False, "error": str(exc)}
 
     optimize_neighbor_guides = bool(args.get("optimize_neighbor_guides", False))
     fetch_optimizer_result: Any = {"ok": True, "skipped": "disabled"}
@@ -4825,7 +5204,8 @@ def run_xiaoluxue_open_knowledge_guide(serial: str, args: dict[str, Any], *, rec
     )
     turbo_result: Any = None
     try:
-        turbo_result = cdp_eval_value(page, turbo_bootstrap_script, timeout=0.6)
+        turbo_timeout = 0.25 if entry_opened_target_course else 0.6
+        turbo_result = cdp_eval_value(page, turbo_bootstrap_script, timeout=turbo_timeout)
     except Exception as exc:
         turbo_result = {"ok": False, "error": str(exc)}
 
@@ -4917,7 +5297,31 @@ def run_xiaoluxue_open_knowledge_guide(serial: str, args: dict[str, Any], *, rec
     last_error: str | None = None
     fallback_reload_result: Any = None
     turbo_refreshed_after_route = False
-    while time.monotonic() < deadline:
+    turbo_video_available_before_ready = bool(isinstance(turbo_result, dict) and turbo_result.get("video"))
+    if entry_opened_target_course:
+        if not turbo_video_available_before_ready and turbo_preview:
+            try:
+                turbo_result = cdp_eval_value(page, turbo_bootstrap_script, timeout=0.25)
+            except Exception as exc:
+                turbo_result = {"ok": False, "error": str(exc)}
+            turbo_video_available_before_ready = bool(isinstance(turbo_result, dict) and turbo_result.get("video"))
+        ready = {
+            "ok": True,
+            "href": current_page_url,
+            "readyState": "complete",
+            "params": {"knowledgeId": str(knowledge_id_int)},
+            "guideIndex": guide_index,
+            "targetWidget": None,
+            "visibleWidget": None,
+            "guidePlayerVisible": False,
+            "videos": (
+                [{"playbackRate": rate, "paused": False, "currentTime": None, "source": "turbo-video"}]
+                if turbo_video_available_before_ready
+                else []
+            ),
+            "skipped": "entry-opened-target-course",
+        }
+    while ready is None and time.monotonic() < deadline:
         try:
             value = cdp_eval_value(page, xiaoluxue_course_ready_expression(knowledge_id_int, guide_index), timeout=1.5)
             if isinstance(value, dict):
@@ -5614,7 +6018,7 @@ def xiaoluxue_should_enter_study_module(
     action = normalize_xiaoluxue_map_action(action_name)
     if action not in XIAOLUXUE_MAP_MODULE_ENTRY_ACTIONS:
         return False
-    return bool(args.get("enter_module", True))
+    return bool(args.get("enter_module", bool(args.get("enter_direct_practice", False))))
 
 
 def xiaoluxue_clamp_native_point(point: tuple[int, int]) -> tuple[int, int]:
@@ -6095,7 +6499,7 @@ def xiaoluxue_tap_study_module_entry(
     action = normalize_xiaoluxue_map_action(action_name)
     if not xiaoluxue_should_enter_study_module(action, args, open_report_when_done=open_report_when_done):
         return None
-    wait_sec = min(max(float(args.get("module_card_wait_sec", 0.45)), 0.05), 1.0)
+    wait_sec = min(max(float(args.get("module_card_wait_sec", 0.16)), 0.05), 1.0)
     time.sleep(wait_sec)
     info = window_info or xiaoluxue_native_window_info(serial)
     module_entry: dict[str, Any] = {"action": action, "card_wait_sec": wait_sec}
@@ -6113,16 +6517,23 @@ def xiaoluxue_tap_study_module_entry(
         return None
 
     if action == "expand" and bool(args.get("confirm_expand_enter", True)):
-        confirm_wait_sec = min(max(float(args.get("confirm_wait_sec", 0.42)), 0.05), 1.5)
+        confirm_wait_sec = min(max(float(args.get("confirm_wait_sec", 0.08)), 0.05), 1.5)
         confirm_started_at = time.monotonic()
-        focus_info = xiaoluxue_native_window_info(serial)
-        focus = str(focus_info.get("focus") or "")
-        deadline = confirm_started_at + confirm_wait_sec
-        while XIAOLUXUE_STUDY_SUBJECT_ACTIVITY in focus and time.monotonic() < deadline:
-            time.sleep(min(0.06, max(deadline - time.monotonic(), 0)))
+        if bool(args.get("confirm_expand_focus_check", False)):
             focus_info = xiaoluxue_native_window_info(serial)
             focus = str(focus_info.get("focus") or "")
-        if XIAOLUXUE_STUDY_SUBJECT_ACTIVITY in focus:
+            deadline = confirm_started_at + confirm_wait_sec
+            while XIAOLUXUE_STUDY_SUBJECT_ACTIVITY in focus and time.monotonic() < deadline:
+                time.sleep(min(0.06, max(deadline - time.monotonic(), 0)))
+                focus_info = xiaoluxue_native_window_info(serial)
+                focus = str(focus_info.get("focus") or "")
+            should_tap_confirm = XIAOLUXUE_STUDY_SUBJECT_ACTIVITY in focus
+        else:
+            if confirm_wait_sec:
+                time.sleep(confirm_wait_sec)
+            focus_info = info
+            should_tap_confirm = True
+        if should_tap_confirm:
             xiaoluxue_native_tap(
                 serial,
                 XIAOLUXUE_NATIVE_EXPAND_CONFIRM_ENTER,
@@ -6137,6 +6548,9 @@ def xiaoluxue_tap_study_module_entry(
         module_entry["confirm_wait_sec"] = round(time.monotonic() - confirm_started_at, 3)
     if action == "practise" and bool(args.get("enter_direct_practice", False)):
         direct_args = dict(args)
+        direct_args.setdefault("tap_direct_practice_until_answer_ready", True)
+        direct_args.setdefault("answer_ready_poll_after_taps", 2)
+        direct_args.setdefault("lesson_focus_timeout_sec", 0.55)
         direct_args.setdefault("lesson_ready_timeout_sec", 5.5)
         direct_args.setdefault("lesson_ready_poll_sec", 0.15)
         direct_args.setdefault("require_lesson_ready", True)
@@ -6147,6 +6561,14 @@ def xiaoluxue_tap_study_module_entry(
             started_at,
             default_wait_sec=0.12,
         )
+    elif action in XIAOLUXUE_MAP_MODULE_ENTRY_ACTIONS and bool(args.get("verify_module_activity", True)):
+        focus_timeout_sec = min(max(float(args.get("module_focus_timeout_sec", 0.9)), 0.0), 2.0)
+        focus_info = xiaoluxue_wait_for_lesson_activity(serial, focus_timeout_sec)
+        focus = str(focus_info.get("focus") or "")
+        module_entry["focus_timeout_sec"] = focus_timeout_sec
+        module_entry["focus_after_enter"] = focus
+        if XIAOLUXUE_LESSON_ACTIVITY not in focus:
+            raise AndroidUseError(f"Xiaoluxue module did not open LessonActivity: {focus or 'unknown focus'}")
     return module_entry
 
 
@@ -6156,6 +6578,7 @@ def xiaoluxue_start_scheme_route(
     steps: list[dict[str, Any]],
     started_at: float,
 ) -> dict[str, Any]:
+    xiaoluxue_dismiss_debug_overlay_if_needed(serial, steps, started_at)
     output = adb(
         [
             "shell",
@@ -6235,17 +6658,47 @@ def xiaoluxue_open_native_subject_map(
     )
     xiaoluxue_leave_lesson_before_subject_route(serial, args, steps, started_at)
     route = xiaoluxue_start_scheme_route(serial, url, steps, started_at)
-    wait_sec = min(max(float(args.get("route_wait_sec", 1.15)), 0.0), 3.0)
+    wait_sec = min(max(float(args.get("route_wait_sec", 0.45)), 0.0), 3.0)
+    window_info: dict[str, Any] | None = None
     if wait_sec:
-        time.sleep(wait_sec)
-        steps.append({"action": "wait", "reason": "subject-route-render", "seconds": wait_sec, "at_sec": round(time.monotonic() - started_at, 3)})
+        wait_started = time.monotonic()
+        deadline = wait_started + wait_sec
+        poll_sec = min(max(float(args.get("route_focus_poll_sec", 0.08)), 0.03), 0.3)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(poll_sec, remaining))
+            try:
+                window_info = xiaoluxue_native_window_info(serial)
+            except AndroidUseError:
+                window_info = None
+            focus = str((window_info or {}).get("focus") or "")
+            if XIAOLUXUE_STUDY_SUBJECT_ACTIVITY in focus:
+                break
+        actual_wait_sec = round(time.monotonic() - wait_started, 3)
+        steps.append(
+            {
+                "action": "wait",
+                "reason": "subject-route-render",
+                "seconds": actual_wait_sec,
+                "target_focus": XIAOLUXUE_STUDY_SUBJECT_ACTIVITY,
+                "focus": str((window_info or {}).get("focus") or ""),
+                "at_sec": round(time.monotonic() - started_at, 3),
+            }
+        )
+    if window_info is None:
+        window_info = xiaoluxue_native_window_info(serial)
+    if XIAOLUXUE_STUDY_SUBJECT_ACTIVITY in str(window_info.get("focus") or ""):
+        settle_sec = min(max(float(args.get("route_settle_sec", 0.0)), 0.0), 0.3)
+        if settle_sec:
+            time.sleep(settle_sec)
     if bool(args.get("close_progress_popup", True)):
-        close_taps = min(max(int(args.get("close_progress_taps", 2)), 1), 3)
-        close_wait_sec = min(max(float(args.get("close_progress_wait_sec", 0.12)), 0.0), 0.8)
+        close_taps = min(max(int(args.get("close_progress_taps", 1)), 1), 3)
+        close_wait_sec = min(max(float(args.get("close_progress_wait_sec", 0.05)), 0.0), 0.8)
         for attempt in range(close_taps):
             if attempt and close_wait_sec:
                 time.sleep(close_wait_sec)
-            window_info = xiaoluxue_native_window_info(serial)
             xiaoluxue_native_tap(
                 serial,
                 XIAOLUXUE_NATIVE_PROGRESS_POPUP_CLOSE,
@@ -6254,7 +6707,7 @@ def xiaoluxue_open_native_subject_map(
                 steps,
                 started_at,
             )
-    return {"subject_id": subject_id, "route": route}
+    return {"subject_id": subject_id, "route": route, "window_info": window_info}
 
 
 def xiaoluxue_route_preset_for(subject_id: int | None, index: str | None) -> dict[str, tuple[int, int]] | None:
@@ -6276,13 +6729,14 @@ def xiaoluxue_run_selected_module_shortcut(
     steps: list[dict[str, Any]],
     started_at: float,
     open_report_when_done: bool,
+    window_info: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     action = normalize_xiaoluxue_map_action(action_name)
     if action not in XIAOLUXUE_MAP_MODULE_ENTRY_ACTIONS:
         return None
     if not bool(args.get("selected_module_shortcut", True)):
         return None
-    window_info = xiaoluxue_native_window_info(serial)
+    window_info = window_info or xiaoluxue_native_window_info(serial)
     focus = str(window_info.get("focus") or "")
     if XIAOLUXUE_STUDY_SUBJECT_ACTIVITY not in focus:
         return None
@@ -6327,6 +6781,7 @@ def xiaoluxue_run_route_preset_map_fast_path(
     wait_after_select: float,
     open_report_when_done: bool,
     report_wait_sec: float,
+    window_info: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     preset = xiaoluxue_route_preset_for(subject_id, index)
     if not preset:
@@ -6335,7 +6790,7 @@ def xiaoluxue_run_route_preset_map_fast_path(
     index_point = preset.get("index")
     if not index_point:
         return None
-    window_info = xiaoluxue_native_window_info(serial)
+    window_info = window_info or xiaoluxue_native_window_info(serial)
     xiaoluxue_native_tap(serial, index_point, window_info, f"index:{index}:preset", steps, started_at)
     xiaoluxue_update_cached_selected_index(serial, str(index))
     module_entry: dict[str, Any] | None = None
@@ -6556,7 +7011,7 @@ def run_xiaoluxue_map_fast_path(serial: str, args: dict[str, Any], *, record: bo
         or args.get("instruction")
     )
     prefer_predicted = bool(args.get("prefer_predicted", True))
-    wait_after_select = min(max(float(args.get("after_select_wait_sec", 0.34)), 0.05), 1.0)
+    wait_after_select = min(max(float(args.get("after_select_wait_sec", 0.08)), 0.05), 1.0)
     report_wait_sec = min(max(float(args.get("report_wait_sec", 0.32)), 0.05), 1.0)
     open_report_when_done = bool(args.get("open_report_when_done", requested_report))
     route_subject = bool(args.get("route_subject", False) or args.get("open_subject", False) or args.get("route_if_subject", False))
@@ -6568,8 +7023,9 @@ def run_xiaoluxue_map_fast_path(serial: str, args: dict[str, Any], *, record: bo
             and action_name in XIAOLUXUE_MAP_MODULE_ENTRY_ACTIONS
             and "route_wait_sec" not in args
         ):
-            route_args = {**args, "route_wait_sec": 1.5}
-        xiaoluxue_open_native_subject_map(serial, route_args, steps, started_at)
+            route_args = {**args, "route_wait_sec": 0.65}
+        route_info = xiaoluxue_open_native_subject_map(serial, route_args, steps, started_at)
+        route_window_info = route_info.get("window_info") if isinstance(route_info, dict) else None
         preset_result = xiaoluxue_run_route_preset_map_fast_path(
             serial,
             subject_id=subject_id,
@@ -6581,6 +7037,7 @@ def run_xiaoluxue_map_fast_path(serial: str, args: dict[str, Any], *, record: bo
             wait_after_select=wait_after_select,
             open_report_when_done=open_report_when_done,
             report_wait_sec=report_wait_sec,
+            window_info=route_window_info if isinstance(route_window_info, dict) else None,
         )
         if preset_result:
             if record:
@@ -6601,6 +7058,7 @@ def run_xiaoluxue_map_fast_path(serial: str, args: dict[str, Any], *, record: bo
                 steps=steps,
                 started_at=started_at,
                 open_report_when_done=open_report_when_done,
+                window_info=route_window_info if isinstance(route_window_info, dict) else None,
             )
             if shortcut_result:
                 shortcut_result["routed"] = True
@@ -7425,25 +7883,128 @@ def xiaoluxue_exercise_action_expression(args: dict[str, Any]) -> str:
     }}
     return null;
   }};
+  const unique = (items) => {{
+    const seen = new Set();
+    const result = [];
+    for (const item of items.filter(Boolean)) {{
+      if (!seen.has(item)) {{
+        seen.add(item);
+        result.push(item);
+      }}
+    }}
+    return result;
+  }};
+  const isTextField = (el) => {{
+    if (!el) return false;
+    if (el instanceof HTMLTextAreaElement) return true;
+    if (el instanceof HTMLInputElement) return el.type !== "hidden";
+    return el.getAttribute?.("contenteditable") === "true" || el.getAttribute?.("role") === "textbox";
+  }};
+  const fieldValue = (el) => ("value" in el ? el.value : (el.textContent || ""));
+  const textFieldCandidates = () => unique([
+    document.activeElement,
+    ...document.querySelectorAll("textarea.keyboard-input-textarea, textarea, input:not([type='hidden']), [contenteditable='true'], [role='textbox']"),
+  ]).filter((el) => isTextField(el) && visible(el));
   const setNativeValue = (el, value) => {{
-    const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-    const descriptor = Object.getOwnPropertyDescriptor(proto, "value");
-    if (descriptor?.set) descriptor.set.call(el, value);
-    else el.value = value;
-    el.dispatchEvent(new Event("input", {{ bubbles: true }}));
-    el.dispatchEvent(new Event("change", {{ bubbles: true }}));
+    if ("value" in el) {{
+      const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const descriptor = Object.getOwnPropertyDescriptor(proto, "value");
+      if (descriptor?.set) descriptor.set.call(el, value);
+      else el.value = value;
+    }} else {{
+      el.textContent = value;
+    }}
+    const inputEvent = typeof InputEvent === "function"
+      ? new InputEvent("input", {{ bubbles: true, cancelable: true, data: value, inputType: "insertText" }})
+      : new Event("input", {{ bubbles: true, cancelable: true }});
+    el.dispatchEvent(inputEvent);
+    el.dispatchEvent(new Event("change", {{ bubbles: true, cancelable: true }}));
+  }};
+  const reactPropsChain = (el) => {{
+    const seen = new Set();
+    const propsList = [];
+    for (let startEl = el; startEl; startEl = startEl.parentElement) {{
+      let fiber = reactFiber(startEl);
+      let depth = 0;
+      while (fiber && depth < 40) {{
+        if (!seen.has(fiber)) {{
+          seen.add(fiber);
+          const props = fiber.memoizedProps || fiber.pendingProps || {{}};
+          propsList.push({{ props, element: startEl }});
+        }}
+        fiber = fiber.return;
+        depth += 1;
+      }}
+    }}
+    return propsList;
+  }};
+  const callReactTextHandlers = (el, value) => {{
+    const called = [];
+    const valueHandlerNames = ["onValueChange", "onAnswerChange", "onTextChange", "onLatexChange"];
+    const eventHandlerNames = ["onChange", "onInput"];
+    const event = {{
+      target: el,
+      currentTarget: el,
+      type: "change",
+      bubbles: true,
+      cancelable: true,
+      defaultPrevented: false,
+      nativeEvent: new Event("input", {{ bubbles: true, cancelable: true }}),
+      preventDefault: () => {{}},
+      stopPropagation: () => {{}},
+    }};
+    for (const {{ props }} of reactPropsChain(el)) {{
+      for (const name of valueHandlerNames) {{
+        if (typeof props[name] === "function") {{
+          try {{
+            props[name](value);
+            called.push(name);
+          }} catch (_err) {{}}
+        }}
+      }}
+      for (const name of eventHandlerNames) {{
+        if (typeof props[name] === "function") {{
+          try {{
+            props[name](event);
+            called.push(name);
+          }} catch (_err) {{}}
+        }}
+      }}
+    }}
+    return [...new Set(called)];
   }};
   const fillAnswer = async () => {{
     if (config.answerText === null || config.answerText === undefined) {{
       return {{ ok: false, reason: "answer_text is required" }};
     }}
     const answerText = String(config.answerText);
+    const directFields = textFieldCandidates();
+    const directField = directFields.find((el) => String(el.className || "").includes("keyboard-input-textarea"))
+      || directFields.find((el) => el === document.activeElement)
+      || directFields[0];
+    if (directField) {{
+      const before = fieldValue(directField);
+      setNativeValue(directField, answerText);
+      const reactHandlers = callReactTextHandlers(directField, answerText);
+      directField.blur?.();
+      await sleep(80);
+      return {{
+        ok: true,
+        method: "dom_text_field",
+        chars: answerText.length,
+        answerText,
+        before,
+        after: fieldValue(directField),
+        reactHandlers,
+        renderedText: text(directField.closest("[class*='answer'],[class*='question'],body") || directField).slice(0, 500),
+        rect: rect(directField),
+      }};
+    }}
     const roots = [
       ...document.querySelectorAll(".math-field-answer-box"),
       ...document.querySelectorAll("[class*='math-field'][class*='answer']"),
       ...document.querySelectorAll("[class*='answer-box']"),
       document.activeElement,
-      ...document.querySelectorAll("textarea,input,[contenteditable='true']"),
     ].filter(Boolean);
     const root = roots.find((el) => el === document.activeElement || visible(el)) || roots[0] || document.body;
     const found = findReactFunctionProp(root, "onLatexChange");
@@ -7460,16 +8021,18 @@ def xiaoluxue_exercise_action_expression(args: dict[str, Any]) -> str:
         rect: box ? rect(box) : null,
       }};
     }}
-    const field = roots.find((el) => el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement);
+    const field = textFieldCandidates()[0] || roots.find((el) => el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement);
     if (field) {{
-      field.focus();
       setNativeValue(field, answerText);
-      await sleep(100);
+      const reactHandlers = callReactTextHandlers(field, answerText);
+      field.blur?.();
+      await sleep(80);
       return {{
         ok: true,
-        method: "native_input_event",
+        method: "dom_text_field_fallback",
         chars: answerText.length,
         answerText,
+        reactHandlers,
         renderedText: text(root).slice(0, 500),
         rect: root ? rect(root) : null,
       }};
@@ -9311,6 +9874,9 @@ def execute_action(serial: str, action: dict[str, Any]) -> list[dict[str, Any]]:
     if action_type == "xiaoluxue_open_native_subject":
         result = run_xiaoluxue_open_native_subject(serial, action, record=True)
         return [text_content({"ok": True, "serial": serial, **result})]
+    if action_type == "xiaoluxue_login_fast_path":
+        result = run_xiaoluxue_login_fast_path(serial, action, record=True)
+        return [text_content({"ok": True, "serial": serial, **result})]
     if action_type == "wait":
         seconds = min(float(action.get("seconds", 1)), 10)
         time.sleep(seconds)
@@ -9727,6 +10293,27 @@ TOOLS: dict[str, dict[str, Any]] = {
         },
         "handler": tool_xiaoluxue_runtime_status,
     },
+    "xiaoluxue_login_fast_path": {
+        "description": "Run the Xiaoluxue native login fast path: fill account and password, ensure the agreement checkbox is checked, submit, and wait for the home Activity.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "serial": {"type": "string"},
+                "account": {"type": "string"},
+                "password": {"type": "string"},
+                "open_app_if_needed": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Launch Xiaoluxue first when the login page is not currently focused.",
+                },
+                "after_open_wait_sec": {"type": "number", "default": 0.25},
+                "timeout_sec": {"type": "number", "default": 5.0},
+            },
+            "required": ["account", "password"],
+            "additionalProperties": False,
+        },
+        "handler": tool_xiaoluxue_login_fast_path,
+    },
     "xiaoluxue_course_snapshot": {
         "description": "Read a fast DOM snapshot from the Xiaoluxue course WebView, including widgets, visible part, buttons, videos, and URL params.",
         "inputSchema": {
@@ -9861,6 +10448,21 @@ TOOLS: dict[str, dict[str, Any]] = {
                     "default": True,
                     "description": "When no WebView is present, use the Xiaoluxue native 首页 > 数学 > 知识讲解 coordinate shortcut before CDP routing.",
                 },
+                "prefer_native_entry_first": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Try native map taps before direct vessel routing. Defaults to false for known shortcut URLs to keep common guide entry under 5s.",
+                },
+                "fallback_native_after_vessel": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "When direct vessel routing fails, fall back to native map taps. Disabled by default to avoid slow double attempts.",
+                },
+                "vessel_entry_timeout_sec": {
+                    "type": "number",
+                    "default": 4.8,
+                    "description": "Maximum time to wait for the direct Xiaoluxue vessel WebView route.",
+                },
                 "turbo_preview": {
                     "type": "boolean",
                     "default": True,
@@ -9916,7 +10518,7 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "chapter_id": {"type": "integer"},
                 "knowledge_id": {"type": "integer"},
                 "go_next_knowledge": {"type": "boolean"},
-                "route_wait_sec": {"type": "number", "default": 1.15},
+                "route_wait_sec": {"type": "number", "default": 0.45},
                 "leave_lesson_before_route": {
                     "type": "boolean",
                     "default": True,
@@ -9928,8 +10530,8 @@ TOOLS: dict[str, dict[str, Any]] = {
                     "default": True,
                     "description": "Tap the known progress popup close point after routing to the native subject map.",
                 },
-                "close_progress_wait_sec": {"type": "number", "default": 0.12},
-                "close_progress_taps": {"type": "integer", "default": 2},
+                "close_progress_wait_sec": {"type": "number", "default": 0.05},
+                "close_progress_taps": {"type": "integer", "default": 1},
                 "verify_focus": {"type": "boolean", "default": False},
                 "focus_timeout_sec": {"type": "number", "default": 1.5},
             },
@@ -9952,7 +10554,7 @@ TOOLS: dict[str, dict[str, Any]] = {
                     "default": False,
                     "description": "When subject_id/subject is present, open the native subject map route before tapping.",
                 },
-                "route_wait_sec": {"type": "number", "default": 1.15},
+                "route_wait_sec": {"type": "number", "default": 0.45},
                 "leave_lesson_before_route": {
                     "type": "boolean",
                     "default": True,
@@ -9964,8 +10566,8 @@ TOOLS: dict[str, dict[str, Any]] = {
                     "default": True,
                     "description": "When routing first, close the known progress popup before tapping map controls.",
                 },
-                "close_progress_wait_sec": {"type": "number", "default": 0.12},
-                "close_progress_taps": {"type": "integer", "default": 2},
+                "close_progress_wait_sec": {"type": "number", "default": 0.05},
+                "close_progress_taps": {"type": "integer", "default": 1},
                 "action_name": {
                     "type": "string",
                     "default": "select",
@@ -9998,13 +10600,14 @@ TOOLS: dict[str, dict[str, Any]] = {
                     "default": True,
                     "description": "For 题型突破/专属精练, tap the module card entry button after opening the control.",
                 },
-                "module_card_wait_sec": {"type": "number", "default": 0.45},
+                "module_card_wait_sec": {"type": "number", "default": 0.16},
                 "confirm_expand_enter": {
                     "type": "boolean",
                     "default": True,
                     "description": "For 专属精练, tap the secondary 依然进入 confirmation when the map activity is still focused.",
                 },
-                "confirm_wait_sec": {"type": "number", "default": 0.42},
+                "confirm_wait_sec": {"type": "number", "default": 0.08},
+                "confirm_expand_focus_check": {"type": "boolean", "default": False},
                 "use_cache": {
                     "type": "boolean",
                     "default": True,
@@ -10012,7 +10615,7 @@ TOOLS: dict[str, dict[str, Any]] = {
                 },
                 "force_observe": {"type": "boolean", "default": False},
                 "cache_max_age_sec": {"type": "number", "default": 21600},
-                "after_select_wait_sec": {"type": "number", "default": 0.34},
+                "after_select_wait_sec": {"type": "number", "default": 0.08},
                 "open_report_when_done": {"type": "boolean", "default": False},
                 "report_wait_sec": {"type": "number", "default": 0.32},
                 "enter_direct_practice": {
