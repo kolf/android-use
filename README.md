@@ -229,6 +229,7 @@ cd ~/plugins/android-use-plugins
 
 - Android 工具被调用时自动弹出；
 - 同一个设备只保留一个 scrcpy 窗口；
+- `ANDROID_USE_SCRCPY_RESIDENT_SERIALS` 写入多个序列号时，会为每台已连接设备分别保活一个 scrcpy 窗口；
 - 不会自动启动 WebRTC；
 - 窗口稳定显示后，如果用户手动关闭，插件会尊重这次关闭；
 - 下一次调用 Android 插件工具时，再重新弹出窗口；
@@ -424,9 +425,25 @@ export ANDROID_SERIAL=设备序列号
 export ANDROID_USE_SERIAL=设备序列号
 ```
 
+如果需要多台设备同时投屏，可以写入逗号分隔的序列号：
+
+```bash
+export ANDROID_USE_SCRCPY_RESIDENT_SERIALS=设备1序列号,设备2序列号
+```
+
+也可以直接调用 `android_start_scrcpy`，传入 `serials` 列表，让每台设备各开一个 scrcpy 窗口。
+
 ### 可以不用 USB 线吗
 
 可以用 adb wireless，但第一次配置通常还是需要 USB 线。小白用户建议先用 USB 跑通，稳定后再让 Codex 帮你配置无线调试。
+
+一台设备配对成功后，`android_wireless_pair` 会把它追加到 `~/.config/android-use/env` 的 `ANDROID_USE_WIRELESS_DEVICES` 和 `ANDROID_USE_SCRCPY_RESIDENT_SERIALS`。多台设备分别配对后，可以调用：
+
+```text
+android_wireless_reconnect(all=true, start_scrcpy=true)
+```
+
+这样会批量重连已保存的无线设备，并为每台设备启动一个 scrcpy 投屏窗口。
 
 ### WebRTC 要不要开
 

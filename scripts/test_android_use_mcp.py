@@ -60,6 +60,132 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
             }
         ])
 
+    def test_wireless_configs_from_env_reads_multiple_devices_and_legacy(self) -> None:
+        original_read = mcp.read_user_env_values
+        original_env = {
+            "ANDROID_USE_WIRELESS_DEVICES": mcp.os.environ.get("ANDROID_USE_WIRELESS_DEVICES"),
+            "ANDROID_USE_WIRELESS_HOST": mcp.os.environ.get("ANDROID_USE_WIRELESS_HOST"),
+            "ANDROID_USE_WIRELESS_PORT": mcp.os.environ.get("ANDROID_USE_WIRELESS_PORT"),
+            "ANDROID_USE_SERIAL": mcp.os.environ.get("ANDROID_USE_SERIAL"),
+            "ANDROID_SERIAL": mcp.os.environ.get("ANDROID_SERIAL"),
+        }
+        try:
+            for key in original_env:
+                mcp.os.environ.pop(key, None)
+            mcp.read_user_env_values = lambda: {
+                "ANDROID_USE_WIRELESS_DEVICES": "10.0.0.1:5555,10.0.0.2:4444",
+                "ANDROID_USE_WIRELESS_HOST": "10.0.0.3",
+                "ANDROID_USE_WIRELESS_PORT": "3333",
+                "ANDROID_SERIAL": "10.0.0.3:3333",
+            }
+
+            configs = mcp.wireless_configs_from_env()
+        finally:
+            mcp.read_user_env_values = original_read
+            for key, value in original_env.items():
+                if value is None:
+                    mcp.os.environ.pop(key, None)
+                else:
+                    mcp.os.environ[key] = value
+
+        self.assertEqual(
+            [(item["host"], item["port"], item["serial"]) for item in configs],
+            [
+                ("10.0.0.1", 5555, "10.0.0.1:5555"),
+                ("10.0.0.2", 4444, "10.0.0.2:4444"),
+                ("10.0.0.3", 3333, "10.0.0.3:3333"),
+            ],
+        )
+
+    def test_save_wireless_config_appends_multi_device_and_resident_serials(self) -> None:
+        original_read = mcp.read_user_env_values
+        original_update = mcp.update_user_env_file
+        original_env = {
+            "ANDROID_USE_WIRELESS_DEVICES": mcp.os.environ.get("ANDROID_USE_WIRELESS_DEVICES"),
+            "ANDROID_USE_SCRCPY_RESIDENT_SERIALS": mcp.os.environ.get("ANDROID_USE_SCRCPY_RESIDENT_SERIALS"),
+        }
+        captured: dict[str, str] = {}
+        try:
+            for key in original_env:
+                mcp.os.environ.pop(key, None)
+            mcp.read_user_env_values = lambda: {
+                "ANDROID_USE_WIRELESS_DEVICES": "10.0.0.1:5555",
+                "ANDROID_USE_SCRCPY_RESIDENT_SERIALS": "10.0.0.1:5555,usb-1",
+            }
+            mcp.update_user_env_file = lambda updates: captured.update(updates)
+
+            mcp.save_wireless_config("10.0.0.2", 4444, "10.0.0.2:4444")
+        finally:
+            mcp.read_user_env_values = original_read
+            mcp.update_user_env_file = original_update
+            for key, value in original_env.items():
+                if value is None:
+                    mcp.os.environ.pop(key, None)
+                else:
+                    mcp.os.environ[key] = value
+
+        self.assertEqual(captured["ANDROID_USE_WIRELESS_HOST"], "10.0.0.2")
+        self.assertEqual(captured["ANDROID_USE_WIRELESS_PORT"], "4444")
+        self.assertEqual(captured["ANDROID_USE_WIRELESS_DEVICES"], "10.0.0.1:5555,10.0.0.2:4444")
+        self.assertEqual(captured["ANDROID_USE_SERIAL"], "10.0.0.2:4444")
+        self.assertEqual(captured["ANDROID_SERIAL"], "10.0.0.2:4444")
+        self.assertEqual(captured["ANDROID_USE_SCRCPY_RESIDENT_SERIALS"], "10.0.0.1:5555,usb-1,10.0.0.2:4444")
+
+    def test_save_wireless_config_replaces_stale_port_for_same_host(self) -> None:
+        original_read = mcp.read_user_env_values
+        original_update = mcp.update_user_env_file
+        original_env = {
+            "ANDROID_USE_WIRELESS_DEVICES": mcp.os.environ.get("ANDROID_USE_WIRELESS_DEVICES"),
+            "ANDROID_USE_SCRCPY_RESIDENT_SERIALS": mcp.os.environ.get("ANDROID_USE_SCRCPY_RESIDENT_SERIALS"),
+        }
+        captured: dict[str, str] = {}
+        try:
+            for key in original_env:
+                mcp.os.environ.pop(key, None)
+            mcp.read_user_env_values = lambda: {
+                "ANDROID_USE_WIRELESS_DEVICES": "10.0.0.1:1111,10.0.0.2:2222",
+                "ANDROID_USE_SCRCPY_RESIDENT_SERIALS": "10.0.0.1:1111,usb-1",
+            }
+            mcp.update_user_env_file = lambda updates: captured.update(updates)
+
+            mcp.save_wireless_config("10.0.0.1", 5555, "10.0.0.1:5555")
+        finally:
+            mcp.read_user_env_values = original_read
+            mcp.update_user_env_file = original_update
+            for key, value in original_env.items():
+                if value is None:
+                    mcp.os.environ.pop(key, None)
+                else:
+                    mcp.os.environ[key] = value
+
+        self.assertEqual(captured["ANDROID_USE_WIRELESS_DEVICES"], "10.0.0.2:2222,10.0.0.1:5555")
+        self.assertEqual(captured["ANDROID_USE_SCRCPY_RESIDENT_SERIALS"], "usb-1,10.0.0.1:5555")
+
+    def test_wireless_reconnect_all_uses_saved_configs(self) -> None:
+        original_configs = mcp.wireless_configs_from_env
+        original_reconnect = mcp.wireless_reconnect
+        calls: list[dict[str, object]] = []
+        try:
+            mcp.wireless_configs_from_env = lambda: [
+                {"host": "10.0.0.1", "port": 5555, "serial": "10.0.0.1:5555"},
+                {"host": "10.0.0.2", "port": 4444, "serial": "10.0.0.2:4444"},
+            ]
+
+            def fake_reconnect(**kwargs: object) -> dict[str, object]:
+                calls.append(kwargs)
+                return {"ok": True, "serial": kwargs["serial"]}
+
+            mcp.wireless_reconnect = fake_reconnect
+            result = mcp.wireless_reconnect_all(save=False, start_scrcpy=True)
+        finally:
+            mcp.wireless_configs_from_env = original_configs
+            mcp.wireless_reconnect = original_reconnect
+
+        self.assertEqual(result["count"], 2)
+        self.assertEqual([call["serial"] for call in calls], ["10.0.0.1:5555", "10.0.0.2:4444"])
+        self.assertTrue(all(call["start_scrcpy"] for call in calls))
+        self.assertTrue(all(call["save"] is False for call in calls))
+
     def test_choose_serial_dedupes_usb_and_wireless_same_device(self) -> None:
         original_list_devices = mcp.list_devices
         original_shell = mcp.shell
@@ -350,6 +476,7 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
         self.assertEqual(mcp.normalize_xiaoluxue_map_action("进入数学 巩固练习"), "expand")
         self.assertEqual(mcp.normalize_xiaoluxue_lesson_action("直接练"), "direct_practice")
         self.assertEqual(mcp.normalize_xiaoluxue_lesson_action("继续到下一题"), "continue_answer")
+        self.assertEqual(mcp.normalize_xiaoluxue_lesson_action("完成返回地图"), "finish_result")
         self.assertEqual(mcp.normalize_xiaoluxue_subject_id("进入语文 1.5 题型突破"), 1)
         self.assertEqual(mcp.normalize_xiaoluxue_subject_id("打开 subject_id=2 地图"), 2)
         self.assertEqual(
@@ -398,6 +525,15 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
                 "action": "xiaoluxue_lesson_fast_path",
                 "instruction": "进入 直接练",
                 "action_name": "direct_practice",
+                "source": "xiaoluxue-native-lesson",
+            },
+        )
+        self.assertEqual(
+            mcp.xiaoluxue_lesson_fast_action_from_instruction("完成返回地图"),
+            {
+                "action": "xiaoluxue_lesson_fast_path",
+                "instruction": "完成返回地图",
+                "action_name": "finish_result",
                 "source": "xiaoluxue-native-lesson",
             },
         )
@@ -726,6 +862,33 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
             },
         )
 
+    def test_xiaoluxue_lesson_fast_path_finish_result_taps_finish(self) -> None:
+        original_tap = mcp.xiaoluxue_native_tap
+        original_sleep = mcp.time.sleep
+        taps: list[tuple[tuple[int, int], str]] = []
+        try:
+            mcp.xiaoluxue_native_tap = lambda serial, point, info, label, steps, started_at: taps.append((point, label))
+            mcp.time.sleep = lambda seconds: None
+
+            result = mcp.run_xiaoluxue_lesson_fast_path(
+                "serial",
+                {"action_name": "finish_result", "after_finish_wait_sec": 0},
+                record=False,
+            )
+        finally:
+            mcp.xiaoluxue_native_tap = original_tap
+            mcp.time.sleep = original_sleep
+
+        self.assertEqual(result["finish_result"]["action"], "finish_result")
+        self.assertEqual(taps, [(mcp.XIAOLUXUE_NATIVE_RESULT_FINISH, "lesson:finish-result")])
+        self.assertEqual(
+            result["finish_result"]["finish_point"],
+            {
+                "base_x": mcp.XIAOLUXUE_NATIVE_RESULT_FINISH[0],
+                "base_y": mcp.XIAOLUXUE_NATIVE_RESULT_FINISH[1],
+            },
+        )
+
     def test_xiaoluxue_chinese_1_5_route_preset_defaults_to_opening_module_popup(self) -> None:
         original_tap = mcp.xiaoluxue_native_tap
         original_sleep = mcp.time.sleep
@@ -1050,6 +1213,30 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
                 else:
                     mcp.os.environ[key] = value
 
+    def test_start_scrcpy_accepts_multiple_serials(self) -> None:
+        original_choose = mcp.choose_serial
+        original_prune = mcp.prune_duplicate_scrcpy_processes
+        original_visible = mcp.scrcpy_visible_process_for_serial
+        original_clear = mcp.clear_scrcpy_user_closed
+        try:
+            mcp.choose_serial = lambda serial=None: str(serial)
+            mcp.prune_duplicate_scrcpy_processes = lambda serial: []
+            mcp.scrcpy_visible_process_for_serial = lambda serial: f"scrcpy {serial}"
+            mcp.clear_scrcpy_user_closed = lambda serial: None
+
+            content = mcp.tool_start_scrcpy({"serials": ["device-1", "device-2"]})
+        finally:
+            mcp.choose_serial = original_choose
+            mcp.prune_duplicate_scrcpy_processes = original_prune
+            mcp.scrcpy_visible_process_for_serial = original_visible
+            mcp.clear_scrcpy_user_closed = original_clear
+
+        payload = json.loads(content[0]["text"])
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["serials"], ["device-1", "device-2"])
+        self.assertEqual([item["serial"] for item in payload["results"]], ["device-1", "device-2"])
+        self.assertTrue(all(item["skipped"] == "already-running" for item in payload["results"]))
+
     def test_scrcpy_manual_close_marker_blocks_resident_reopen_until_tool_call(self) -> None:
         original_screen_dir = mcp.SCREEN_DIR
         original_visible = mcp.scrcpy_visible_process_for_serial
@@ -1138,6 +1325,7 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
 
         start_scrcpy = next(tool for tool in mcp.tool_descriptors() if tool["name"] == "android_start_scrcpy")
         properties = start_scrcpy["inputSchema"]["properties"]
+        self.assertIn("serials", properties)
         self.assertIn("keep_alive", properties)
         self.assertIn("audio", properties)
         self.assertIn("keyboard", properties)
@@ -1155,6 +1343,8 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
         self.assertIn("android_scrcpy_resident_status", tool_names)
         self.assertIn("android_webview_pages", tool_names)
         self.assertIn("android_webview_eval", tool_names)
+        wireless_reconnect = next(tool for tool in mcp.tool_descriptors() if tool["name"] == "android_wireless_reconnect")
+        self.assertIn("all", wireless_reconnect["inputSchema"]["properties"])
         self.assertIn("xiaoluxue_open_app_url", tool_names)
         self.assertIn("xiaoluxue_runtime_status", tool_names)
         self.assertIn("xiaoluxue_course_snapshot", tool_names)
@@ -1180,6 +1370,10 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
         self.assertEqual(map_props["module_card_wait_sec"]["default"], 0.16)
         self.assertEqual(map_props["confirm_wait_sec"]["default"], 0.08)
         self.assertFalse(map_props["confirm_expand_focus_check"]["default"])
+        lesson_fast = next(tool for tool in mcp.tool_descriptors() if tool["name"] == "xiaoluxue_lesson_fast_path")
+        lesson_props = lesson_fast["inputSchema"]["properties"]
+        self.assertIn("finish_result", lesson_props["action_name"]["enum"])
+        self.assertIn("after_finish_wait_sec", lesson_props)
         login_fast = next(tool for tool in mcp.tool_descriptors() if tool["name"] == "xiaoluxue_login_fast_path")
         self.assertIn("account", login_fast["inputSchema"]["required"])
         self.assertIn("password", login_fast["inputSchema"]["required"])
@@ -1189,6 +1383,11 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
         self.assertIn("fill_answer", action_props["action_name"]["enum"])
         exercise_fast = next(tool for tool in mcp.tool_descriptors() if tool["name"] == "xiaoluxue_exercise_fast_path")
         self.assertIn("answer_text", exercise_fast["inputSchema"]["properties"])
+        exercise_fast_props = exercise_fast["inputSchema"]["properties"]
+        self.assertIn("auto_answer", exercise_fast_props["action_name"]["enum"])
+        self.assertIn("max_steps", exercise_fast_props)
+        self.assertIn("step_wait_sec", exercise_fast_props)
+        self.assertIn("click_report", exercise_fast_props)
 
     def test_xiaoluxue_exercise_fast_path_fills_answer_text(self) -> None:
         original_page = mcp.xiaoluxue_exercise_page
@@ -1221,6 +1420,43 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
         self.assertTrue(any("textarea.keyboard-input-textarea" in expression for expression in calls))
         self.assertTrue(any('"dom_text_field"' in expression for expression in calls))
         self.assertFalse(any("field.focus()" in expression for expression in calls))
+
+    def test_xiaoluxue_exercise_fast_path_auto_answer_uses_page_store(self) -> None:
+        original_page = mcp.xiaoluxue_exercise_page
+        original_eval = mcp.cdp_eval_value
+        original_sleep = mcp.time.sleep
+        calls: list[str] = []
+        try:
+            mcp.xiaoluxue_exercise_page = lambda serial: {"id": "page-1", "socket": "webview", "webSocketDebuggerUrl": "ws://test"}
+
+            def fake_eval(page: dict[str, object], expression: str, timeout: int | float = 10) -> dict[str, object]:
+                calls.append(expression)
+                if "findQuestionStore" in expression and '"maxSteps": 3' in expression:
+                    return {"ok": True, "completed": True}
+                return {"ready": True}
+
+            mcp.cdp_eval_value = fake_eval
+            mcp.time.sleep = lambda seconds: None
+            result = mcp.run_xiaoluxue_exercise_fast_path(
+                "device-1",
+                {
+                    "action_name": "auto_answer",
+                    "max_steps": 3,
+                    "step_wait_sec": 0.2,
+                    "click_report": False,
+                    "after_action_wait_sec": 0,
+                },
+                record=False,
+            )
+        finally:
+            mcp.xiaoluxue_exercise_page = original_page
+            mcp.cdp_eval_value = original_eval
+            mcp.time.sleep = original_sleep
+
+        self.assertEqual(result["steps"][0]["action"], "auto_answer")
+        self.assertTrue(result["steps"][0]["result"]["completed"])
+        self.assertEqual(result["pageId"], "page-1")
+        self.assertTrue(any('"clickReport": false' in expression for expression in calls))
 
     def test_xiaoluxue_login_fast_path_checks_agreement_and_redacts_password(self) -> None:
         original_focus = mcp.get_focused_window
@@ -1400,6 +1636,18 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
                     "arguments": {"option_key": "C", "submit": True},
                     "result": {"ok": True},
                 },
+                {
+                    "kind": "action",
+                    "action": "xiaoluxue_lesson_fast_path",
+                    "arguments": {"action_name": "finish_result", "after_finish_wait_sec": 0.1},
+                    "result": {"ok": True},
+                },
+                {
+                    "kind": "action",
+                    "action": "xiaoluxue_exercise_fast_path",
+                    "arguments": {"action_name": "auto_answer", "max_steps": 5, "step_wait_sec": 0.3, "click_report": False},
+                    "result": {"ok": True},
+                },
             ],
         }
 
@@ -1427,6 +1675,11 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
         self.assertEqual(recipe["steps"][6], {"action": "xiaoluxue_switch_env", "env": "test", "open_student": True})
         self.assertEqual(recipe["steps"][7], {"action": "xiaoluxue_exercise_action", "action_name": "select_option", "option_key": "B"})
         self.assertEqual(recipe["steps"][8], {"action": "xiaoluxue_exercise_fast_path", "option_key": "C", "submit": True})
+        self.assertEqual(recipe["steps"][9], {"action": "xiaoluxue_lesson_fast_path", "action_name": "finish_result", "after_finish_wait_sec": 0.1})
+        self.assertEqual(
+            recipe["steps"][10],
+            {"action": "xiaoluxue_exercise_fast_path", "action_name": "auto_answer", "max_steps": 5, "step_wait_sec": 0.3, "click_report": False},
+        )
 
     def test_normalize_xiaoluxue_env(self) -> None:
         key, url, label = mcp.normalize_xiaoluxue_env("测试环境")

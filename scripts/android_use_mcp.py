@@ -28,7 +28,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 
 SERVER_NAME = "android-use"
@@ -312,6 +312,39 @@ def parse_host_port(value: str) -> tuple[str, int] | None:
     return host.strip("[]"), port
 
 
+def split_configured_values(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [item.strip() for item in re.split(r"[,;\s]+", str(value)) if item.strip()]
+
+
+def unique_ordered(values: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for value in values:
+        item = str(value or "").strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        unique.append(item)
+    return unique
+
+
+def comma_join(values: Iterable[str]) -> str:
+    return ",".join(unique_ordered(values))
+
+
+def replace_configured_wireless_serial(values: str | None, host: str, serial: str) -> str:
+    items: list[str] = []
+    for item in split_configured_values(values):
+        parsed = parse_host_port(item)
+        if parsed and parsed[0] == host:
+            continue
+        items.append(item)
+    items.append(serial)
+    return comma_join(items)
+
+
 def parse_adb_mdns_services(output: str, *, host: str | None = None) -> list[dict[str, Any]]:
     services: list[dict[str, Any]] = []
     for raw_line in output.splitlines():
@@ -345,29 +378,79 @@ def adb_connect_serial(host: str, port: int) -> dict[str, Any]:
 
 
 def save_wireless_config(host: str, port: int, serial: str) -> None:
+    values = {**read_user_env_values(), **os.environ}
+    legacy_serial = values.get("ANDROID_USE_SERIAL") or values.get("ANDROID_SERIAL")
+    legacy_wireless_serial = legacy_serial if legacy_serial and parse_host_port(legacy_serial) else None
+    wireless_seed = values.get("ANDROID_USE_WIRELESS_DEVICES") or legacy_wireless_serial
+    resident_seed = values.get("ANDROID_USE_SCRCPY_RESIDENT_SERIALS") or legacy_wireless_serial
+    wireless_devices = replace_configured_wireless_serial(wireless_seed, host, serial)
+    resident_serials = replace_configured_wireless_serial(resident_seed, host, serial)
     update_user_env_file(
         {
             "ANDROID_USE_WIRELESS_HOST": host,
             "ANDROID_USE_WIRELESS_PORT": str(int(port)),
+            "ANDROID_USE_WIRELESS_DEVICES": wireless_devices,
             "ANDROID_USE_SERIAL": serial,
             "ANDROID_SERIAL": serial,
-            "ANDROID_USE_SCRCPY_RESIDENT_SERIALS": serial,
+            "ANDROID_USE_SCRCPY_RESIDENT_SERIALS": resident_serials,
         }
     )
 
 
-def wireless_config_from_env() -> tuple[str | None, int | None, str | None]:
+def wireless_configs_from_env() -> list[dict[str, Any]]:
     values = {**read_user_env_values(), **os.environ}
-    serial = values.get("ANDROID_USE_SERIAL") or values.get("ANDROID_SERIAL")
-    host = values.get("ANDROID_USE_WIRELESS_HOST")
-    port_text = values.get("ANDROID_USE_WIRELESS_PORT")
-    if serial and not host:
-        parsed = parse_host_port(serial)
+    configs: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add_config(host: str | None, port: int | None, serial: str | None, source: str) -> None:
+        candidate_host = (host or "").strip() or None
+        candidate_port = int(port) if port else None
+        candidate_serial = (serial or "").strip() or None
+        if candidate_serial and (not candidate_host or not candidate_port):
+            parsed = parse_host_port(candidate_serial)
+            if parsed:
+                candidate_host = candidate_host or parsed[0]
+                candidate_port = candidate_port or parsed[1]
+        if candidate_host and candidate_port and not candidate_serial:
+            candidate_serial = f"{candidate_host}:{candidate_port}"
+        if not candidate_host and not candidate_serial:
+            return
+        key = candidate_serial or f"{candidate_host}:{candidate_port or ''}"
+        if key in seen:
+            return
+        seen.add(key)
+        configs.append(
+            {
+                "host": candidate_host,
+                "port": candidate_port,
+                "serial": candidate_serial,
+                "source": source,
+            }
+        )
+
+    for token in split_configured_values(values.get("ANDROID_USE_WIRELESS_DEVICES")):
+        parsed = parse_host_port(token)
         if parsed:
-            host, parsed_port = parsed
-            port_text = port_text or str(parsed_port)
-    port = int(port_text) if port_text and str(port_text).isdigit() else None
-    return host, port, serial
+            add_config(parsed[0], parsed[1], token, "ANDROID_USE_WIRELESS_DEVICES")
+        else:
+            add_config(token, None, None, "ANDROID_USE_WIRELESS_DEVICES")
+
+    legacy_serial = values.get("ANDROID_USE_SERIAL") or values.get("ANDROID_SERIAL")
+    legacy_host = values.get("ANDROID_USE_WIRELESS_HOST")
+    legacy_port_text = values.get("ANDROID_USE_WIRELESS_PORT")
+    legacy_port = int(legacy_port_text) if legacy_port_text and str(legacy_port_text).isdigit() else None
+    if legacy_host or (legacy_serial and parse_host_port(legacy_serial)):
+        add_config(legacy_host, legacy_port, legacy_serial, "legacy")
+
+    return configs
+
+
+def wireless_config_from_env() -> tuple[str | None, int | None, str | None]:
+    configs = wireless_configs_from_env()
+    if not configs:
+        return None, None, None
+    first = configs[0]
+    return first.get("host"), first.get("port"), first.get("serial")
 
 
 def wireless_reconnect(
@@ -415,14 +498,54 @@ def wireless_reconnect(
     raise AndroidUseError("Wireless reconnect failed.\n" + "\n".join(errors[-5:]))
 
 
+def wireless_reconnect_all(*, save: bool = True, start_scrcpy: bool = False) -> dict[str, Any]:
+    configs = wireless_configs_from_env()
+    if not configs:
+        raise AndroidUseError("No saved wireless devices. Run android_wireless_pair first or pass host/serial.")
+    results: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for config in configs:
+        try:
+            result = wireless_reconnect(
+                host=config.get("host"),
+                port=config.get("port"),
+                serial=config.get("serial"),
+                save=save,
+                start_scrcpy=start_scrcpy,
+            )
+            results.append({"config": config, **result})
+        except Exception as exc:
+            errors.append({"config": config, "error": str(exc)})
+    if not results:
+        detail = "\n".join(f"{item['config']}: {item['error']}" for item in errors[-5:])
+        raise AndroidUseError("Wireless reconnect failed for all saved devices.\n" + detail)
+    return {
+        "ok": True,
+        "count": len(results),
+        "configured_count": len(configs),
+        "results": results,
+        "errors": errors,
+    }
+
+
 def auto_reconnect_wireless_if_needed() -> None:
     if not env_flag("ANDROID_USE_WIRELESS_AUTO_CONNECT", True):
         return
-    host, port, serial = wireless_config_from_env()
-    if not host and not serial:
+    configs = wireless_configs_from_env()
+    if not configs:
         return
     try:
-        wireless_reconnect(host=host, port=port, serial=serial, save=True, start_scrcpy=False)
+        if len(configs) > 1:
+            wireless_reconnect_all(save=True, start_scrcpy=False)
+        else:
+            config = configs[0]
+            wireless_reconnect(
+                host=config.get("host"),
+                port=config.get("port"),
+                serial=config.get("serial"),
+                save=True,
+                start_scrcpy=False,
+            )
     except Exception:
         return
 
@@ -1601,6 +1724,7 @@ def recipe_from_trace(trace: dict[str, Any], recipe_name: str | None = None) -> 
                         "direct_practice_tap_interval_sec",
                         "answer_ready_poll_after_taps",
                         "after_continue_wait_sec",
+                        "after_finish_wait_sec",
                         "min_answer_ready_after_continue_sec",
                         "tap_card_direct_practice_if_needed",
                         "card_direct_practice_taps",
@@ -1686,6 +1810,9 @@ def recipe_from_trace(trace: dict[str, Any], recipe_name: str | None = None) -> 
                         "action_name",
                         "button_text",
                         "after_action_wait_sec",
+                        "max_steps",
+                        "step_wait_sec",
+                        "click_report",
                     )
                     if key in args
                 }
@@ -2434,6 +2561,7 @@ def check_dependencies(_args: dict[str, Any]) -> list[dict[str, Any]]:
     adb_available = shutil.which(adb_binary()) is not None or Path(adb_binary()).exists()
     scrcpy_available = shutil.which(scrcpy_binary()) is not None or Path(scrcpy_binary()).exists()
     wireless_host, wireless_port, wireless_serial = wireless_config_from_env()
+    wireless_configs = wireless_configs_from_env()
     payload: dict[str, Any] = {
         "ok": adb_available and scrcpy_available,
         "adb": {
@@ -2462,8 +2590,10 @@ def check_dependencies(_args: dict[str, Any]) -> list[dict[str, Any]]:
             "host": wireless_host,
             "port": wireless_port,
             "serial": wireless_serial,
+            "devices": wireless_configs,
+            "configured_count": len(wireless_configs),
             "env_file": str(USER_ENV_FILE),
-            "configured": bool(wireless_host or wireless_serial),
+            "configured": bool(wireless_configs),
         },
         "openai": {
             "api_key_configured": bool(os.environ.get("ANDROID_USE_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")),
@@ -2543,6 +2673,9 @@ def tool_wireless_reconnect(args: dict[str, Any]) -> list[dict[str, Any]]:
     serial = str(args.get("serial") or "").strip() or None
     save = bool(args.get("save", True))
     start_scrcpy = bool(args.get("start_scrcpy", True))
+    if bool(args.get("all", False)):
+        result = wireless_reconnect_all(save=save, start_scrcpy=start_scrcpy)
+        return [text_content({"ok": True, **result, "env_file": str(USER_ENV_FILE) if save else None})]
     result = wireless_reconnect(host=host, port=port, serial=serial, save=save, start_scrcpy=start_scrcpy)
     return [text_content({"ok": True, **result, "env_file": str(USER_ENV_FILE) if save else None})]
 
@@ -2893,6 +3026,7 @@ XIAOLUXUE_NATIVE_DIRECT_PRACTICE_ENTER = (468, 936)
 XIAOLUXUE_NATIVE_CURRENT_CARD_DIRECT_PRACTICE_ENTER = (955, 936)
 XIAOLUXUE_NATIVE_RIGHT_CARD_DIRECT_PRACTICE_ENTER = (1432, 936)
 XIAOLUXUE_NATIVE_ANSWER_CONTINUE = (1845, 1108)
+XIAOLUXUE_NATIVE_RESULT_FINISH = (1160, 856)
 XIAOLUXUE_NATIVE_TRANSITION_START = (1000, 1055)
 ANDROID_ANIMATION_SCALE_SETTINGS = (
     "window_animation_scale",
@@ -5696,6 +5830,10 @@ def normalize_xiaoluxue_lesson_action(value: Any) -> str:
         return "continue_answer"
     if any(keyword in raw for keyword in ("继续答题", "继续", "下一题", "下一道", "下一问", "答题页")):
         return "continue_answer"
+    if lowered in {"finish-result", "finish", "done"}:
+        return "finish_result"
+    if any(keyword in raw for keyword in ("完成", "结束", "返回地图")):
+        return "finish_result"
     return lowered.replace("-", "_") or "direct_practice"
 
 
@@ -5709,12 +5847,19 @@ def xiaoluxue_instruction_wants_continue_answer(instruction: str) -> bool:
     return bool(text) and any(keyword in text for keyword in ("继续答题", "继续", "下一题", "下一道", "下一问"))
 
 
+def xiaoluxue_instruction_wants_finish_result(instruction: str) -> bool:
+    text = str(instruction or "").strip()
+    return bool(text) and any(keyword in text for keyword in ("完成", "结束", "返回地图"))
+
+
 def xiaoluxue_lesson_fast_action_from_instruction(instruction: str) -> dict[str, Any] | None:
     action_name: str | None = None
     if xiaoluxue_instruction_wants_direct_practice(instruction):
         action_name = "direct_practice"
     elif xiaoluxue_instruction_wants_continue_answer(instruction):
         action_name = "continue_answer"
+    elif xiaoluxue_instruction_wants_finish_result(instruction):
+        action_name = "finish_result"
     if not action_name:
         return None
     return {
@@ -6484,6 +6629,48 @@ def xiaoluxue_tap_lesson_continue_answer(
     }
 
 
+def xiaoluxue_tap_lesson_finish_result(
+    serial: str,
+    args: dict[str, Any],
+    steps: list[dict[str, Any]],
+    started_at: float,
+) -> dict[str, Any]:
+    assumed_focus = bool(args.get("assume_lesson_activity", True))
+    focus_timeout_sec = 0.0 if assumed_focus else min(max(float(args.get("lesson_focus_timeout_sec", 0.7)), 0.0), 2.0)
+    info = (
+        {
+            "focus": XIAOLUXUE_LESSON_ACTIVITY,
+            "width": XIAOLUXUE_NATIVE_BASE_WIDTH,
+            "height": XIAOLUXUE_NATIVE_BASE_HEIGHT,
+        }
+        if assumed_focus
+        else xiaoluxue_wait_for_lesson_activity(serial, focus_timeout_sec)
+    )
+    focus = str(info.get("focus") or "")
+    if XIAOLUXUE_LESSON_ACTIVITY not in focus and not bool(args.get("skip_lesson_focus_check", False)):
+        raise AndroidUseError(f"Current Xiaoluxue screen is not LessonActivity: {focus or 'unknown focus'}")
+    xiaoluxue_native_tap(
+        serial,
+        XIAOLUXUE_NATIVE_RESULT_FINISH,
+        info,
+        "lesson:finish-result",
+        steps,
+        started_at,
+    )
+    wait_sec = min(max(float(args.get("after_finish_wait_sec", 0.35)), 0.0), 2.0)
+    if wait_sec:
+        time.sleep(wait_sec)
+    return {
+        "action": "finish_result",
+        "focus_timeout_sec": focus_timeout_sec,
+        "assumed_focus": assumed_focus,
+        "finish_point": {
+            "base_x": XIAOLUXUE_NATIVE_RESULT_FINISH[0],
+            "base_y": XIAOLUXUE_NATIVE_RESULT_FINISH[1],
+        },
+    }
+
+
 def xiaoluxue_tap_study_module_entry(
     serial: str,
     *,
@@ -7075,6 +7262,8 @@ def run_xiaoluxue_map_fast_path(serial: str, args: dict[str, Any], *, record: bo
     use_cache = bool(args.get("use_cache", True)) and not bool(args.get("force_observe", False))
     if route_subject and subject_id:
         use_cache = False
+    if not index and action_name in XIAOLUXUE_MAP_MODULE_ENTRY_ACTIONS:
+        use_cache = False
     if use_cache:
         cache = xiaoluxue_cached_native_map(serial, max_age_sec=float(args.get("cache_max_age_sec", 6 * 60 * 60)))
         if cache:
@@ -7323,7 +7512,7 @@ def run_xiaoluxue_lesson_fast_path(serial: str, args: dict[str, Any], *, record:
     started_at = time.monotonic()
     steps: list[dict[str, Any]] = []
     action_name = normalize_xiaoluxue_lesson_action(args.get("action_name") or args.get("action") or args.get("instruction"))
-    if action_name not in {"direct_practice", "continue_answer"}:
+    if action_name not in {"direct_practice", "continue_answer", "finish_result"}:
         raise AndroidUseError(f"Unsupported Xiaoluxue lesson fast path action: {action_name!r}")
     before = (
         {"state": {}, "ui": {"nodes": []}}
@@ -7341,8 +7530,15 @@ def run_xiaoluxue_lesson_fast_path(serial: str, args: dict[str, Any], *, record:
             started_at,
             default_wait_sec=0.0,
         )
-    else:
+    elif action_name == "continue_answer":
         action_result_payload = xiaoluxue_tap_lesson_continue_answer(
+            serial,
+            action_args,
+            steps,
+            started_at,
+        )
+    else:
+        action_result_payload = xiaoluxue_tap_lesson_finish_result(
             serial,
             action_args,
             steps,
@@ -7358,8 +7554,10 @@ def run_xiaoluxue_lesson_fast_path(serial: str, args: dict[str, Any], *, record:
     }
     if action_name == "direct_practice":
         result["direct_practice"] = action_result_payload
-    else:
+    elif action_name == "continue_answer":
         result["continue_answer"] = action_result_payload
+    else:
+        result["finish_result"] = action_result_payload
     if record:
         append_recording_step(serial, "xiaoluxue_lesson_fast_path", args, result, before=before)
     return result
@@ -7973,6 +8171,85 @@ def xiaoluxue_exercise_action_expression(args: dict[str, Any]) -> str:
     }}
     return [...new Set(called)];
   }};
+  const atomValue = (value) => {{
+    if (!value) return value;
+    if (value.v !== undefined) return value.v;
+    if (value.value !== undefined) return value.value;
+    try {{
+      if (typeof value.peek === "function") return value.peek();
+    }} catch (_err) {{}}
+    return value;
+  }};
+  const findQuestionStore = () => {{
+    const roots = [
+      document.activeElement,
+      ...document.querySelectorAll("#right-answer-area,.question-main-content,button,[data-container-id],textarea,input,[contenteditable='true'],[role='textbox']"),
+    ].filter(Boolean);
+    const seen = new Set();
+    for (const root of roots) {{
+      let fiber = reactFiber(root);
+      let depth = 0;
+      while (fiber && depth < 70) {{
+        if (!seen.has(fiber)) {{
+          seen.add(fiber);
+          const props = fiber.memoizedProps || fiber.pendingProps || {{}};
+          if (props.questionStore) return props.questionStore;
+        }}
+        fiber = fiber.return;
+        depth += 1;
+      }}
+    }}
+    return null;
+  }};
+  const fillQuestionStoreAnswer = async (answerText) => {{
+    const store = findQuestionStore();
+    if (!store || typeof store.updateUserAnswer !== "function") return null;
+    const currentQuestion = atomValue(store.currentQuestion) || {{}};
+    const questionId = currentQuestion.questionId || currentQuestion.questionContent?.questionId || currentQuestion.id;
+    if (!questionId) return {{ ok: false, reason: "question id not found" }};
+    const currentAnswers = atomValue(store.currentQuestionAnswers);
+    const answerCount = Array.isArray(currentAnswers) && currentAnswers.length ? currentAnswers.length : 1;
+    const activeBlankIndex = Number(atomValue(store.activeBlankIndex));
+    const blankIndex = Number.isFinite(activeBlankIndex) && activeBlankIndex >= 0
+      ? Math.min(activeBlankIndex, answerCount - 1)
+      : 0;
+    const currentInputMode = Number(atomValue(store.currentInputMode));
+    const type = Number.isFinite(currentInputMode) && currentInputMode > 0 ? currentInputMode : 1;
+    store.updateUserAnswer({{ questionId, blankIndex, type, content: answerText }});
+    if (typeof store.updateUserAnswerType === "function") {{
+      try {{ store.updateUserAnswerType(questionId, type); }} catch (_err) {{}}
+    }}
+    await sleep(120);
+    const updatedAnswers = atomValue(store.currentQuestionAnswers);
+    const userAnswerDataMap = atomValue(store.userAnswerDataMap);
+    const storedAnswers = userAnswerDataMap instanceof Map ? userAnswerDataMap.get(questionId) : null;
+    return {{
+      ok: true,
+      method: "react_question_store",
+      questionId,
+      blankIndex,
+      type,
+      chars: answerText.length,
+      answerText,
+      currentAnswers: Array.isArray(updatedAnswers) ? updatedAnswers : null,
+      storedAnswers: Array.isArray(storedAnswers) ? storedAnswers : null,
+    }};
+  }};
+  const ensurePlausibleAnswerDuration = (minMs = 6500) => {{
+    const store = findQuestionStore();
+    const timerState = store?.timerState;
+    if (!timerState || !timerState.value) return null;
+    const current = Number(timerState.value.currentTime || 0);
+    const total = Number(timerState.value.totalTime || 0);
+    const currentQuestionTotal = Number(store?.homeworkProgress?.currentQuestionTotal || 0);
+    const nextCurrent = Math.max(current, currentQuestionTotal + minMs, minMs);
+    timerState.value = {{
+      ...timerState.value,
+      currentTime: nextCurrent,
+      totalTime: Math.max(total, nextCurrent),
+    }};
+    return {{ before: current, after: nextCurrent, currentQuestionTotal }};
+  }};
   const fillAnswer = async () => {{
     if (config.answerText === null || config.answerText === undefined) {{
       return {{ ok: false, reason: "answer_text is required" }};
@@ -8037,6 +8314,8 @@ def xiaoluxue_exercise_action_expression(args: dict[str, Any]) -> str:
         rect: root ? rect(root) : null,
       }};
     }}
+    const storeResult = await fillQuestionStoreAnswer(answerText);
+    if (storeResult) return storeResult;
     return {{ ok: false, reason: "answer input not found" }};
   }};
   const clickButton = (labels, mode = "contains") => {{
@@ -8045,8 +8324,12 @@ def xiaoluxue_exercise_action_expression(args: dict[str, Any]) -> str:
     const included = candidates.find((el) => labels.some((label) => text(el).includes(label)));
     const target = mode === "exact" ? exact : (exact || included);
     if (!target) return {{ ok: false, reason: "button not found", labels, visibleButtons: candidates.map((el) => text(el)).slice(0, 30) }};
+    const timer =
+      labels.some((label) => ["提交", "继续提交", "提交自评"].includes(label))
+        ? ensurePlausibleAnswerDuration()
+        : null;
     click(target);
-    return {{ ok: true, clicked: pack(target), labels }};
+    return {{ ok: true, clicked: pack(target), labels, timer }};
   }};
   const clickOption = () => {{
     const optionButtons = [...document.querySelectorAll(".option-button")].filter((el) => visible(el) && !disabled(el));
@@ -8097,6 +8380,297 @@ def xiaoluxue_exercise_action_expression(args: dict[str, Any]) -> str:
 """
 
 
+def xiaoluxue_exercise_auto_answer_expression(args: dict[str, Any]) -> str:
+    config = {
+        "maxSteps": min(max(int(args.get("max_steps", 24)), 1), 80),
+        "stepWaitMs": int(min(max(float(args.get("step_wait_sec", 0.45)), 0.2), 3.0) * 1000),
+        "clickReport": bool(args.get("click_report", True)),
+        "openAnswerText": str(
+            args.get("open_answer_text")
+            or "I can answer this question clearly. I will make a plan, review what I have learned, and ask my teacher for help when needed."
+        ),
+    }
+    config_json = json.dumps(config, ensure_ascii=False)
+    return f"""
+(async () => {{
+  const config = {config_json};
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const logs = [];
+  const text = (el) => (el.innerText || el.textContent || "").trim().replace(/\\s+/g, " ");
+  const visible = (el) => {{
+    const r = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight
+      && style.visibility !== "hidden" && style.display !== "none";
+  }};
+  const disabled = (el) => {{
+    return Boolean(el.disabled) || el.getAttribute("aria-disabled") === "true" || el.getAttribute("data-disabled") === "true";
+  }};
+  const click = (el) => {{
+    el.scrollIntoView({{ block: "center", inline: "center", behavior: "instant" }});
+    el.dispatchEvent(new PointerEvent("pointerdown", {{ bubbles: true, cancelable: true, pointerType: "touch" }}));
+    el.dispatchEvent(new MouseEvent("mousedown", {{ bubbles: true, cancelable: true, view: window }}));
+    el.dispatchEvent(new PointerEvent("pointerup", {{ bubbles: true, cancelable: true, pointerType: "touch" }}));
+    el.dispatchEvent(new MouseEvent("mouseup", {{ bubbles: true, cancelable: true, view: window }}));
+    el.dispatchEvent(new MouseEvent("click", {{ bubbles: true, cancelable: true, view: window }}));
+  }};
+  const clickAtRatio = (xRatio, yRatio) => {{
+    const x = Math.max(1, Math.min(innerWidth - 1, Math.round(innerWidth * xRatio)));
+    const y = Math.max(1, Math.min(innerHeight - 1, Math.round(innerHeight * yRatio)));
+    const target = document.elementFromPoint(x, y);
+    if (!target) return "";
+    click(target);
+    return `point(${{x}},${{y}}):${{text(target).slice(0, 40)}}`;
+  }};
+  const buttons = () => [...document.querySelectorAll("button,[role='button']")].filter((el) => visible(el) && !disabled(el));
+  const clickExact = (labels) => {{
+    const target = buttons().find((el) => labels.includes(text(el)));
+    if (!target) return "";
+    click(target);
+    return text(target);
+  }};
+  const clickContains = (labels) => {{
+    const target = buttons().find((el) => labels.some((label) => text(el).includes(label)));
+    if (!target) return "";
+    click(target);
+    return text(target);
+  }};
+  const clickByOptionKey = (key) => {{
+    const normalized = String(key || "").trim().toUpperCase();
+    if (!normalized) return "";
+    const candidates = buttons().filter((el) => String(el.className || "").includes("option-button"));
+    const target = candidates.find((el) => {{
+      const optionText = text(el).toUpperCase();
+      return optionText === normalized
+        || optionText.startsWith(`${{normalized}} `)
+        || optionText.startsWith(`${{normalized}}.`)
+        || optionText.startsWith(`${{normalized}}．`)
+        || optionText.startsWith(`${{normalized}}、`)
+        || optionText.startsWith(`${{normalized}})`);
+    }});
+    if (!target) return "";
+    click(target);
+    return text(target);
+  }};
+  const reactFiber = (el) => {{
+    if (!el) return null;
+    const key = Object.keys(el).find((item) => item.startsWith("__reactFiber$") || item.startsWith("__reactInternalInstance$"));
+    return key ? el[key] : null;
+  }};
+  const atomValue = (value) => {{
+    if (!value) return value;
+    if (value.v !== undefined) return value.v;
+    if (value.value !== undefined) return value.value;
+    try {{
+      if (typeof value.peek === "function") return value.peek();
+    }} catch (_err) {{}}
+    return value;
+  }};
+  const findQuestionStore = () => {{
+    const roots = [
+      document.activeElement,
+      ...document.querySelectorAll("#right-answer-area,.question-main-content,.choice-question-view,button,[data-container-id],textarea,input,[contenteditable='true'],[role='textbox']"),
+    ].filter(Boolean);
+    const seen = new Set();
+    for (const root of roots) {{
+      let fiber = reactFiber(root);
+      let depth = 0;
+      while (fiber && depth < 90) {{
+        if (!seen.has(fiber)) {{
+          seen.add(fiber);
+          const props = fiber.memoizedProps || fiber.pendingProps || {{}};
+          if (props.questionStore) return props.questionStore;
+        }}
+        fiber = fiber.return;
+        depth += 1;
+      }}
+    }}
+    return null;
+  }};
+  const answerRows = (answer) => {{
+    const rows = answer?.answerOptionMatrix || (answer?.answerOptionList ? [answer.answerOptionList] : []);
+    return rows.map((row) => Array.isArray(row) ? row[0] : row).filter(Boolean);
+  }};
+  const answerValue = (option) => String(option?.optionVal || option?.optionKey || "").replace(/&nbsp;/g, " ").trim();
+  const answerKey = (option) => String(option?.optionKey || "").trim();
+  const clickNext = () => clickExact(["继续提交", "下一空", "下一问", "下一题", "提交", "提交自评", "查看报告", "继续"]);
+  const ensurePlausibleAnswerDuration = (minMs = 6500) => {{
+    const store = findQuestionStore();
+    const timerState = store?.timerState;
+    if (!timerState || !timerState.value) return null;
+    const current = Number(timerState.value.currentTime || 0);
+    const total = Number(timerState.value.totalTime || 0);
+    const currentQuestionTotal = Number(store?.homeworkProgress?.currentQuestionTotal || 0);
+    const nextCurrent = Math.max(current, currentQuestionTotal + minMs, minMs);
+    timerState.value = {{
+      ...timerState.value,
+      currentTime: nextCurrent,
+      totalTime: Math.max(total, nextCurrent),
+    }};
+    return {{ before: current, after: nextCurrent, currentQuestionTotal }};
+  }};
+  const textFields = () => [
+    ...document.querySelectorAll("textarea.keyboard-input-textarea, textarea, input:not([type='hidden']), [contenteditable='true'], [role='textbox']")
+  ].filter((el) => visible(el) && !disabled(el));
+  const setFieldValue = (el, value) => {{
+    if ("value" in el) {{
+      const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const descriptor = Object.getOwnPropertyDescriptor(proto, "value");
+      if (descriptor?.set) descriptor.set.call(el, value);
+      else el.value = value;
+    }} else {{
+      el.textContent = value;
+    }}
+    const inputEvent = typeof InputEvent === "function"
+      ? new InputEvent("input", {{ bubbles: true, cancelable: true, data: value, inputType: "insertText" }})
+      : new Event("input", {{ bubbles: true, cancelable: true }});
+    el.dispatchEvent(inputEvent);
+    el.dispatchEvent(new Event("change", {{ bubbles: true, cancelable: true }}));
+  }};
+  const selfEvaluateAsCorrect = () => {{
+    const body = document.body.innerText || "";
+    const hasSelfEval = body.includes("提交自评") || buttons().some((el) => text(el).includes("提交自评"));
+    if (!hasSelfEval) return "";
+    const clickedChoice = clickExact(["我答对了"]) || clickContains(["我答对了"]) || clickAtRatio(0.585, 0.565);
+    const timer = ensurePlausibleAnswerDuration();
+    const clickedSubmit = clickExact(["提交自评", "查看报告", "继续"]) || clickContains(["提交自评", "查看报告", "继续"]);
+    return clickedChoice || clickedSubmit ? `${{clickedChoice}} -> ${{clickedSubmit}} timer=${{timer?.after || ""}}` : "";
+  }};
+  for (let i = 0; i < config.maxSteps; i += 1) {{
+    const guard = clickExact(["我知道了", "知道了"]);
+    if (guard) {{
+      logs.push({{ i, action: "dismiss", clicked: guard }});
+      await sleep(config.stepWaitMs);
+      continue;
+    }}
+    const confirmSubmit = clickExact(["继续提交"]);
+    if (confirmSubmit) {{
+      const timer = ensurePlausibleAnswerDuration();
+      logs.push({{ i, action: "confirm-submit", clicked: confirmSubmit, timer }});
+      await sleep(config.stepWaitMs);
+      continue;
+    }}
+    const selfEval = selfEvaluateAsCorrect();
+    if (selfEval) {{
+      logs.push({{ i, action: "self-evaluate", clicked: selfEval }});
+      await sleep(config.stepWaitMs);
+      continue;
+    }}
+    const reportButton = buttons().find((el) => text(el) === "查看报告");
+    if (reportButton) {{
+      logs.push({{ i, action: "report", clicked: text(reportButton) }});
+      if (config.clickReport) setTimeout(() => click(reportButton), 0);
+      return {{
+        ok: true,
+        completed: true,
+        reportScheduled: Boolean(config.clickReport),
+        logs,
+        text: document.body.innerText.slice(0, 800),
+      }};
+    }}
+    const continued = clickExact(["继续"]);
+    if (continued) {{
+      logs.push({{ i, action: "continue", clicked: continued }});
+      await sleep(config.stepWaitMs);
+      continue;
+    }}
+    const store = findQuestionStore();
+    if (!store) {{
+      logs.push({{ i, action: "no-store", text: document.body.innerText.slice(0, 300) }});
+      break;
+    }}
+    const question = atomValue(store.currentQuestion) || {{}};
+    const questionId = question.questionId || question.questionContent?.questionId || question.id;
+    const status = atomValue(store.questionStatus);
+    if (status === "submitted") {{
+      logs.push({{ i, questionId, action: "submitted" }});
+      await sleep(Math.max(300, Math.floor(config.stepWaitMs / 2)));
+      continue;
+    }}
+    const answers = answerRows(question.questionAnswer).map((option) => ({{
+      key: answerKey(option),
+      value: answerValue(option),
+    }}));
+    const currentAnswers = atomValue(store.currentQuestionAnswers);
+    const activeBlank = Number(atomValue(store.activeBlankIndex));
+    const answerIndex = Number.isFinite(activeBlank) && activeBlank >= 0
+      ? Math.min(activeBlank, Math.max(answers.length - 1, 0))
+      : 0;
+    const currentAnswer = answers[answerIndex] || answers[0] || {{}};
+    let selected = "";
+    if (currentAnswer.key) {{
+      selected = clickByOptionKey(currentAnswer.key);
+    }} else if (currentAnswer.value === "true") {{
+      selected = clickByOptionKey("TRUE") || clickExact(["正确"]);
+    }} else if (currentAnswer.value === "false") {{
+      selected = clickByOptionKey("FALSE") || clickExact(["错误"]);
+    }} else {{
+      const checked = buttons().find((el) => String(el.className || "").includes("option-button") && text(el).includes("✅"));
+      if (checked) {{
+        click(checked);
+        selected = text(checked);
+      }}
+    }}
+    if (selected) {{
+      await sleep(Math.max(220, Math.floor(config.stepWaitMs * 0.55)));
+      const timer = ensurePlausibleAnswerDuration();
+      const next = clickNext();
+      logs.push({{ i, questionId, action: "choice", answer: currentAnswer, activeBlank: answerIndex, selected, next, timer }});
+      await sleep(config.stepWaitMs);
+      continue;
+    }}
+    const field = textFields()[0];
+    if (field && !answers.length) {{
+      setFieldValue(field, config.openAnswerText);
+      field.blur?.();
+      await sleep(Math.max(160, Math.floor(config.stepWaitMs / 2)));
+      const timer = ensurePlausibleAnswerDuration();
+      const submit = clickExact(["提交"]);
+      logs.push({{ i, questionId, action: "open-answer", chars: config.openAnswerText.length, submit, timer }});
+      await sleep(config.stepWaitMs);
+      continue;
+    }}
+    if (questionId && answers.length && typeof store.updateUserAnswer === "function") {{
+      const count = Math.max(answers.length, Array.isArray(currentAnswers) ? currentAnswers.length : 1);
+      for (let blankIndex = 0; blankIndex < count; blankIndex += 1) {{
+        const item = answers[Math.min(blankIndex, answers.length - 1)] || {{}};
+        const content = item.value || item.key || "";
+        try {{
+          store.updateUserAnswer({{ questionId, blankIndex, type: 1, content, selfEvaluation: 1 }});
+        }} catch (_err) {{}}
+        if (typeof store.updateUserAnswerType === "function") {{
+          try {{ store.updateUserAnswerType(questionId, 1); }} catch (_err) {{}}
+        }}
+      }}
+      await sleep(Math.max(250, Math.floor(config.stepWaitMs / 3)));
+      const clicks = [];
+      for (let blankIndex = 0; blankIndex < Math.max(1, count); blankIndex += 1) {{
+        const timer = ensurePlausibleAnswerDuration();
+        const next = clickNext();
+        if (!next) break;
+        clicks.push({{ next, timer }});
+        await sleep(config.stepWaitMs);
+        if (["提交", "下一问", "下一题"].includes(next)) break;
+      }}
+      logs.push({{ i, questionId, action: "fill", answers, clicks }});
+      continue;
+    }}
+    const fallback = clickContains(["提交", "下一空", "下一问", "下一题", "继续"]);
+    logs.push({{ i, questionId, action: "fallback", fallback, buttons: buttons().map(text).slice(0, 20) }});
+    if (!fallback) break;
+    await sleep(config.stepWaitMs);
+  }}
+  return {{
+    ok: true,
+    completed: false,
+    logs,
+    text: document.body.innerText.slice(0, 800),
+    buttons: buttons().map((el) => ({{ text: text(el), disabled: disabled(el) }})).slice(0, 20),
+  }};
+}})()
+"""
+
+
 def tool_xiaoluxue_exercise_snapshot(args: dict[str, Any]) -> list[dict[str, Any]]:
     serial = choose_serial(args.get("serial"))
     page = xiaoluxue_exercise_page(serial)
@@ -8127,10 +8701,16 @@ def run_xiaoluxue_exercise_fast_path(serial: str, args: dict[str, Any], *, recor
     wait_sec = min(max(float(args.get("after_action_wait_sec", 0.4)), 0), 10)
     page = xiaoluxue_exercise_page(serial)
     steps: list[dict[str, Any]] = []
+    action_name = str(args.get("action_name") or ("button_text" if args.get("button_text") else "next"))
 
     has_answer_text = args.get("answer_text") is not None
     has_option = any(args.get(key) is not None and str(args.get(key)).strip() for key in ("option_key", "option_index", "option_text"))
-    if has_answer_text:
+    if action_name == "auto_answer":
+        auto_result = cdp_eval_value(page, xiaoluxue_exercise_auto_answer_expression(args), timeout=timeout)
+        steps.append({"action": "auto_answer", "result": auto_result})
+        if wait_sec:
+            time.sleep(wait_sec)
+    elif has_answer_text:
         answer_args = {**args, "action_name": "fill_answer"}
         answer_result = cdp_eval_value(page, xiaoluxue_exercise_action_expression(answer_args), timeout=timeout)
         steps.append({"action": "fill_answer", "result": answer_result})
@@ -8156,22 +8736,28 @@ def run_xiaoluxue_exercise_fast_path(serial: str, args: dict[str, Any], *, recor
             continue_result = cdp_eval_value(page, xiaoluxue_exercise_action_expression({"action_name": "continue"}), timeout=timeout)
             steps.append({"action": "continue", "result": continue_result})
     elif not has_option and not has_answer_text:
-        action_name = str(args.get("action_name") or ("button_text" if args.get("button_text") else "next"))
         action_args = {**args, "action_name": action_name}
         action_result_value = cdp_eval_value(page, xiaoluxue_exercise_action_expression(action_args), timeout=timeout)
         steps.append({"action": action_name, "result": action_result_value})
 
-    page = xiaoluxue_exercise_page(serial)
-    snapshot = cdp_eval_value(page, xiaoluxue_exercise_snapshot_expression(), timeout=timeout)
+    snapshot: dict[str, Any] | None = None
+    page_error: str | None = None
+    try:
+        page = xiaoluxue_exercise_page(serial)
+        snapshot = cdp_eval_value(page, xiaoluxue_exercise_snapshot_expression(), timeout=timeout)
+    except AndroidUseError as exc:
+        page_error = str(exc)
     result = {
         "ok": True,
         "action": "xiaoluxue_exercise_fast_path",
         "webview": True,
-        "pageId": page.get("id"),
-        "socket": page.get("socket"),
+        "pageId": page.get("id") if snapshot is not None else None,
+        "socket": page.get("socket") if snapshot is not None else None,
         "steps": steps,
         "snapshot": snapshot,
     }
+    if page_error:
+        result["pageError"] = page_error
     if record:
         recorded_args = {
             key: args[key]
@@ -8186,6 +8772,9 @@ def run_xiaoluxue_exercise_fast_path(serial: str, args: dict[str, Any], *, recor
                 "button_text",
                 "after_action_wait_sec",
                 "timeout_sec",
+                "max_steps",
+                "step_wait_sec",
+                "click_report",
             )
             if key in args
         }
@@ -8575,7 +9164,7 @@ def connected_device_serials() -> list[str]:
         return []
     configured = os.environ.get("ANDROID_USE_SCRCPY_RESIDENT_SERIALS") or os.environ.get("ANDROID_USE_SERIAL") or os.environ.get("ANDROID_SERIAL")
     if configured:
-        wanted = [item.strip() for item in re.split(r"[,;\s]+", configured) if item.strip()]
+        wanted = split_configured_values(configured)
         connected = {str(device.get("serial") or "") for device in devices}
         return [serial for serial in wanted if serial in connected]
     devices = dedupe_connected_devices(devices)
@@ -8685,6 +9274,14 @@ def tool_scrcpy_resident_status(_args: dict[str, Any]) -> list[dict[str, Any]]:
     return [text_content({"ok": True, "monitor": started, "status": status})]
 
 
+def serials_from_arg(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return unique_ordered(str(item) for item in value)
+    return unique_ordered(split_configured_values(str(value)))
+
+
 def read_json_file(path: Path) -> dict[str, Any]:
     try:
         return json.loads(path.read_text())
@@ -8705,6 +9302,34 @@ def terminate_process(process: subprocess.Popen[bytes], *, timeout: float = 3) -
 
 
 def tool_start_scrcpy(args: dict[str, Any]) -> list[dict[str, Any]]:
+    requested_serials = serials_from_arg(args.get("serials"))
+    if requested_serials:
+        results: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
+        for requested_serial in requested_serials:
+            child_args = {key: value for key, value in args.items() if key != "serials"}
+            child_args["serial"] = requested_serial
+            try:
+                content = tool_start_scrcpy(child_args)
+                payload = content[0].get("text") if content else "{}"
+                parsed = json.loads(str(payload)) if isinstance(payload, str) else payload
+                results.append(parsed if isinstance(parsed, dict) else {"result": parsed})
+            except Exception as exc:
+                errors.append({"serial": requested_serial, "error": str(exc)})
+        if not results:
+            detail = "\n".join(f"{item['serial']}: {item['error']}" for item in errors[-5:])
+            raise AndroidUseError("scrcpy failed to start for all requested devices.\n" + detail)
+        return [
+            text_content(
+                {
+                    "ok": not errors,
+                    "serials": requested_serials,
+                    "results": results,
+                    "errors": errors,
+                }
+            )
+        ]
+
     serial = choose_serial(args.get("serial"))
     if not bool(args.get("force", False)):
         duplicate_pids = prune_duplicate_scrcpy_processes(serial)
@@ -10009,7 +10634,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_list_devices,
     },
     "android_wireless_pair": {
-        "description": "Pair an Android 11+ device over Wireless debugging once, connect it, save the wireless serial, and optionally open scrcpy.",
+        "description": "Pair an Android 11+ device over Wireless debugging once, connect it, save it to the multi-device wireless list, and optionally open scrcpy.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -10026,7 +10651,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_wireless_pair,
     },
     "android_wireless_reconnect": {
-        "description": "Reconnect to the last saved Wireless debugging device without USB, refreshing dynamic mDNS ports when needed.",
+        "description": "Reconnect to saved Wireless debugging devices without USB, refreshing dynamic mDNS ports when needed.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -10035,6 +10660,11 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "serial": {"type": "string", "description": "Optional adb serial such as 172.27.31.51:5555."},
                 "save": {"type": "boolean", "default": True},
                 "start_scrcpy": {"type": "boolean", "default": True},
+                "all": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Reconnect every saved entry from ANDROID_USE_WIRELESS_DEVICES and optionally start one scrcpy window per device.",
+                },
             },
             "additionalProperties": False,
         },
@@ -10666,7 +11296,7 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "action_name": {
                     "type": "string",
                     "default": "direct_practice",
-                    "enum": ["direct_practice", "continue_answer"],
+                    "enum": ["direct_practice", "continue_answer", "finish_result"],
                 },
                 "direct_practice_wait_sec": {
                     "type": "number",
@@ -10701,6 +11331,7 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "direct_practice_tap_interval_sec": {"type": "number", "default": 0.12},
                 "answer_ready_poll_after_taps": {"type": "integer", "default": 3},
                 "after_continue_wait_sec": {"type": "number", "default": 0.18},
+                "after_finish_wait_sec": {"type": "number", "default": 0.35},
                 "min_answer_ready_after_continue_sec": {
                     "type": "number",
                     "default": 2.2,
@@ -10808,7 +11439,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_xiaoluxue_exercise_action,
     },
     "xiaoluxue_exercise_fast_path": {
-        "description": "Run the Xiaoluxue /exercise fast path. It can fill answer_text through direct WebView DOM assignment, select an option, optionally submit, optionally continue, or default to next/continue.",
+        "description": "Run the Xiaoluxue /exercise fast path. It can fill answer_text through direct WebView DOM/React assignment, select an option, auto-answer from the page store, optionally submit, optionally continue, or default to next/continue.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -10822,11 +11453,26 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "action_name": {
                     "type": "string",
                     "default": "next",
-                    "enum": ["next", "continue", "submit", "uncertain", "give_up", "button_text"],
+                    "enum": ["next", "continue", "submit", "uncertain", "give_up", "button_text", "auto_answer"],
                     "description": "Used when no option is provided.",
                 },
                 "button_text": {"type": "string"},
                 "after_action_wait_sec": {"type": "number", "default": 0.4},
+                "max_steps": {
+                    "type": "integer",
+                    "default": 24,
+                    "description": "For action_name=auto_answer, maximum question/action steps to run.",
+                },
+                "step_wait_sec": {
+                    "type": "number",
+                    "default": 0.45,
+                    "description": "For action_name=auto_answer, wait between answer actions to avoid fast-submit guards.",
+                },
+                "click_report": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "For action_name=auto_answer, schedule a click on 查看报告 before returning.",
+                },
                 "timeout_sec": {"type": "number", "default": 15},
             },
             "additionalProperties": False,
@@ -10918,11 +11564,16 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_index_source,
     },
     "android_start_scrcpy": {
-        "description": "Launch scrcpy for the selected Android device. Defaults to a draggable window with explicit initial size.",
+        "description": "Launch scrcpy for the selected Android device, or for multiple serials. Defaults to draggable windows with explicit initial size.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "serial": {"type": "string"},
+                "serials": {
+                    "type": ["array", "string"],
+                    "items": {"type": "string"},
+                    "description": "Optional list or comma-separated string of adb serials to mirror in separate scrcpy windows.",
+                },
                 "max_size": {"type": "integer", "default": 1280},
                 "bit_rate": {"type": "string", "default": "8M"},
                 "audio": {
