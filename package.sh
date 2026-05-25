@@ -24,11 +24,15 @@ zip -r "$OUT" "$NAME" \
   -x "$NAME/.screen/*" \
   -x "$NAME/Library/*" \
   -x "$NAME/tools/*" \
+  -x "$NAME/.codex/*" \
   -x "$NAME/__pycache__/*" \
   -x "$NAME/scripts/__pycache__/*" \
   -x "$NAME/skills/*/__pycache__/*" \
   -x "$NAME/dist/*" \
   -x "$NAME/.DS_Store" \
+  -x "$NAME/*/.DS_Store" \
+  -x "$NAME/*/*/.DS_Store" \
+  -x "$NAME/*/*/*/.DS_Store" \
   >/dev/null
 
 echo "已生成：$OUT"

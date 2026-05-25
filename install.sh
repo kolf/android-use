@@ -142,6 +142,7 @@ items = [
     ".mcp.json",
     "README.md",
     "scripts",
+    "macos",
     "skills",
     "assets",
     "docs",
@@ -209,7 +210,7 @@ install_or_update_plugin() {
   fi
   info "Git clone failed, installing from local checkout"
   mkdir -p "$INSTALL_DIR"
-  for item in .codex-plugin .mcp.json README.md scripts skills assets docs install.sh doctor.sh marketplace-entry.json marketplace.example.json .gitignore; do
+  for item in .codex-plugin .mcp.json README.md scripts macos skills assets docs install.sh doctor.sh marketplace-entry.json marketplace.example.json .gitignore; do
     if [ -e "$SOURCE_DIR/$item" ]; then
       cp -R "$SOURCE_DIR/$item" "$INSTALL_DIR/"
     fi

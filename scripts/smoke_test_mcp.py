@@ -48,10 +48,12 @@ def main() -> int:
             "android_list_devices",
             "android_screenshot",
             "android_show_screen",
+            "android_appshot",
             "android_start_screen_viewer",
             "android_start_webrtc_viewer",
             "android_agent_step",
             "android_start_scrcpy",
+            "android_start_scrcpy_app",
             "android_wireless_pair",
             "android_wireless_reconnect",
         }

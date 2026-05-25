@@ -217,13 +217,25 @@ cd ~/plugins/android-use-plugins
 [@Android] 列出设备
 [@Android] 打开并截图
 [@Android] 显示当前 Android 屏幕
+[@Android] 生成当前 Android AppShot
 ```
 
 正常情况下，插件会识别到 adb 设备，并弹出一个 scrcpy 桌面窗口。
 
+## AppShot 证据快照
+
+`android_appshot` 会一次性返回当前 Android 设备的截图、设备状态和 UIAutomator 控件树，适合给 Codex 做自动化测试、Bug 复现和验收证据。默认会把 PNG 和 JSON 保存到 `.screen/appshots/`，同时把截图作为工具结果返回给 Codex。
+
+常用参数：
+
+- `include_xml=true`：额外保存原始 UIAutomator XML；
+- `include_image=false`：只返回 JSON，不在工具结果里附带图片；
+- `save=false`：只返回本次结果，不写入 `.screen/appshots/`；
+- `strict_ui=true`：UIAutomator 失败时直接报错。默认情况下即使控件树抓取失败，也会返回截图和设备状态。
+
 ## scrcpy 窗口说明
 
-插件默认会使用 scrcpy 打开一个桌面镜像窗口。
+插件默认会通过原生 macOS `.app` wrapper 启动 scrcpy 桌面镜像窗口，保证 Codex Attach/AppShot 识别到稳定的 app 名称、bundle id 和 Android 图标。不要直接裸启动 scrcpy 可见窗口。
 
 默认行为：
 
@@ -231,10 +243,14 @@ cd ~/plugins/android-use-plugins
 - 同一个设备只保留一个 scrcpy 窗口；
 - `ANDROID_USE_SCRCPY_RESIDENT_SERIALS` 写入多个序列号时，会为每台已连接设备分别保活一个 scrcpy 窗口；
 - 不会自动启动 WebRTC；
-- 窗口稳定显示后，如果用户手动关闭，插件会尊重这次关闭；
-- 下一次调用 Android 插件工具时，再重新弹出窗口；
+- 自动弹窗、`android_start_scrcpy`、`android_start_scrcpy_app`、无线调试 `start_scrcpy=true`、resident monitor 都走同一个 `.app` wrapper 启动路径；
+- 只复用 bundle id 为 `com.kolf.android-use` 的窗口；发现旧的裸 scrcpy/supervisor 窗口会先关闭再重开；
+- 窗口稳定显示后，如果用户手动关闭，插件会尽量尊重这次关闭；
+- 下一次调用 Android 插件工具时，再重新弹出 `.app` wrapper 窗口；
 - 默认关闭音频，降低资源占用；
 - 默认启用文字输入优化。
+
+`.app` wrapper 的 bundle id 是 `com.kolf.android-use`，并使用 Android 图标与 software renderer 打开 scrcpy。窗口标题和 macOS app 显示名默认使用设备名称，例如 `荣耀平板Z6`；取不到设备名称时使用型号，最后回退到 `Android`。默认初始窗口大小是当前设备截图尺寸的 1/2，例如横屏 `2000 x 1200` 会以 `1000 x 600` 打开；这只影响启动窗口大小，不降低 scrcpy 视频流分辨率，也不会持续锁定窗口。
 
 如果不想让工具调用时自动弹出 scrcpy：
 
@@ -431,7 +447,7 @@ export ANDROID_USE_SERIAL=设备序列号
 export ANDROID_USE_SCRCPY_RESIDENT_SERIALS=设备1序列号,设备2序列号
 ```
 
-也可以直接调用 `android_start_scrcpy`，传入 `serials` 列表，让每台设备各开一个 scrcpy 窗口。
+也可以直接调用 `android_start_scrcpy`，传入 `serials` 列表，让每台设备各开一个 `.app` wrapper scrcpy 窗口。
 
 ### 可以不用 USB 线吗
 
@@ -443,7 +459,7 @@ export ANDROID_USE_SCRCPY_RESIDENT_SERIALS=设备1序列号,设备2序列号
 android_wireless_reconnect(all=true, start_scrcpy=true)
 ```
 
-这样会批量重连已保存的无线设备，并为每台设备启动一个 scrcpy 投屏窗口。
+这样会批量重连已保存的无线设备，并为每台设备启动一个 `.app` wrapper scrcpy 投屏窗口。
 
 ### WebRTC 要不要开
 

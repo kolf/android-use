@@ -33,6 +33,7 @@ from typing import Any, Iterable, Iterator
 
 SERVER_NAME = "android-use"
 SERVER_VERSION = "0.1.0"
+ANDROID_USE_BUNDLE_ID = "com.kolf.android-use"
 DEFAULT_TIMEOUT = 30
 TMP_DIR = Path(os.environ.get("ANDROID_USE_TMP_DIR", "/tmp/android-use"))
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
@@ -2729,6 +2730,78 @@ def tool_show_screen(args: dict[str, Any]) -> list[dict[str, Any]]:
         ),
         image_content(png),
     ]
+
+
+def appshot_save_paths(serial: str, save_dir: str | None = None) -> tuple[Path, Path]:
+    if save_dir:
+        directory = Path(save_dir).expanduser()
+    else:
+        directory = SCREEN_DIR / "appshots"
+    safe_serial = slugify(serial, default="device")
+    stem = f"appshot-{safe_serial}-{int(time.time() * 1000)}"
+    return directory / f"{stem}.json", directory / f"{stem}.png"
+
+
+def tool_appshot(args: dict[str, Any]) -> list[dict[str, Any]]:
+    serial = choose_serial(args.get("serial"))
+    include_xml = bool(args.get("include_xml", False))
+    include_image = bool(args.get("include_image", True))
+    strict_ui = bool(args.get("strict_ui", False))
+    save = bool(args.get("save", True))
+    limit = max(20, min(int(args.get("limit", 220)), 500))
+
+    captured_at = timestamp_iso()
+    png = screenshot_png(serial)
+    screenshot = {
+        "mime_type": "image/png",
+        "bytes": len(png),
+        "screen": png_size(png),
+    }
+
+    try:
+        observation = observe_ui(serial, include_xml=include_xml, limit=limit)
+        state = observation.get("state") or device_state(serial)
+        ui = observation.get("ui", {})
+        ui_error = None
+    except Exception as exc:
+        if strict_ui:
+            raise
+        try:
+            state = device_state(serial)
+        except Exception as state_exc:
+            state = {"serial": serial, "error": str(state_exc)}
+        ui = {"nodes": [], "count": 0}
+        ui_error = str(exc)
+
+    payload: dict[str, Any] = {
+        "ok": True,
+        "kind": "android_appshot",
+        "version": 1,
+        "serial": serial,
+        "captured_at": captured_at,
+        "state": state,
+        "screenshot": screenshot,
+        "ui": ui,
+        "image_attached": include_image,
+        "display": "Android appshot includes a screenshot plus device state and UI tree for Codex evidence.",
+    }
+    if ui_error:
+        payload["ui_error"] = ui_error
+
+    if save:
+        json_path, png_path = appshot_save_paths(serial, args.get("save_dir") if args.get("save_dir") else None)
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        png_path.write_bytes(png)
+        payload["paths"] = {
+            "json": str(json_path),
+            "png": str(png_path),
+        }
+        json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+
+    content = [text_content(payload)]
+    if include_image:
+        content.append(image_content(png))
+    return content
 
 
 def tool_observe(args: dict[str, Any]) -> list[dict[str, Any]]:
@@ -8979,15 +9052,48 @@ def tool_index_source(args: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def clean_device_title(value: str | None) -> str | None:
+    cleaned = str(value or "").strip()
+    if not cleaned or cleaned.lower() == "null":
+        return None
+    return cleaned
+
+
+def get_android_setting(serial: str, namespace: str, key: str) -> str | None:
+    try:
+        return shell(serial, f"settings get {namespace} {key}", timeout=5)
+    except AndroidUseError:
+        return None
+
+
+def android_device_display_name(serial: str) -> str:
+    candidates = [
+        clean_device_title(get_android_setting(serial, "global", "device_name")),
+        clean_device_title(get_prop(serial, "ro.product.model")),
+    ]
+    for candidate in candidates:
+        if candidate:
+            return candidate
+    return "Android"
+
+
 def build_scrcpy_command(args: dict[str, Any], serial: str) -> tuple[list[str], int | None, int | None, str]:
     command = [scrcpy_binary(), "--serial", serial]
     max_size = int(args.get("max_size", 1280))
     window_width = args.get("window_width")
     window_height = args.get("window_height")
-    window_title = str(args.get("window_title") or f"Android {serial}")
+    window_scale = args.get("window_scale")
+    window_title = str(args.get("window_title") or android_device_display_name(serial))
     keyboard_mode = str(args.get("keyboard") or "sdk").strip().lower()
     if keyboard_mode not in {"disabled", "sdk", "uhid", "aoa"}:
         raise AndroidUseError("keyboard must be one of: disabled, sdk, uhid, aoa.")
+    if window_scale is not None:
+        try:
+            window_scale = float(window_scale)
+        except (TypeError, ValueError) as exc:
+            raise AndroidUseError("window_scale must be a positive number.") from exc
+        if window_scale <= 0:
+            raise AndroidUseError("window_scale must be a positive number.")
     command.extend(["--window-title", window_title])
     command.extend(["--keyboard", keyboard_mode])
     if args.get("prefer_text", True) and keyboard_mode == "sdk":
@@ -9018,6 +9124,8 @@ def build_scrcpy_command(args: dict[str, Any], serial: str) -> tuple[list[str], 
                 longest_side = max(screen_width, screen_height)
                 if max_size and longest_side > max_size:
                     scale = max_size / longest_side
+                if window_scale is not None:
+                    scale *= window_scale
                 window_width = window_width or max(1, round(screen_width * scale))
                 window_height = window_height or max(1, round(screen_height * scale))
         if window_width:
@@ -9029,6 +9137,127 @@ def build_scrcpy_command(args: dict[str, Any], serial: str) -> tuple[list[str], 
         raise AndroidUseError("extra_args must be a list of scrcpy command arguments.")
     command.extend(str(item) for item in extra_args)
     return command, int(window_width) if window_width else None, int(window_height) if window_height else None, window_title
+
+
+def macos_app_name(value: str | None) -> str:
+    cleaned = re.sub(r"[\0/:]+", "-", str(value or "").strip()).strip(" .")
+    return cleaned[:80] or "Android"
+
+
+def android_scrcpy_app_path(args: dict[str, Any] | None = None, app_name: str | None = None) -> Path:
+    args = args or {}
+    if args.get("app_path"):
+        return Path(str(args["app_path"])).expanduser()
+    configured = os.environ.get("ANDROID_USE_SCRCPY_APP_PATH")
+    if configured:
+        return Path(configured).expanduser()
+    return ANDROID_USE_DIR / f"{macos_app_name(app_name)}.app"
+
+
+def build_android_scrcpy_app(app_path: Path, app_name: str = "Android") -> Path:
+    if sys.platform != "darwin":
+        raise AndroidUseError("Android Use macOS app launch is only available on macOS.")
+    builder = PLUGIN_ROOT / "scripts" / "build_android_scrcpy_app.sh"
+    if not builder.exists():
+        raise AndroidUseError(f"Android Use app builder not found: {builder}")
+    stdout, _stderr = run_command([str(builder), str(app_path), macos_app_name(app_name)], timeout=30)
+    built_path = Path(decode_bytes(stdout).splitlines()[-1]).expanduser()
+    return built_path
+
+
+def build_scrcpy_app_launch_command(command: list[str], app_path: Path) -> list[str]:
+    return ["open", "-na", str(app_path), "--args", "--scrcpy", command[0], *command[1:]]
+
+
+def launch_android_scrcpy_app(command: list[str], app_path: Path) -> subprocess.CompletedProcess[bytes]:
+    launch_command = build_scrcpy_app_launch_command(command, app_path)
+    try:
+        return subprocess.run(
+            launch_command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=8,
+            check=False,
+            env=tool_env(),
+        )
+    except FileNotFoundError as exc:
+        raise AndroidUseError("Command not found: open") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise AndroidUseError("Timed out launching Android Use macOS app.") from exc
+
+
+def latest_scrcpy_visible_process(serial: str) -> dict[str, Any] | None:
+    rows = scrcpy_app_wrapper_processes_for_serial(serial)
+    if not rows:
+        return None
+    rows.sort(key=lambda row: int(row.get("pid") or 0), reverse=True)
+    return rows[0]
+
+
+def start_scrcpy_app_window(args: dict[str, Any], serial: str) -> dict[str, Any]:
+    child_args = dict(args)
+    child_args.setdefault("window_title", android_device_display_name(serial))
+    app_name = str(child_args["window_title"])
+    app_path = build_android_scrcpy_app(android_scrcpy_app_path(args, app_name), app_name)
+    child_args.setdefault("max_size", 0)
+    child_args.setdefault("window_scale", 0.5)
+    child_args.setdefault("render_driver", "software")
+    extra_args = list(child_args.get("extra_args") or [])
+    if child_args.get("render_driver") and "--render-driver" not in extra_args:
+        extra_args.extend(["--render-driver", str(child_args["render_driver"])])
+    child_args["extra_args"] = extra_args
+    child_args.setdefault("fixed_window", True)
+    command, _window_width, _window_height, window_title = build_scrcpy_command(child_args, serial)
+    launch_command = build_scrcpy_app_launch_command(command, app_path)
+    result = launch_android_scrcpy_app(command, app_path)
+    if result.returncode != 0:
+        stderr = decode_bytes(result.stderr)
+        stdout = decode_bytes(result.stdout)
+        raise AndroidUseError(f"Android Use macOS app failed to launch.\n{stderr or stdout}")
+    time.sleep(0.8)
+    visible = latest_scrcpy_visible_process(serial)
+    return {
+        "ok": True,
+        "serial": serial,
+        "pid": visible.get("pid") if visible else None,
+        "scrcpy_pid": visible.get("pid") if visible else None,
+        "app_path": str(app_path),
+        "bundle_id": ANDROID_USE_BUNDLE_ID,
+        "app_name": app_name,
+        "window_title": window_title,
+        "command": command,
+        "launch_command": launch_command,
+        "keep_alive": False,
+        "launch_mode": "macos_app",
+        "display": "scrcpy is running through the native macOS app wrapper.",
+    }
+
+
+def tool_start_scrcpy_app(args: dict[str, Any]) -> list[dict[str, Any]]:
+    serial = choose_serial(args.get("serial"))
+    if not bool(args.get("force", False)):
+        duplicate_pids = prune_duplicate_scrcpy_processes(serial)
+        existing = scrcpy_app_wrapper_process_for_serial(serial)
+        if existing:
+            clear_scrcpy_user_closed(serial)
+            return [
+                text_content(
+                    {
+                        "ok": True,
+                        "serial": serial,
+                        "skipped": "already-running",
+                        "process": existing[:500],
+                        "stopped_duplicate_pids": duplicate_pids,
+                        "launch_mode": "macos_app",
+                        "display": "scrcpy app-wrapper window is already running for this device.",
+                    }
+                )
+            ]
+    clear_scrcpy_user_closed(serial)
+    payload = start_scrcpy_app_window(args, serial)
+    return [
+        text_content(payload)
+    ]
 
 
 def host_process_lines() -> list[str]:
@@ -9079,17 +9308,49 @@ def scrcpy_visible_process_for_serial(serial: str) -> str | None:
     return None
 
 
-def prune_duplicate_scrcpy_processes(serial: str) -> list[int]:
-    rows = scrcpy_visible_processes_for_serial(serial)
-    supervisors = [row for row in rows if "scrcpy_supervisor.py" in str(row.get("command") or "")]
-    if len(supervisors) <= 1:
-        return []
-    supervisors.sort(key=lambda row: int(row["pid"]), reverse=True)
-    keep_pid = int(supervisors[0]["pid"])
+def macos_bundle_identifier_for_pid(pid: int) -> str | None:
+    if sys.platform != "darwin":
+        return None
+    script = f'tell application "System Events" to get bundle identifier of first application process whose unix id is {int(pid)}'
+    try:
+        stdout, _stderr = run_command(["osascript", "-e", script], timeout=3)
+    except AndroidUseError:
+        return None
+    bundle_id = decode_bytes(stdout).strip()
+    if not bundle_id or bundle_id == "missing value":
+        return None
+    return bundle_id
+
+
+def is_android_use_app_process(row: dict[str, Any]) -> bool:
+    try:
+        pid = int(row.get("pid") or 0)
+    except (TypeError, ValueError):
+        return False
+    return macos_bundle_identifier_for_pid(pid) == ANDROID_USE_BUNDLE_ID
+
+
+def scrcpy_app_wrapper_processes_for_serial(serial: str) -> list[dict[str, Any]]:
+    return [row for row in scrcpy_visible_processes_for_serial(serial) if is_android_use_app_process(row)]
+
+
+def scrcpy_app_wrapper_process_for_serial(serial: str) -> str | None:
+    rows = scrcpy_app_wrapper_processes_for_serial(serial)
+    if not rows:
+        return None
+    rows.sort(key=lambda row: int(row.get("pid") or 0), reverse=True)
+    row = rows[0]
+    return f"{row.get('pid')} {row.get('command')}"
+
+
+def stop_host_process_rows(rows: Iterable[dict[str, Any]]) -> list[int]:
     stopped: list[int] = []
-    for row in supervisors[1:]:
-        pid = int(row["pid"])
-        if pid == keep_pid:
+    for row in rows:
+        try:
+            pid = int(row.get("pid") or 0)
+        except (TypeError, ValueError):
+            continue
+        if pid <= 0:
             continue
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.kill(pid, 15)
@@ -9097,6 +9358,18 @@ def prune_duplicate_scrcpy_processes(serial: str) -> list[int]:
     if stopped:
         time.sleep(0.2)
     return stopped
+
+
+def prune_duplicate_scrcpy_processes(serial: str) -> list[int]:
+    rows = scrcpy_visible_processes_for_serial(serial)
+    if not rows:
+        return []
+    app_rows = [row for row in rows if is_android_use_app_process(row)]
+    if not app_rows:
+        return stop_host_process_rows(rows)
+    app_rows.sort(key=lambda row: int(row.get("pid") or 0), reverse=True)
+    keep_pid = int(app_rows[0].get("pid") or 0)
+    return stop_host_process_rows(row for row in rows if int(row.get("pid") or 0) != keep_pid)
 
 
 def ensure_default_scrcpy_window(serial: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -9107,7 +9380,7 @@ def ensure_default_scrcpy_window(serial: str, args: dict[str, Any]) -> dict[str,
         if not locked:
             return {"ok": False, "error": "could not acquire scrcpy launch lock"}
         duplicate_pids = prune_duplicate_scrcpy_processes(serial)
-        existing = scrcpy_visible_process_for_serial(serial)
+        existing = scrcpy_app_wrapper_process_for_serial(serial)
         if existing:
             if not bool(args.get("respect_manual_close", False)):
                 clear_scrcpy_user_closed(serial)
@@ -9136,7 +9409,9 @@ def ensure_default_scrcpy_window(serial: str, args: dict[str, Any]) -> dict[str,
                     "lock_window_size": args.get("scrcpy_lock_window_size", True),
                     "window_width": args.get("scrcpy_window_width"),
                     "window_height": args.get("scrcpy_window_height"),
-                    "max_size": args.get("scrcpy_max_size", 1280),
+                    "max_size": args.get("scrcpy_max_size", 0),
+                    "window_scale": args.get("scrcpy_window_scale", 0.5),
+                    "render_driver": args.get("scrcpy_render_driver", "software"),
                 }
             )
             payload = content[0].get("text") if content else "{}"
@@ -9185,7 +9460,9 @@ def ensure_resident_scrcpy_windows() -> dict[str, Any]:
                 "scrcpy_keep_alive": True,
                 "scrcpy_fixed_window": True,
                 "scrcpy_lock_window_size": True,
-                "scrcpy_max_size": 1280,
+                "scrcpy_max_size": 0,
+                "scrcpy_window_scale": 0.5,
+                "scrcpy_render_driver": "software",
                 "respect_manual_close": True,
             },
         )
@@ -9333,7 +9610,7 @@ def tool_start_scrcpy(args: dict[str, Any]) -> list[dict[str, Any]]:
     serial = choose_serial(args.get("serial"))
     if not bool(args.get("force", False)):
         duplicate_pids = prune_duplicate_scrcpy_processes(serial)
-        existing = scrcpy_visible_process_for_serial(serial)
+        existing = scrcpy_app_wrapper_process_for_serial(serial)
         if existing:
             clear_scrcpy_user_closed(serial)
             return [
@@ -9344,140 +9621,28 @@ def tool_start_scrcpy(args: dict[str, Any]) -> list[dict[str, Any]]:
                         "skipped": "already-running",
                         "process": existing[:500],
                         "stopped_duplicate_pids": duplicate_pids,
-                        "display": "scrcpy is already running for this device.",
+                        "launch_mode": "macos_app",
+                        "display": "scrcpy app-wrapper window is already running for this device.",
                     }
                 )
             ]
-    command, window_width, window_height, window_title = build_scrcpy_command(args, serial)
     clear_scrcpy_user_closed(serial)
-
-    SCREEN_DIR.mkdir(parents=True, exist_ok=True)
-    log_path = SCREEN_DIR / "scrcpy.log"
-    keep_alive = bool(args.get("keep_alive", True))
-    ready_path = SCREEN_DIR / f"scrcpy-{uuid.uuid4().hex}.ready.json"
-    user_closed_path = scrcpy_user_closed_path(serial)
-    launch_command = command
-    if keep_alive:
-        supervisor_script = PLUGIN_ROOT / "scripts" / "scrcpy_supervisor.py"
-        if not supervisor_script.exists():
-            raise AndroidUseError(f"scrcpy supervisor script not found: {supervisor_script}")
-        launch_command = [
-            sys.executable,
-            str(supervisor_script),
-            "--ready-file",
-            str(ready_path),
-            "--ready-after-sec",
-            "0.8",
-            "--early-exit-sec",
-            "2.0",
-            "--manual-exit-after-sec",
-            "2.0",
-            "--max-early-restarts",
-            "3",
-            "--restart-delay-sec",
-            "0.7",
-            "--user-closed-file",
-            str(user_closed_path),
-            "--",
-            *command,
-        ]
-    log_handle = log_path.open("ab")
-    try:
-        process = subprocess.Popen(
-            launch_command,
-            stdout=log_handle,
-            stderr=log_handle,
-            env=tool_env(),
-            start_new_session=True,
-        )
-    except FileNotFoundError as exc:
-        log_handle.close()
-        raise AndroidUseError(f"Command not found: {launch_command[0]}") from exc
-    log_handle.close()
-    startup_deadline = time.monotonic() + (4 if keep_alive else 0.8)
-    while time.monotonic() < startup_deadline:
-        if process.poll() is not None:
-            break
-        if not keep_alive or ready_path.exists():
-            break
-        time.sleep(0.1)
-    if process.poll() is not None or (keep_alive and not ready_path.exists()):
-        if process.poll() is None:
-            terminate_process(process)
-        log_text = log_path.read_text(errors="replace") if log_path.exists() else ""
-        raise AndroidUseError(f"scrcpy failed to start.\n{log_text[-2000:]}")
-    SCRCPY_PROCESSES[process.pid] = process
-    ready_state = read_json_file(ready_path) if keep_alive else {}
-
-    lock_pid = None
-    lock_error = None
-    lock_log_path = SCREEN_DIR / "scrcpy-window-lock.log"
-    should_lock_size = bool(args.get("lock_window_size", True)) and window_width is not None and window_height is not None
-    if should_lock_size and not args.get("borderless", False):
-        lock_script = PLUGIN_ROOT / "scripts" / "scrcpy_window_lock.py"
-        lock_continuous = bool(args.get("lock_window_continuous", False))
-        lock_command = [
-            sys.executable,
-            str(lock_script),
-            "--process-name",
-            "scrcpy",
-            "--window-title",
-            window_title,
-            "--width",
-            str(int(window_width)),
-            "--height",
-            str(int(window_height)),
-            "--max-successes",
-            "0" if lock_continuous else "1",
-        ]
-        lock_log_handle = lock_log_path.open("ab")
-        try:
-            lock_process = subprocess.Popen(
-                lock_command,
-                stdout=lock_log_handle,
-                stderr=lock_log_handle,
-                env=tool_env(),
-                start_new_session=True,
-            )
-            lock_log_handle.close()
-            time.sleep(0.4)
-            if lock_process.poll() is None:
-                SCRCPY_LOCK_PROCESSES[lock_process.pid] = lock_process
-                lock_pid = lock_process.pid
-            else:
-                lock_output = lock_log_path.read_text(errors="replace")[-2000:] if lock_log_path.exists() else ""
-                if "max-successes-reached" not in lock_output:
-                    lock_error = lock_output or "lock process exited"
-        except Exception as exc:
-            lock_log_handle.close()
-            lock_error = str(exc)
-
-    return [
-        text_content(
-            {
-                "ok": True,
-                "serial": serial,
-                "pid": process.pid,
-                "scrcpy_pid": ready_state.get("pid") if keep_alive else process.pid,
-                "keep_alive": keep_alive,
-                "window_title": window_title,
-                "command": command,
-                "launch_command": launch_command,
-                "log_path": str(log_path),
-                "user_closed_path": str(user_closed_path) if keep_alive else None,
-                "lock_pid": lock_pid,
-                "lock_log_path": str(lock_log_path) if should_lock_size else None,
-                "lock_error": lock_error,
-                "display": "scrcpy is running as a detached desktop window.",
-            }
-        )
-    ]
+    child_args = dict(args)
+    child_args.setdefault("max_size", 0)
+    child_args.setdefault("window_scale", 0.5)
+    child_args.setdefault("render_driver", "software")
+    payload = start_scrcpy_app_window(child_args, serial)
+    payload["requested_keep_alive"] = bool(args.get("keep_alive", True))
+    payload["keep_alive"] = False
+    payload["keep_alive_note"] = "Visible scrcpy windows are always launched through the macOS app wrapper; resident/on-demand checks reopen the app when needed."
+    return [text_content(payload)]
 
 
 AUTO_SCRCPY_TOOL_NAMES = {
     "android_get_state",
     "android_screenshot",
     "android_show_screen",
+    "android_appshot",
     "android_observe",
     "android_tap_text",
     "android_tap",
@@ -9520,7 +9685,9 @@ def maybe_show_scrcpy_for_tool_call(name: str, arguments: dict[str, Any]) -> Non
                 "scrcpy_keep_alive": arguments.get("scrcpy_keep_alive", True),
                 "scrcpy_fixed_window": arguments.get("scrcpy_fixed_window", True),
                 "scrcpy_lock_window_size": arguments.get("scrcpy_lock_window_size", True),
-                "scrcpy_max_size": arguments.get("scrcpy_max_size", 1280),
+                "scrcpy_max_size": arguments.get("scrcpy_max_size", 0),
+                "scrcpy_window_scale": arguments.get("scrcpy_window_scale", 0.5),
+                "scrcpy_render_driver": arguments.get("scrcpy_render_driver", "software"),
             },
         )
         update_resident_scrcpy_status(last_on_demand_result={"tool": name, "serial": serial, **result})
@@ -9535,13 +9702,27 @@ def tool_stop_scrcpy(args: dict[str, Any]) -> list[dict[str, Any]]:
         pids = [int(requested_pid)]
     elif args.get("all", True):
         pids = list(SCRCPY_PROCESSES)
+        for row in host_process_rows():
+            command = str(row.get("command") or "")
+            is_visible = re.search(r"(^|\s)(?:\S*/)?scrcpy(\s|$)", command) is not None and "--no-window" not in command
+            if is_visible and "android_webrtc_viewer.py" not in command:
+                pids.append(int(row["pid"]))
     else:
         pids = []
 
+    seen_pids: set[int] = set()
     for pid in pids:
+        pid = int(pid)
+        if pid in seen_pids:
+            continue
+        seen_pids.add(pid)
         process = SCRCPY_PROCESSES.pop(pid, None)
         if process and terminate_process(process):
             stopped.append(pid)
+        elif not process:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(pid, 15)
+                stopped.append(pid)
     lock_stopped: list[int] = []
     for pid, process in list(SCRCPY_LOCK_PROCESSES.items()):
         if terminate_process(process):
@@ -10705,6 +10886,35 @@ TOOLS: dict[str, dict[str, Any]] = {
         },
         "handler": tool_show_screen,
     },
+    "android_appshot": {
+        "description": "Capture a Codex-friendly Android appshot: screenshot, device state, and UIAutomator nodes in one evidence bundle.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "serial": {"type": "string"},
+                "include_xml": {"type": "boolean", "default": False},
+                "include_image": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Attach the PNG image inline in the tool result.",
+                },
+                "save": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Save the appshot JSON and PNG under .screen/appshots or save_dir.",
+                },
+                "save_dir": {"type": "string", "description": "Optional directory for saved appshot JSON and PNG files."},
+                "strict_ui": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Fail the tool if UIAutomator cannot return nodes. By default the screenshot is still returned.",
+                },
+                "limit": {"type": "integer", "default": 220},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_appshot,
+    },
     "android_observe": {
         "description": "Observe the Android screen using UIAutomator, returning device state and visible UI nodes; optionally include screenshot/XML.",
         "inputSchema": {
@@ -11564,7 +11774,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_index_source,
     },
     "android_start_scrcpy": {
-        "description": "Launch scrcpy for the selected Android device, or for multiple serials. Defaults to draggable windows with explicit initial size.",
+        "description": "Launch scrcpy for the selected Android device, or for multiple serials, always through the native macOS app wrapper for AppShot compatibility.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -11574,7 +11784,12 @@ TOOLS: dict[str, dict[str, Any]] = {
                     "items": {"type": "string"},
                     "description": "Optional list or comma-separated string of adb serials to mirror in separate scrcpy windows.",
                 },
-                "max_size": {"type": "integer", "default": 1280},
+                "app_path": {"type": "string", "description": "Optional output path for the generated Android app wrapper."},
+                "max_size": {
+                    "type": "integer",
+                    "default": 0,
+                    "description": "scrcpy max video size. 0 keeps the device stream at its native size.",
+                },
                 "bit_rate": {"type": "string", "default": "8M"},
                 "audio": {
                     "type": "boolean",
@@ -11602,7 +11817,7 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "keep_alive": {
                     "type": "boolean",
                     "default": True,
-                    "description": "Retry startup-time scrcpy exits. Manual window closes after startup are respected until the next Android tool call.",
+                    "description": "Accepted for compatibility. Visible windows are launched through the macOS app wrapper; resident/on-demand checks reopen the app when needed.",
                 },
                 "fixed_window": {
                     "type": "boolean",
@@ -11620,7 +11835,7 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "lock_window_size": {
                     "type": "boolean",
                     "default": True,
-                    "description": "Use macOS accessibility automation to keep the draggable scrcpy window at the requested size.",
+                    "description": "Accepted for compatibility. App-wrapper windows use scrcpy's initial window size instead of a separate lock helper.",
                 },
                 "lock_window_continuous": {
                     "type": "boolean",
@@ -11628,6 +11843,16 @@ TOOLS: dict[str, dict[str, Any]] = {
                     "description": "Keep enforcing the scrcpy window size continuously. Disabled by default so the helper does not interfere with keyboard focus.",
                 },
                 "window_title": {"type": "string"},
+                "window_scale": {
+                    "type": "number",
+                    "default": 0.5,
+                    "description": "Initial window scale when window_width/window_height are not provided. Does not resize the scrcpy video stream.",
+                },
+                "render_driver": {
+                    "type": "string",
+                    "default": "software",
+                    "description": "scrcpy SDL renderer. software is preferred for Codex AppShot compatibility.",
+                },
                 "extra_args": {"type": "array", "items": {"type": "string"}},
                 "force": {
                     "type": "boolean",
@@ -11638,6 +11863,56 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_start_scrcpy,
+    },
+    "android_start_scrcpy_app": {
+        "description": "Launch scrcpy through a native macOS Android Use.app wrapper so Codex can attach/AppShot the window by bundle id.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "serial": {"type": "string"},
+                "app_path": {"type": "string", "description": "Optional output path for the generated Android Use.app."},
+                "max_size": {
+                    "type": "integer",
+                    "default": 0,
+                    "description": "scrcpy max video size. 0 keeps the device stream at its native size.",
+                },
+                "bit_rate": {"type": "string", "default": "8M"},
+                "audio": {"type": "boolean", "default": False},
+                "keyboard": {
+                    "type": "string",
+                    "default": "sdk",
+                    "enum": ["disabled", "sdk", "uhid", "aoa"],
+                },
+                "prefer_text": {"type": "boolean", "default": True},
+                "legacy_paste": {"type": "boolean", "default": False},
+                "stay_awake": {"type": "boolean", "default": False},
+                "turn_screen_off": {"type": "boolean", "default": False},
+                "window_width": {"type": "integer"},
+                "window_height": {"type": "integer"},
+                "window_title": {
+                    "type": "string",
+                    "description": "Optional title. Defaults to Android device name, then model, then Android.",
+                },
+                "window_scale": {
+                    "type": "number",
+                    "default": 0.5,
+                    "description": "Initial window scale when window_width/window_height are not provided. Does not resize the scrcpy video stream.",
+                },
+                "render_driver": {
+                    "type": "string",
+                    "default": "software",
+                    "description": "scrcpy SDL renderer. software is preferred for Codex AppShot compatibility.",
+                },
+                "extra_args": {"type": "array", "items": {"type": "string"}},
+                "force": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Start a new app-wrapper scrcpy window even if one is already visible for the same serial.",
+                },
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_start_scrcpy_app,
     },
     "android_scrcpy_resident_status": {
         "description": "Report and start the background monitor. It never starts WebRTC and respects manual scrcpy window closes until the next Android tool call.",

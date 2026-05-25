@@ -31,6 +31,16 @@ def make_raw_screenshot(
     return struct.pack("<IIII", width, height, 1, 0) + bytes(pixels)
 
 
+def make_png(width: int, height: int) -> bytes:
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        b"\x00\x00\x00\rIHDR"
+        + struct.pack(">II", width, height)
+        + b"\x08\x02\x00\x00\x00"
+        + b"\x00\x00\x00\x00"
+    )
+
+
 class AndroidUseMcpTests(unittest.TestCase):
     def test_parse_adb_devices(self) -> None:
         output = """List of devices attached
@@ -219,6 +229,81 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
         size = mcp.parse_screen_size("Physical size: 1080x2400\nOverride size: 720x1600")
 
         self.assertEqual(size, {"width": 720, "height": 1600})
+
+    def test_tool_appshot_saves_evidence_bundle(self) -> None:
+        original_choose = mcp.choose_serial
+        original_screenshot = mcp.screenshot_png
+        original_observe = mcp.observe_ui
+        png = make_png(1080, 2400)
+        try:
+            mcp.choose_serial = lambda _serial=None: "device-1"
+            mcp.screenshot_png = lambda serial: png
+
+            def fake_observe(serial: str, include_xml: bool = False, limit: int = 160) -> dict[str, object]:
+                ui: dict[str, object] = {
+                    "nodes": [
+                        {
+                            "index": 0,
+                            "text": "登录",
+                            "resource_id": "com.example:id/login",
+                            "bounds": {"left": 10, "top": 20, "right": 110, "bottom": 80},
+                            "center": {"x": 60, "y": 50},
+                            "clickable": True,
+                        }
+                    ],
+                    "count": 1,
+                }
+                if include_xml:
+                    ui["xml"] = "<hierarchy />"
+                return {
+                    "state": {"serial": serial, "focused_window": "com.example/.MainActivity"},
+                    "ui": ui,
+                }
+
+            mcp.observe_ui = fake_observe
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                content = mcp.tool_appshot({"serial": "device-1", "include_xml": True, "save_dir": tmpdir})
+                payload = json.loads(content[0]["text"])
+                saved_json = Path(payload["paths"]["json"])
+                saved_png = Path(payload["paths"]["png"])
+
+                self.assertEqual(content[1]["type"], "image")
+                self.assertEqual(payload["kind"], "android_appshot")
+                self.assertEqual(payload["screenshot"]["screen"], {"width": 1080, "height": 2400})
+                self.assertEqual(payload["ui"]["count"], 1)
+                self.assertEqual(payload["ui"]["xml"], "<hierarchy />")
+                self.assertTrue(saved_json.exists())
+                self.assertEqual(saved_png.read_bytes(), png)
+                self.assertEqual(json.loads(saved_json.read_text())["kind"], "android_appshot")
+        finally:
+            mcp.choose_serial = original_choose
+            mcp.screenshot_png = original_screenshot
+            mcp.observe_ui = original_observe
+
+    def test_tool_appshot_returns_screenshot_when_ui_dump_fails(self) -> None:
+        original_choose = mcp.choose_serial
+        original_screenshot = mcp.screenshot_png
+        original_observe = mcp.observe_ui
+        original_state = mcp.device_state
+        try:
+            mcp.choose_serial = lambda _serial=None: "device-1"
+            mcp.screenshot_png = lambda serial: make_png(720, 1280)
+            mcp.observe_ui = lambda *args, **kwargs: (_ for _ in ()).throw(mcp.AndroidUseError("dump failed"))
+            mcp.device_state = lambda serial: {"serial": serial, "focused_window": "com.example/.MainActivity"}
+
+            content = mcp.tool_appshot({"save": False, "include_image": False})
+            payload = json.loads(content[0]["text"])
+        finally:
+            mcp.choose_serial = original_choose
+            mcp.screenshot_png = original_screenshot
+            mcp.observe_ui = original_observe
+            mcp.device_state = original_state
+
+        self.assertEqual(len(content), 1)
+        self.assertEqual(payload["kind"], "android_appshot")
+        self.assertEqual(payload["ui"]["count"], 0)
+        self.assertIn("dump failed", payload["ui_error"])
 
     def test_keycode_normalization(self) -> None:
         self.assertEqual(mcp.keycode("back"), "KEYCODE_BACK")
@@ -1121,22 +1206,63 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
 
     def test_start_scrcpy_reuses_existing_visible_window(self) -> None:
         original_choose = mcp.choose_serial
-        original_visible = mcp.scrcpy_visible_process_for_serial
+        original_app_visible = mcp.scrcpy_app_wrapper_process_for_serial
         original_prune = mcp.prune_duplicate_scrcpy_processes
         try:
             mcp.choose_serial = lambda _serial=None: "device-1"
-            mcp.scrcpy_visible_process_for_serial = lambda _serial: "123 scrcpy --serial device-1"
+            mcp.scrcpy_app_wrapper_process_for_serial = lambda _serial: "123 scrcpy --serial device-1"
             mcp.prune_duplicate_scrcpy_processes = lambda _serial: [100]
 
             content = mcp.tool_start_scrcpy({"serial": "device-1"})
         finally:
             mcp.choose_serial = original_choose
-            mcp.scrcpy_visible_process_for_serial = original_visible
+            mcp.scrcpy_app_wrapper_process_for_serial = original_app_visible
             mcp.prune_duplicate_scrcpy_processes = original_prune
 
         payload = json.loads(content[0]["text"])
         self.assertEqual(payload["skipped"], "already-running")
         self.assertEqual(payload["stopped_duplicate_pids"], [100])
+
+    def test_start_scrcpy_launches_through_app_wrapper(self) -> None:
+        original_choose = mcp.choose_serial
+        original_app_visible = mcp.scrcpy_app_wrapper_process_for_serial
+        original_prune = mcp.prune_duplicate_scrcpy_processes
+        original_clear = mcp.clear_scrcpy_user_closed
+        original_start_app = mcp.start_scrcpy_app_window
+        calls: list[dict[str, object]] = []
+        try:
+            mcp.choose_serial = lambda _serial=None: "device-1"
+            mcp.scrcpy_app_wrapper_process_for_serial = lambda _serial: None
+            mcp.prune_duplicate_scrcpy_processes = lambda _serial: []
+            mcp.clear_scrcpy_user_closed = lambda _serial: None
+
+            def fake_start_app(args: dict[str, object], serial: str) -> dict[str, object]:
+                calls.append({"args": dict(args), "serial": serial})
+                return {
+                    "ok": True,
+                    "serial": serial,
+                    "launch_mode": "macos_app",
+                    "command": ["scrcpy", "--serial", serial],
+                }
+
+            mcp.start_scrcpy_app_window = fake_start_app  # type: ignore[assignment]
+
+            content = mcp.tool_start_scrcpy({"serial": "device-1", "keep_alive": True})
+        finally:
+            mcp.choose_serial = original_choose
+            mcp.scrcpy_app_wrapper_process_for_serial = original_app_visible
+            mcp.prune_duplicate_scrcpy_processes = original_prune
+            mcp.clear_scrcpy_user_closed = original_clear
+            mcp.start_scrcpy_app_window = original_start_app  # type: ignore[assignment]
+
+        payload = json.loads(content[0]["text"])
+        self.assertEqual(payload["launch_mode"], "macos_app")
+        self.assertFalse(payload["keep_alive"])
+        self.assertEqual(calls[0]["serial"], "device-1")
+        args = calls[0]["args"]
+        self.assertEqual(args["max_size"], 0)
+        self.assertEqual(args["window_scale"], 0.5)
+        self.assertEqual(args["render_driver"], "software")
 
     def test_map_openai_computer_actions(self) -> None:
         screen = {"width": 1440, "height": 2560}
@@ -1183,6 +1309,139 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
         self.assertIn("uhid", command)
         self.assertNotIn("--prefer-text", command)
 
+    def test_android_device_display_name_prefers_device_name(self) -> None:
+        original_shell = mcp.shell
+        original_get_prop = mcp.get_prop
+        try:
+            mcp.shell = lambda serial, command, timeout=30: "荣耀平板Z6" if "settings get global" in command else ""
+            mcp.get_prop = lambda serial, prop: "ELN-W09"
+
+            self.assertEqual(mcp.android_device_display_name("device-1"), "荣耀平板Z6")
+        finally:
+            mcp.shell = original_shell
+            mcp.get_prop = original_get_prop
+
+    def test_android_device_display_name_falls_back_to_model(self) -> None:
+        original_shell = mcp.shell
+        original_get_prop = mcp.get_prop
+        try:
+            mcp.shell = lambda serial, command, timeout=30: "null"
+            mcp.get_prop = lambda serial, prop: "ELN-W09" if prop == "ro.product.model" else None
+
+            self.assertEqual(mcp.android_device_display_name("device-1"), "ELN-W09")
+        finally:
+            mcp.shell = original_shell
+            mcp.get_prop = original_get_prop
+
+    def test_android_device_display_name_falls_back_to_android(self) -> None:
+        original_shell = mcp.shell
+        original_get_prop = mcp.get_prop
+        try:
+            mcp.shell = lambda serial, command, timeout=30: "null"
+            mcp.get_prop = lambda serial, prop: None
+
+            self.assertEqual(mcp.android_device_display_name("device-1"), "Android")
+        finally:
+            mcp.shell = original_shell
+            mcp.get_prop = original_get_prop
+
+    def test_android_scrcpy_app_path_uses_display_name(self) -> None:
+        original_env = mcp.os.environ.get("ANDROID_USE_SCRCPY_APP_PATH")
+        try:
+            mcp.os.environ.pop("ANDROID_USE_SCRCPY_APP_PATH", None)
+
+            path = mcp.android_scrcpy_app_path({}, "荣耀平板Z6")
+        finally:
+            if original_env is None:
+                mcp.os.environ.pop("ANDROID_USE_SCRCPY_APP_PATH", None)
+            else:
+                mcp.os.environ["ANDROID_USE_SCRCPY_APP_PATH"] = original_env
+
+        self.assertEqual(path.name, "荣耀平板Z6.app")
+
+    def test_build_scrcpy_command_defaults_to_device_name_title(self) -> None:
+        original_name = mcp.android_device_display_name
+        try:
+            mcp.android_device_display_name = lambda serial: "荣耀平板Z6"
+
+            command, _width, _height, title = mcp.build_scrcpy_command({"fixed_window": False}, "device-1")
+        finally:
+            mcp.android_device_display_name = original_name
+
+        self.assertEqual(title, "荣耀平板Z6")
+        self.assertEqual(command[command.index("--window-title") + 1], "荣耀平板Z6")
+
+    def test_build_scrcpy_command_can_half_size_initial_window_without_video_scale(self) -> None:
+        original_screenshot = mcp.screenshot_png
+        try:
+            mcp.screenshot_png = lambda serial: make_png(2000, 1200)
+
+            command, width, height, _title = mcp.build_scrcpy_command(
+                {"max_size": 0, "window_scale": 0.5, "window_title": "Debug"},
+                "device-1",
+            )
+        finally:
+            mcp.screenshot_png = original_screenshot
+
+        self.assertNotIn("-m", command)
+        self.assertEqual(width, 1000)
+        self.assertEqual(height, 600)
+        self.assertEqual(command[command.index("--window-width") + 1], "1000")
+        self.assertEqual(command[command.index("--window-height") + 1], "600")
+
+    def test_start_scrcpy_app_descriptor_uses_android_use_bundle(self) -> None:
+        tool = next(tool for tool in mcp.tool_descriptors() if tool["name"] == "android_start_scrcpy_app")
+        properties = tool["inputSchema"]["properties"]
+
+        self.assertEqual(properties["max_size"]["default"], 0)
+        self.assertEqual(properties["window_scale"]["default"], 0.5)
+        self.assertEqual(properties["render_driver"]["default"], "software")
+        self.assertIn("window_title", properties)
+
+    def test_prune_scrcpy_processes_removes_bare_windows(self) -> None:
+        original_rows = mcp.host_process_rows
+        original_bundle = mcp.macos_bundle_identifier_for_pid
+        original_kill = mcp.os.kill
+        killed: list[int] = []
+        try:
+            mcp.host_process_rows = lambda: [
+                {"pid": 10, "ppid": 1, "command": "scrcpy --serial device-1 --window-title Android device-1"},
+            ]
+            mcp.macos_bundle_identifier_for_pid = lambda pid: None
+            mcp.os.kill = lambda pid, signal: killed.append(pid)  # type: ignore[assignment]
+
+            stopped = mcp.prune_duplicate_scrcpy_processes("device-1")
+        finally:
+            mcp.host_process_rows = original_rows
+            mcp.macos_bundle_identifier_for_pid = original_bundle
+            mcp.os.kill = original_kill  # type: ignore[assignment]
+
+        self.assertEqual(stopped, [10])
+        self.assertEqual(killed, [10])
+
+    def test_prune_scrcpy_processes_keeps_newest_app_wrapper(self) -> None:
+        original_rows = mcp.host_process_rows
+        original_bundle = mcp.macos_bundle_identifier_for_pid
+        original_kill = mcp.os.kill
+        killed: list[int] = []
+        try:
+            mcp.host_process_rows = lambda: [
+                {"pid": 10, "ppid": 1, "command": "scrcpy --serial device-1 --window-title Android device-1"},
+                {"pid": 20, "ppid": 1, "command": "scrcpy --serial device-1 --window-title 荣耀平板Z6"},
+                {"pid": 15, "ppid": 1, "command": "scrcpy --serial device-1 --window-title 荣耀平板Z6"},
+            ]
+            mcp.macos_bundle_identifier_for_pid = lambda pid: mcp.ANDROID_USE_BUNDLE_ID if pid in {15, 20} else None
+            mcp.os.kill = lambda pid, signal: killed.append(pid)  # type: ignore[assignment]
+
+            stopped = mcp.prune_duplicate_scrcpy_processes("device-1")
+        finally:
+            mcp.host_process_rows = original_rows
+            mcp.macos_bundle_identifier_for_pid = original_bundle
+            mcp.os.kill = original_kill  # type: ignore[assignment]
+
+        self.assertEqual(stopped, [10, 15])
+        self.assertEqual(killed, [10, 15])
+
     def test_connected_device_serials_prefers_one_physical_device(self) -> None:
         original_list_devices = mcp.list_devices
         original_shell = mcp.shell
@@ -1216,19 +1475,19 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
     def test_start_scrcpy_accepts_multiple_serials(self) -> None:
         original_choose = mcp.choose_serial
         original_prune = mcp.prune_duplicate_scrcpy_processes
-        original_visible = mcp.scrcpy_visible_process_for_serial
+        original_app_visible = mcp.scrcpy_app_wrapper_process_for_serial
         original_clear = mcp.clear_scrcpy_user_closed
         try:
             mcp.choose_serial = lambda serial=None: str(serial)
             mcp.prune_duplicate_scrcpy_processes = lambda serial: []
-            mcp.scrcpy_visible_process_for_serial = lambda serial: f"scrcpy {serial}"
+            mcp.scrcpy_app_wrapper_process_for_serial = lambda serial: f"scrcpy {serial}"
             mcp.clear_scrcpy_user_closed = lambda serial: None
 
             content = mcp.tool_start_scrcpy({"serials": ["device-1", "device-2"]})
         finally:
             mcp.choose_serial = original_choose
             mcp.prune_duplicate_scrcpy_processes = original_prune
-            mcp.scrcpy_visible_process_for_serial = original_visible
+            mcp.scrcpy_app_wrapper_process_for_serial = original_app_visible
             mcp.clear_scrcpy_user_closed = original_clear
 
         payload = json.loads(content[0]["text"])
@@ -1239,13 +1498,13 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
 
     def test_scrcpy_manual_close_marker_blocks_resident_reopen_until_tool_call(self) -> None:
         original_screen_dir = mcp.SCREEN_DIR
-        original_visible = mcp.scrcpy_visible_process_for_serial
+        original_app_visible = mcp.scrcpy_app_wrapper_process_for_serial
         original_start = mcp.tool_start_scrcpy
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 mcp.SCREEN_DIR = Path(tmpdir)
                 mcp.scrcpy_user_closed_path("device-1").write_text(json.dumps({"closed_at": 1, "runtime_sec": 3}))
-                mcp.scrcpy_visible_process_for_serial = lambda _serial: None
+                mcp.scrcpy_app_wrapper_process_for_serial = lambda _serial: None
                 calls: list[dict[str, object]] = []
 
                 def fake_start(args: dict[str, object]) -> list[dict[str, str]]:
@@ -1270,7 +1529,7 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
                 self.assertFalse(mcp.scrcpy_user_closed_path("device-1").exists())
         finally:
             mcp.SCREEN_DIR = original_screen_dir
-            mcp.scrcpy_visible_process_for_serial = original_visible
+            mcp.scrcpy_app_wrapper_process_for_serial = original_app_visible
             mcp.tool_start_scrcpy = original_start  # type: ignore[assignment]
 
     def test_scrcpy_supervisor_treats_late_exit_as_manual_close(self) -> None:
@@ -1316,12 +1575,14 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
         self.assertIn("android_open_url", tool_names)
         self.assertIn("android_open_app", tool_names)
         self.assertIn("android_show_screen", tool_names)
+        self.assertIn("android_appshot", tool_names)
         self.assertIn("android_observe", tool_names)
         self.assertIn("android_tap_text", tool_names)
         self.assertIn("android_start_screen_viewer", tool_names)
         self.assertIn("android_start_webrtc_viewer", tool_names)
         self.assertIn("android_agent_run", tool_names)
         self.assertIn("android_agent_tars_run", tool_names)
+        self.assertIn("android_start_scrcpy_app", tool_names)
 
         start_scrcpy = next(tool for tool in mcp.tool_descriptors() if tool["name"] == "android_start_scrcpy")
         properties = start_scrcpy["inputSchema"]["properties"]
@@ -1332,9 +1593,17 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
         self.assertIn("prefer_text", properties)
         self.assertIn("legacy_paste", properties)
         self.assertIn("lock_window_continuous", properties)
+        self.assertIn("app_path", properties)
+        self.assertEqual(properties["max_size"]["default"], 0)
+        self.assertEqual(properties["window_scale"]["default"], 0.5)
+        self.assertEqual(properties["render_driver"]["default"], "software")
 
         agent_run = next(tool for tool in mcp.tool_descriptors() if tool["name"] == "android_agent_run")
         self.assertTrue(agent_run["inputSchema"]["properties"]["show_scrcpy"]["default"])
+
+        appshot = next(tool for tool in mcp.tool_descriptors() if tool["name"] == "android_appshot")
+        self.assertTrue(appshot["inputSchema"]["properties"]["include_image"]["default"])
+        self.assertTrue(appshot["inputSchema"]["properties"]["save"]["default"])
 
         self.assertIn("android_start_recording", tool_names)
         self.assertIn("android_create_recipe", tool_names)
