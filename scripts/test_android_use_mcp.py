@@ -1338,7 +1338,9 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
                 mcp.SCRCPY_VIDEO_RECORDING_PROCESSES.clear()
                 mcp.choose_serial = lambda _serial=None: "device-1"
                 mcp.scrcpy_binary = lambda: "scrcpy"
-                mcp.time.sleep = lambda _seconds: None
+                mcp.time.sleep = lambda _seconds: (_ for _ in ()).throw(
+                    AssertionError("start_video_recording should not use a fixed startup sleep")
+                )
                 mcp.video_recording_state_path = lambda _serial: tmp_path / "active.json"
 
                 def fake_popen(command: list[str], **_kwargs: object) -> FakeProcess:
@@ -1354,6 +1356,7 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
                         "output_path": str(output_path),
                         "max_size": 720,
                         "bit_rate": "4M",
+                        "start_marker": False,
                     }
                 )
             finally:
@@ -1367,6 +1370,9 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
 
         payload = json.loads(content[0]["text"])
         self.assertEqual(payload["file_path"], str(output_path))
+        self.assertEqual(payload["metadata_path"], str(output_path.with_suffix(".mp4.json")))
+        self.assertFalse(payload["start_anchor"]["enabled"])
+        self.assertEqual(payload["start_anchor"]["status"], "disabled")
         command = calls[0]
         self.assertIn("--no-window", command)
         self.assertIn("--record", command)
@@ -1378,6 +1384,68 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
         self.assertIn("-b", command)
         self.assertIn("4M", command)
         self.assertIn("--no-audio", command)
+
+    def test_start_video_recording_schedules_start_anchor_without_blocking(self) -> None:
+        original_choose = mcp.choose_serial
+        original_scrcpy = mcp.scrcpy_binary
+        original_popen = mcp.subprocess.Popen
+        original_marker = mcp.schedule_video_recording_start_marker
+        original_state_path = mcp.video_recording_state_path
+        scheduled: list[tuple[str, Path, Path]] = []
+
+        class FakeProcess:
+            pid = 4321
+
+            def poll(self) -> int | None:
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            try:
+                mcp.SCRCPY_VIDEO_RECORDINGS.clear()
+                mcp.SCRCPY_VIDEO_RECORDING_PROCESSES.clear()
+                mcp.choose_serial = lambda _serial=None: "device-1"
+                mcp.scrcpy_binary = lambda: "scrcpy"
+                mcp.video_recording_state_path = lambda _serial: tmp_path / "active.json"
+
+                def fake_popen(command: list[str], **_kwargs: object) -> FakeProcess:
+                    return FakeProcess()
+
+                def fake_marker(
+                    serial: str,
+                    marker_path: Path,
+                    metadata_path: Path,
+                    **_kwargs: object,
+                ) -> None:
+                    scheduled.append((serial, marker_path, metadata_path))
+
+                mcp.subprocess.Popen = fake_popen  # type: ignore[assignment]
+                mcp.schedule_video_recording_start_marker = fake_marker  # type: ignore[assignment]
+
+                output_path = tmp_path / "capture.mp4"
+                content = mcp.tool_start_video_recording(
+                    {"serial": "device-1", "output_path": str(output_path)}
+                )
+                metadata = json.loads(output_path.with_suffix(".mp4.json").read_text())
+            finally:
+                mcp.choose_serial = original_choose
+                mcp.scrcpy_binary = original_scrcpy
+                mcp.subprocess.Popen = original_popen  # type: ignore[assignment]
+                mcp.schedule_video_recording_start_marker = original_marker  # type: ignore[assignment]
+                mcp.video_recording_state_path = original_state_path
+                mcp.SCRCPY_VIDEO_RECORDINGS.clear()
+                mcp.SCRCPY_VIDEO_RECORDING_PROCESSES.clear()
+
+        payload = json.loads(content[0]["text"])
+        metadata_path = output_path.with_suffix(".mp4.json")
+        marker_path = output_path.with_suffix(".mp4.start.png")
+        self.assertEqual(payload["metadata_path"], str(metadata_path))
+        self.assertEqual(payload["start_anchor"]["status"], "pending")
+        self.assertEqual(payload["start_anchor"]["path"], str(marker_path))
+        self.assertIn("startup_probe_ms", payload["timing"])
+        self.assertEqual(scheduled, [("device-1", marker_path, metadata_path)])
+        self.assertEqual(metadata["start_anchor"]["status"], "pending")
+        self.assertEqual(metadata["start_anchor"]["path"], str(marker_path))
 
     def test_stop_video_recording_returns_markdown_path(self) -> None:
         original_choose = mcp.choose_serial
@@ -1406,7 +1474,19 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             output_path = tmp_path / "capture.mp4"
+            metadata_path = output_path.with_suffix(".mp4.json")
             output_path.write_bytes(b"mp4")
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "start_anchor": {
+                            "status": "captured",
+                            "path": str(output_path.with_suffix(".mp4.start.png")),
+                        },
+                        "timing": {"startup_probe_ms": 1.5},
+                    }
+                )
+            )
             process = FakeProcess()
             try:
                 mcp.SCRCPY_VIDEO_RECORDINGS.clear()
@@ -1418,6 +1498,7 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
                     "serial": "device-1",
                     "pid": process.pid,
                     "file_path": str(output_path),
+                    "metadata_path": str(metadata_path),
                     "log_path": str(tmp_path / "capture.mp4.log"),
                     "started_at_epoch": 100.0,
                 }
@@ -1434,6 +1515,9 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
         payload = json.loads(content[0]["text"])
         self.assertTrue(payload["stopped"])
         self.assertEqual(payload["file_path"], str(output_path))
+        self.assertEqual(payload["metadata_path"], str(metadata_path))
+        self.assertEqual(payload["start_anchor"]["status"], "captured")
+        self.assertEqual(payload["timing"]["startup_probe_ms"], 1.5)
         self.assertEqual(payload["size_bytes"], 3)
         self.assertEqual(payload["duration_sec"], 3.0)
         self.assertEqual(payload["markdown"], f"![android-video-recording]({output_path})")

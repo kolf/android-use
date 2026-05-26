@@ -380,7 +380,9 @@ recipe 会优先使用 selector，找不到时才退回坐标。
 
 ## 视频录制
 
-如果你对 Codex 说“开始录制视频”或“开始录屏”，插件应立即调用 `android_start_video_recording`，通过 scrcpy 后台录制当前安卓屏幕为 MP4，不先截图、不先分析页面。
+如果你对 Codex 说“开始录制视频”或“开始录屏”，插件应立即调用 `android_start_video_recording`，通过 scrcpy 后台录制当前安卓屏幕为 MP4，不先截图、不先分析页面，也不会为了确认启动而固定等待。
+
+开始录制返回值会包含 `timing` 和 `start_anchor`：`timing` 记录请求、进程启动和工具返回的时间；`start_anchor.path` 是后台抓取的起始画面标记 PNG，用来对齐“按下开始录制时屏幕大概在哪一帧”。这个标记不阻塞开始录制，若设备当时无法截图，会在 sidecar 元数据里记录错误。
 
 如果你说“停止录制视频”或“停止录屏”，插件应立即调用 `android_stop_video_recording`，停止当前录制进程，并把返回的本地 MP4 路径作为视频发回给你。
 
@@ -389,6 +391,8 @@ recipe 会优先使用 selector，找不到时才退回坐标。
 ```text
 .screen/video-recordings/
 ```
+
+同名 sidecar 文件会和视频放在一起，例如 `xxx.mp4.json`、`xxx.mp4.start.png`、`xxx.mp4.log`。
 
 这是真实视频录制，和上面的 recipe 录制不同：`android_start_recording` 记录的是可复放操作 trace，不会生成 MP4。
 

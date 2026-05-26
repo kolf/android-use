@@ -20,11 +20,12 @@ Default arguments:
   "record_format": "mp4",
   "max_size": 0,
   "bit_rate": "8M",
-  "audio": false
+  "audio": false,
+  "start_marker": true
 }
 ```
 
-After the tool returns, keep the reply short and include the `file_path` if useful. The recording is active until stopped.
+After the tool returns, keep the reply short and include the `file_path` if useful. The tool returns without a fixed startup wait and includes `timing` plus a best-effort `start_anchor.path` screenshot that is captured in the background. The recording is active until stopped.
 
 ## Stop Trigger
 

@@ -1171,6 +1171,10 @@ def device_state(serial: str) -> dict[str, Any]:
 
 def screenshot_png(serial: str) -> bytes:
     png = adb(["exec-out", "screencap", "-p"], serial=serial, timeout=20)
+    return normalize_png_bytes(png)
+
+
+def normalize_png_bytes(png: bytes) -> bytes:
     if not png.startswith(b"\x89PNG"):
         fixed = png.replace(b"\r\n", b"\n")
         if fixed.startswith(b"\x89PNG"):
@@ -9646,6 +9650,14 @@ def video_recording_state_path(serial: str) -> Path:
     return SCREEN_DIR / f"scrcpy-video-recording-{slugify(serial)}.json"
 
 
+def video_recording_metadata_path(output_path: Path) -> Path:
+    return output_path.with_suffix(output_path.suffix + ".json")
+
+
+def video_recording_start_marker_path(output_path: Path) -> Path:
+    return output_path.with_suffix(output_path.suffix + ".start.png")
+
+
 def host_pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -9681,6 +9693,82 @@ def active_video_recording(serial: str) -> dict[str, Any] | None:
         return payload
     clear_video_recording_state(serial)
     return None
+
+
+def update_video_recording_metadata(metadata_path: Path, updates: dict[str, Any]) -> None:
+    payload = read_json_file(metadata_path)
+    if not payload:
+        payload = {}
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(payload.get(key), dict):
+            merged = dict(payload[key])
+            merged.update(value)
+            payload[key] = merged
+        else:
+            payload[key] = value
+    write_json(metadata_path, payload)
+
+
+def capture_video_recording_start_marker(
+    serial: str,
+    marker_path: Path,
+    metadata_path: Path,
+    *,
+    timeout_sec: float = 2.0,
+) -> None:
+    capture_started_epoch = time.time()
+    capture_started_at = timestamp_iso()
+    try:
+        png = normalize_png_bytes(
+            adb(["exec-out", "screencap", "-p"], serial=serial, timeout=timeout_sec)
+        )
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_bytes(png)
+        update_video_recording_metadata(
+            metadata_path,
+            {
+                "start_anchor": {
+                    "status": "captured",
+                    "path": str(marker_path),
+                    "captured_at": timestamp_iso(),
+                    "captured_at_epoch": time.time(),
+                    "capture_started_at": capture_started_at,
+                    "capture_started_at_epoch": capture_started_epoch,
+                    "size": png_size(png),
+                }
+            },
+        )
+    except Exception as exc:
+        update_video_recording_metadata(
+            metadata_path,
+            {
+                "start_anchor": {
+                    "status": "error",
+                    "path": str(marker_path),
+                    "captured_at": timestamp_iso(),
+                    "captured_at_epoch": time.time(),
+                    "capture_started_at": capture_started_at,
+                    "capture_started_at_epoch": capture_started_epoch,
+                    "error": str(exc),
+                }
+            },
+        )
+
+
+def schedule_video_recording_start_marker(
+    serial: str,
+    marker_path: Path,
+    metadata_path: Path,
+    *,
+    timeout_sec: float = 2.0,
+) -> None:
+    thread = threading.Thread(
+        target=capture_video_recording_start_marker,
+        args=(serial, marker_path, metadata_path),
+        kwargs={"timeout_sec": timeout_sec},
+        daemon=True,
+    )
+    thread.start()
 
 
 def build_video_recording_command(args: dict[str, Any], serial: str, output_path: Path) -> list[str]:
@@ -9763,6 +9851,8 @@ def tool_start_video_recording(args: dict[str, Any]) -> list[dict[str, Any]]:
     serial = choose_serial(args.get("serial"))
     existing = active_video_recording(serial)
     if existing:
+        existing_metadata_path = Path(str(existing.get("metadata_path") or "")).expanduser()
+        existing_metadata = read_json_file(existing_metadata_path) if str(existing_metadata_path) != "." else {}
         return [
             text_content(
                 {
@@ -9772,10 +9862,15 @@ def tool_start_video_recording(args: dict[str, Any]) -> list[dict[str, Any]]:
                     "pid": existing.get("pid"),
                     "file_path": existing.get("file_path"),
                     "started_at": existing.get("started_at"),
+                    "metadata_path": existing.get("metadata_path"),
+                    "start_anchor": existing_metadata.get("start_anchor") or existing.get("start_anchor"),
+                    "timing": existing_metadata.get("timing") or existing.get("timing"),
                 }
             )
         ]
 
+    requested_at = timestamp_iso()
+    requested_at_epoch = time.time()
     record_format = str(args.get("record_format") or "mp4").strip().lower()
     name = slugify(str(args.get("name") or "android-video"), "android-video")
     if args.get("output_path"):
@@ -9786,6 +9881,9 @@ def tool_start_video_recording(args: dict[str, Any]) -> list[dict[str, Any]]:
         output_path = output_path.with_suffix(f".{record_format}")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     log_path = output_path.with_suffix(output_path.suffix + ".log")
+    metadata_path = video_recording_metadata_path(output_path)
+    marker_path = video_recording_start_marker_path(output_path)
+    start_marker_enabled = args.get("start_marker", True) is not False
     command = build_video_recording_command(args, serial, output_path)
     try:
         with log_path.open("ab") as log_file:
@@ -9797,32 +9895,65 @@ def tool_start_video_recording(args: dict[str, Any]) -> list[dict[str, Any]]:
             )
     except FileNotFoundError as exc:
         raise AndroidUseError(f"Command not found: {command[0]}") from exc
-    time.sleep(0.2)
+    process_started_at = timestamp_iso()
+    process_started_at_epoch = time.time()
     if process.poll() is not None:
         log_tail = ""
         with contextlib.suppress(OSError):
             log_tail = log_path.read_text(errors="replace")[-1200:]
         raise AndroidUseError(f"scrcpy video recording failed to start.\n{log_tail}".rstrip())
 
+    returned_at = timestamp_iso()
+    returned_at_epoch = time.time()
+    timing = {
+        "requested_at": requested_at,
+        "requested_at_epoch": requested_at_epoch,
+        "process_started_at": process_started_at,
+        "process_started_at_epoch": process_started_at_epoch,
+        "returned_at": returned_at,
+        "returned_at_epoch": returned_at_epoch,
+        "startup_probe_ms": round((returned_at_epoch - process_started_at_epoch) * 1000, 3),
+    }
+    start_anchor = {
+        "enabled": start_marker_enabled,
+        "status": "pending" if start_marker_enabled else "disabled",
+        "kind": "screenshot",
+        "path": str(marker_path) if start_marker_enabled else None,
+        "description": (
+            "Best-effort screen frame captured in the background immediately after "
+            "the scrcpy recording process starts; the MP4 first encoded frame is "
+            "controlled by scrcpy stream setup."
+        ),
+    }
     recording = {
         "ok": True,
         "serial": serial,
         "pid": process.pid,
         "file_path": str(output_path),
         "log_path": str(log_path),
-        "started_at": timestamp_iso(),
-        "started_at_epoch": time.time(),
+        "metadata_path": str(metadata_path),
+        "started_at": process_started_at,
+        "started_at_epoch": process_started_at_epoch,
+        "timing": timing,
+        "start_anchor": start_anchor,
         "record_format": record_format,
         "command": command,
     }
     SCRCPY_VIDEO_RECORDING_PROCESSES[serial] = process
     SCRCPY_VIDEO_RECORDINGS[serial] = recording
     write_json(video_recording_state_path(serial), recording)
+    write_json(metadata_path, recording)
+    if start_marker_enabled:
+        schedule_video_recording_start_marker(serial, marker_path, metadata_path)
     return [
         text_content(
             {
                 **recording,
-                "message": "scrcpy video recording started. Stop it with android_stop_video_recording.",
+                "message": (
+                    "scrcpy video recording started without a fixed startup wait. "
+                    "Use start_anchor.path as the start-frame anchor and stop it "
+                    "with android_stop_video_recording."
+                ),
             }
         )
     ]
@@ -9837,23 +9968,31 @@ def tool_stop_video_recording(args: dict[str, Any]) -> list[dict[str, Any]]:
     stopped = stop_video_recording_process(serial, recording, timeout_sec)
     clear_video_recording_state(serial)
     output_path = Path(str(recording.get("file_path") or "")).expanduser()
+    metadata_path = Path(str(recording.get("metadata_path") or video_recording_metadata_path(output_path))).expanduser()
+    metadata = read_json_file(metadata_path)
     size_bytes = output_path.stat().st_size if output_path.exists() else 0
     duration_sec = round(time.time() - float(recording.get("started_at_epoch") or time.time()), 3)
-    return [
-        text_content(
-            {
-                "ok": True,
-                "serial": serial,
-                "stopped": stopped,
-                "pid": recording.get("pid"),
-                "file_path": str(output_path),
-                "log_path": recording.get("log_path"),
-                "size_bytes": size_bytes,
-                "duration_sec": duration_sec,
-                "markdown": f"![android-video-recording]({output_path})",
-            }
-        )
-    ]
+    payload = {
+        "ok": True,
+        "serial": serial,
+        "stopped": stopped,
+        "pid": recording.get("pid"),
+        "file_path": str(output_path),
+        "log_path": recording.get("log_path"),
+        "metadata_path": str(metadata_path),
+        "size_bytes": size_bytes,
+        "duration_sec": duration_sec,
+        "markdown": f"![android-video-recording]({output_path})",
+    }
+    if metadata.get("start_anchor"):
+        payload["start_anchor"] = metadata["start_anchor"]
+    elif recording.get("start_anchor"):
+        payload["start_anchor"] = recording["start_anchor"]
+    if metadata.get("timing"):
+        payload["timing"] = metadata["timing"]
+    elif recording.get("timing"):
+        payload["timing"] = recording["timing"]
+    return [text_content(payload)]
 
 
 def tool_start_scrcpy(args: dict[str, Any]) -> list[dict[str, Any]]:
@@ -12064,6 +12203,11 @@ TOOLS: dict[str, dict[str, Any]] = {
                     "type": "boolean",
                     "default": False,
                     "description": "Enable audio capture/forwarding. Disabled by default for reliability.",
+                },
+                "start_marker": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Capture a best-effort start-anchor screenshot in the background without delaying tool return.",
                 },
                 "extra_args": {"type": "array", "items": {"type": "string"}},
             },
