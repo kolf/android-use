@@ -244,13 +244,21 @@ cd ~/plugins/android-use-plugins
 - `ANDROID_USE_SCRCPY_RESIDENT_SERIALS` 写入多个序列号时，会为每台已连接设备分别保活一个 scrcpy 窗口；
 - 不会自动启动 WebRTC；
 - 自动弹窗、`android_start_scrcpy`、`android_start_scrcpy_app`、无线调试 `start_scrcpy=true`、resident monitor 都走同一个 `.app` wrapper 启动路径；
+- 启动 `.app` wrapper 时会检查 `/Applications/Android Use.app`，已有就跳过，没有就自动创建一个系统「应用程序」里的 Android Use 启动图标；
+- 默认启动时会清理 `.android-use/` 下旧的同 bundle id 设备专属 `.app`，只保留固定的 `Android Use.app`；
 - 只复用 bundle id 为 `com.kolf.android-use` 的窗口；发现旧的裸 scrcpy/supervisor 窗口会先关闭再重开；
 - 窗口稳定显示后，如果用户手动关闭，插件会尽量尊重这次关闭；
 - 下一次调用 Android 插件工具时，再重新弹出 `.app` wrapper 窗口；
 - 默认关闭音频，降低资源占用；
 - 默认启用文字输入优化。
 
-`.app` wrapper 的 bundle id 是 `com.kolf.android-use`，并使用 Android 图标与 software renderer 打开 scrcpy。窗口标题和 macOS app 显示名默认使用设备名称，例如 `荣耀平板Z6`；取不到设备名称时使用型号，最后回退到 `Android`。默认初始窗口大小是当前设备截图尺寸的 1/2，例如横屏 `2000 x 1200` 会以 `1000 x 600` 打开；这只影响启动窗口大小，不降低 scrcpy 视频流分辨率，也不会持续锁定窗口。
+`.app` wrapper 的 bundle id 是 `com.kolf.android-use`，并使用 Android 图标与 software renderer 打开 scrcpy。macOS app 固定使用 `Android Use.app` 作为启动器，避免换设备时多个同 bundle id 的设备专属 `.app` 被 LaunchServices 缓存混淆；窗口标题仍默认使用设备名称，例如 `荣耀平板Z6`，取不到设备名称时使用型号，最后回退到 `Android`。默认初始窗口大小是当前设备截图尺寸的 1/2，例如横屏 `2000 x 1200` 会以 `1000 x 600` 打开；这只影响启动窗口大小，不降低 scrcpy 视频流分辨率，也不会持续锁定窗口。
+
+如果不想自动创建系统「应用程序」里的 `Android Use.app`，可设置：
+
+```bash
+export ANDROID_USE_SYSTEM_ANDROID_APP=0
+```
 
 如果不想让工具调用时自动弹出 scrcpy：
 
@@ -369,6 +377,20 @@ ANDROID_USE_RESTORE_IME_AFTER_TYPE=1
 5. 用 `android_replay_recipe` 复放。
 
 recipe 会优先使用 selector，找不到时才退回坐标。
+
+## 视频录制
+
+如果你对 Codex 说“开始录制视频”或“开始录屏”，插件应立即调用 `android_start_video_recording`，通过 scrcpy 后台录制当前安卓屏幕为 MP4，不先截图、不先分析页面。
+
+如果你说“停止录制视频”或“停止录屏”，插件应立即调用 `android_stop_video_recording`，停止当前录制进程，并把返回的本地 MP4 路径作为视频发回给你。
+
+默认输出目录：
+
+```text
+.screen/video-recordings/
+```
+
+这是真实视频录制，和上面的 recipe 录制不同：`android_start_recording` 记录的是可复放操作 trace，不会生成 MP4。
 
 ## 常见问题
 

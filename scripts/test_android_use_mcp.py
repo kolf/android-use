@@ -1208,20 +1208,24 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
         original_choose = mcp.choose_serial
         original_app_visible = mcp.scrcpy_app_wrapper_process_for_serial
         original_prune = mcp.prune_duplicate_scrcpy_processes
+        original_system_app = mcp.ensure_system_android_launcher_app
         try:
             mcp.choose_serial = lambda _serial=None: "device-1"
             mcp.scrcpy_app_wrapper_process_for_serial = lambda _serial: "123 scrcpy --serial device-1"
             mcp.prune_duplicate_scrcpy_processes = lambda _serial: [100]
+            mcp.ensure_system_android_launcher_app = lambda: {"ok": True, "skipped": "already-present"}  # type: ignore[assignment]
 
             content = mcp.tool_start_scrcpy({"serial": "device-1"})
         finally:
             mcp.choose_serial = original_choose
             mcp.scrcpy_app_wrapper_process_for_serial = original_app_visible
             mcp.prune_duplicate_scrcpy_processes = original_prune
+            mcp.ensure_system_android_launcher_app = original_system_app  # type: ignore[assignment]
 
         payload = json.loads(content[0]["text"])
         self.assertEqual(payload["skipped"], "already-running")
         self.assertEqual(payload["stopped_duplicate_pids"], [100])
+        self.assertEqual(payload["system_app"]["skipped"], "already-present")
 
     def test_start_scrcpy_launches_through_app_wrapper(self) -> None:
         original_choose = mcp.choose_serial
@@ -1229,12 +1233,14 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
         original_prune = mcp.prune_duplicate_scrcpy_processes
         original_clear = mcp.clear_scrcpy_user_closed
         original_start_app = mcp.start_scrcpy_app_window
+        original_system_app = mcp.ensure_system_android_launcher_app
         calls: list[dict[str, object]] = []
         try:
             mcp.choose_serial = lambda _serial=None: "device-1"
             mcp.scrcpy_app_wrapper_process_for_serial = lambda _serial: None
             mcp.prune_duplicate_scrcpy_processes = lambda _serial: []
             mcp.clear_scrcpy_user_closed = lambda _serial: None
+            mcp.ensure_system_android_launcher_app = lambda: {"ok": True, "created": True}  # type: ignore[assignment]
 
             def fake_start_app(args: dict[str, object], serial: str) -> dict[str, object]:
                 calls.append({"args": dict(args), "serial": serial})
@@ -1254,10 +1260,12 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
             mcp.prune_duplicate_scrcpy_processes = original_prune
             mcp.clear_scrcpy_user_closed = original_clear
             mcp.start_scrcpy_app_window = original_start_app  # type: ignore[assignment]
+            mcp.ensure_system_android_launcher_app = original_system_app  # type: ignore[assignment]
 
         payload = json.loads(content[0]["text"])
         self.assertEqual(payload["launch_mode"], "macos_app")
         self.assertFalse(payload["keep_alive"])
+        self.assertTrue(payload["system_app"]["created"])
         self.assertEqual(calls[0]["serial"], "device-1")
         args = calls[0]["args"]
         self.assertEqual(args["max_size"], 0)
@@ -1309,6 +1317,128 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
         self.assertIn("uhid", command)
         self.assertNotIn("--prefer-text", command)
 
+    def test_start_video_recording_launches_scrcpy_no_window(self) -> None:
+        original_choose = mcp.choose_serial
+        original_scrcpy = mcp.scrcpy_binary
+        original_popen = mcp.subprocess.Popen
+        original_sleep = mcp.time.sleep
+        original_state_path = mcp.video_recording_state_path
+        calls: list[list[str]] = []
+
+        class FakeProcess:
+            pid = 4321
+
+            def poll(self) -> int | None:
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            try:
+                mcp.SCRCPY_VIDEO_RECORDINGS.clear()
+                mcp.SCRCPY_VIDEO_RECORDING_PROCESSES.clear()
+                mcp.choose_serial = lambda _serial=None: "device-1"
+                mcp.scrcpy_binary = lambda: "scrcpy"
+                mcp.time.sleep = lambda _seconds: None
+                mcp.video_recording_state_path = lambda _serial: tmp_path / "active.json"
+
+                def fake_popen(command: list[str], **_kwargs: object) -> FakeProcess:
+                    calls.append(command)
+                    return FakeProcess()
+
+                mcp.subprocess.Popen = fake_popen  # type: ignore[assignment]
+
+                output_path = tmp_path / "capture.mp4"
+                content = mcp.tool_start_video_recording(
+                    {
+                        "serial": "device-1",
+                        "output_path": str(output_path),
+                        "max_size": 720,
+                        "bit_rate": "4M",
+                    }
+                )
+            finally:
+                mcp.choose_serial = original_choose
+                mcp.scrcpy_binary = original_scrcpy
+                mcp.subprocess.Popen = original_popen  # type: ignore[assignment]
+                mcp.time.sleep = original_sleep
+                mcp.video_recording_state_path = original_state_path
+                mcp.SCRCPY_VIDEO_RECORDINGS.clear()
+                mcp.SCRCPY_VIDEO_RECORDING_PROCESSES.clear()
+
+        payload = json.loads(content[0]["text"])
+        self.assertEqual(payload["file_path"], str(output_path))
+        command = calls[0]
+        self.assertIn("--no-window", command)
+        self.assertIn("--record", command)
+        self.assertIn(str(output_path), command)
+        self.assertIn("--record-format", command)
+        self.assertIn("mp4", command)
+        self.assertIn("-m", command)
+        self.assertIn("720", command)
+        self.assertIn("-b", command)
+        self.assertIn("4M", command)
+        self.assertIn("--no-audio", command)
+
+    def test_stop_video_recording_returns_markdown_path(self) -> None:
+        original_choose = mcp.choose_serial
+        original_state_path = mcp.video_recording_state_path
+        original_time = mcp.time.time
+
+        class FakeProcess:
+            pid = 4321
+            signal_seen: int | None = None
+
+            def poll(self) -> int | None:
+                return None
+
+            def send_signal(self, sig: int) -> None:
+                self.signal_seen = sig
+
+            def wait(self, timeout: float | None = None) -> int:
+                return 0
+
+            def terminate(self) -> None:
+                raise AssertionError("terminate should not be needed")
+
+            def kill(self) -> None:
+                raise AssertionError("kill should not be needed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            output_path = tmp_path / "capture.mp4"
+            output_path.write_bytes(b"mp4")
+            process = FakeProcess()
+            try:
+                mcp.SCRCPY_VIDEO_RECORDINGS.clear()
+                mcp.SCRCPY_VIDEO_RECORDING_PROCESSES.clear()
+                mcp.choose_serial = lambda _serial=None: "device-1"
+                mcp.video_recording_state_path = lambda _serial: tmp_path / "active.json"
+                mcp.time.time = lambda: 103.0
+                mcp.SCRCPY_VIDEO_RECORDINGS["device-1"] = {
+                    "serial": "device-1",
+                    "pid": process.pid,
+                    "file_path": str(output_path),
+                    "log_path": str(tmp_path / "capture.mp4.log"),
+                    "started_at_epoch": 100.0,
+                }
+                mcp.SCRCPY_VIDEO_RECORDING_PROCESSES["device-1"] = process  # type: ignore[assignment]
+
+                content = mcp.tool_stop_video_recording({"serial": "device-1"})
+            finally:
+                mcp.choose_serial = original_choose
+                mcp.video_recording_state_path = original_state_path
+                mcp.time.time = original_time
+                mcp.SCRCPY_VIDEO_RECORDINGS.clear()
+                mcp.SCRCPY_VIDEO_RECORDING_PROCESSES.clear()
+
+        payload = json.loads(content[0]["text"])
+        self.assertTrue(payload["stopped"])
+        self.assertEqual(payload["file_path"], str(output_path))
+        self.assertEqual(payload["size_bytes"], 3)
+        self.assertEqual(payload["duration_sec"], 3.0)
+        self.assertEqual(payload["markdown"], f"![android-video-recording]({output_path})")
+        self.assertEqual(process.signal_seen, mcp.signal.SIGINT)
+
     def test_android_device_display_name_prefers_device_name(self) -> None:
         original_shell = mcp.shell
         original_get_prop = mcp.get_prop
@@ -1345,7 +1475,7 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
             mcp.shell = original_shell
             mcp.get_prop = original_get_prop
 
-    def test_android_scrcpy_app_path_uses_display_name(self) -> None:
+    def test_android_scrcpy_app_path_uses_stable_launcher_name(self) -> None:
         original_env = mcp.os.environ.get("ANDROID_USE_SCRCPY_APP_PATH")
         try:
             mcp.os.environ.pop("ANDROID_USE_SCRCPY_APP_PATH", None)
@@ -1357,7 +1487,118 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
             else:
                 mcp.os.environ["ANDROID_USE_SCRCPY_APP_PATH"] = original_env
 
-        self.assertEqual(path.name, "荣耀平板Z6.app")
+        self.assertEqual(path.name, "Android Use.app")
+
+    def test_build_scrcpy_app_launch_command_opens_app_path_directly(self) -> None:
+        command = mcp.build_scrcpy_app_launch_command(
+            ["scrcpy", "--serial", "device-1"],
+            Path("/tmp/Android Use.app"),
+        )
+
+        self.assertEqual(command[:3], ["open", "-n", "/tmp/Android Use.app"])
+        self.assertIn("--args", command)
+        self.assertIn("--scrcpy", command)
+
+    def test_cleanup_legacy_android_scrcpy_apps_removes_same_bundle_only(self) -> None:
+        original_dir = mcp.ANDROID_USE_DIR
+
+        def write_plist(app_dir: Path, bundle_id: str) -> None:
+            contents_dir = app_dir / "Contents"
+            contents_dir.mkdir(parents=True)
+            with (contents_dir / "Info.plist").open("wb") as file:
+                mcp.plistlib.dump({"CFBundleIdentifier": bundle_id}, file)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            current_app = tmp_path / "Android Use.app"
+            legacy_app = tmp_path / "荣耀平板Z6.app"
+            foreign_app = tmp_path / "Other.app"
+            write_plist(current_app, mcp.ANDROID_USE_BUNDLE_ID)
+            write_plist(legacy_app, mcp.ANDROID_USE_BUNDLE_ID)
+            write_plist(foreign_app, "com.example.other")
+            try:
+                mcp.ANDROID_USE_DIR = tmp_path
+
+                removed = mcp.cleanup_legacy_android_scrcpy_apps(current_app)
+            finally:
+                mcp.ANDROID_USE_DIR = original_dir
+
+            self.assertEqual(removed, [str(legacy_app)])
+            self.assertTrue(current_app.exists())
+            self.assertFalse(legacy_app.exists())
+            self.assertTrue(foreign_app.exists())
+
+    def test_system_android_launcher_path_defaults_to_applications(self) -> None:
+        original_path = mcp.os.environ.get("ANDROID_USE_SYSTEM_ANDROID_APP_PATH")
+        original_dir = mcp.os.environ.get("ANDROID_USE_SYSTEM_APPLICATIONS_DIR")
+        try:
+            mcp.os.environ.pop("ANDROID_USE_SYSTEM_ANDROID_APP_PATH", None)
+            mcp.os.environ.pop("ANDROID_USE_SYSTEM_APPLICATIONS_DIR", None)
+
+            path = mcp.system_android_launcher_app_path()
+        finally:
+            if original_path is None:
+                mcp.os.environ.pop("ANDROID_USE_SYSTEM_ANDROID_APP_PATH", None)
+            else:
+                mcp.os.environ["ANDROID_USE_SYSTEM_ANDROID_APP_PATH"] = original_path
+            if original_dir is None:
+                mcp.os.environ.pop("ANDROID_USE_SYSTEM_APPLICATIONS_DIR", None)
+            else:
+                mcp.os.environ["ANDROID_USE_SYSTEM_APPLICATIONS_DIR"] = original_dir
+
+        self.assertEqual(path, Path("/Applications/Android Use.app"))
+
+    def test_ensure_system_android_launcher_app_skips_existing(self) -> None:
+        original_platform = mcp.sys.platform
+        original_path = mcp.os.environ.get("ANDROID_USE_SYSTEM_ANDROID_APP_PATH")
+        with tempfile.TemporaryDirectory() as tmp:
+            app_path = Path(tmp) / "Android Use.app"
+            app_path.mkdir()
+            try:
+                mcp.sys.platform = "darwin"
+                mcp.os.environ["ANDROID_USE_SYSTEM_ANDROID_APP_PATH"] = str(app_path)
+
+                result = mcp.ensure_system_android_launcher_app()
+            finally:
+                mcp.sys.platform = original_platform
+                if original_path is None:
+                    mcp.os.environ.pop("ANDROID_USE_SYSTEM_ANDROID_APP_PATH", None)
+                else:
+                    mcp.os.environ["ANDROID_USE_SYSTEM_ANDROID_APP_PATH"] = original_path
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["skipped"], "already-present")
+        self.assertEqual(result["app_path"], str(app_path))
+
+    def test_ensure_system_android_launcher_app_creates_missing(self) -> None:
+        original_platform = mcp.sys.platform
+        original_path = mcp.os.environ.get("ANDROID_USE_SYSTEM_ANDROID_APP_PATH")
+        original_builder = mcp.build_android_scrcpy_app
+        calls: list[tuple[Path, str]] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            app_path = Path(tmp) / "Android Use.app"
+            try:
+                mcp.sys.platform = "darwin"
+                mcp.os.environ["ANDROID_USE_SYSTEM_ANDROID_APP_PATH"] = str(app_path)
+
+                def fake_builder(path: Path, app_name: str = "Android") -> Path:
+                    calls.append((path, app_name))
+                    return path
+
+                mcp.build_android_scrcpy_app = fake_builder  # type: ignore[assignment]
+
+                result = mcp.ensure_system_android_launcher_app()
+            finally:
+                mcp.sys.platform = original_platform
+                mcp.build_android_scrcpy_app = original_builder  # type: ignore[assignment]
+                if original_path is None:
+                    mcp.os.environ.pop("ANDROID_USE_SYSTEM_ANDROID_APP_PATH", None)
+                else:
+                    mcp.os.environ["ANDROID_USE_SYSTEM_ANDROID_APP_PATH"] = original_path
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["created"])
+        self.assertEqual(calls, [(app_path, "Android Use")])
 
     def test_build_scrcpy_command_defaults_to_device_name_title(self) -> None:
         original_name = mcp.android_device_display_name
@@ -1442,6 +1683,33 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
         self.assertEqual(stopped, [10, 15])
         self.assertEqual(killed, [10, 15])
 
+    def test_prune_scrcpy_processes_removes_legacy_unattributed_app_wrapper(self) -> None:
+        original_rows = mcp.host_process_rows
+        original_bundle = mcp.macos_bundle_identifier_for_pid
+        original_kill = mcp.os.kill
+        original_sleep = mcp.time.sleep
+        killed: list[int] = []
+        try:
+            mcp.host_process_rows = lambda: [
+                {"pid": 10, "ppid": 1, "command": "/opt/homebrew/bin/scrcpy"},
+                {"pid": 20, "ppid": 1, "command": "scrcpy --serial device-1 --window-title 荣耀平板Z6"},
+            ]
+            mcp.macos_bundle_identifier_for_pid = (
+                lambda pid: mcp.ANDROID_USE_BUNDLE_ID if pid in {10, 20} else None
+            )
+            mcp.os.kill = lambda pid, signal: killed.append(pid)  # type: ignore[assignment]
+            mcp.time.sleep = lambda _seconds: None
+
+            stopped = mcp.prune_duplicate_scrcpy_processes("device-1")
+        finally:
+            mcp.host_process_rows = original_rows
+            mcp.macos_bundle_identifier_for_pid = original_bundle
+            mcp.os.kill = original_kill  # type: ignore[assignment]
+            mcp.time.sleep = original_sleep
+
+        self.assertEqual(stopped, [10])
+        self.assertEqual(killed, [10])
+
     def test_connected_device_serials_prefers_one_physical_device(self) -> None:
         original_list_devices = mcp.list_devices
         original_shell = mcp.shell
@@ -1477,11 +1745,13 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
         original_prune = mcp.prune_duplicate_scrcpy_processes
         original_app_visible = mcp.scrcpy_app_wrapper_process_for_serial
         original_clear = mcp.clear_scrcpy_user_closed
+        original_system_app = mcp.ensure_system_android_launcher_app
         try:
             mcp.choose_serial = lambda serial=None: str(serial)
             mcp.prune_duplicate_scrcpy_processes = lambda serial: []
             mcp.scrcpy_app_wrapper_process_for_serial = lambda serial: f"scrcpy {serial}"
             mcp.clear_scrcpy_user_closed = lambda serial: None
+            mcp.ensure_system_android_launcher_app = lambda: {"ok": True, "skipped": "already-present"}  # type: ignore[assignment]
 
             content = mcp.tool_start_scrcpy({"serials": ["device-1", "device-2"]})
         finally:
@@ -1489,6 +1759,7 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
             mcp.prune_duplicate_scrcpy_processes = original_prune
             mcp.scrcpy_app_wrapper_process_for_serial = original_app_visible
             mcp.clear_scrcpy_user_closed = original_clear
+            mcp.ensure_system_android_launcher_app = original_system_app  # type: ignore[assignment]
 
         payload = json.loads(content[0]["text"])
         self.assertTrue(payload["ok"])
@@ -1606,6 +1877,8 @@ adb-ANMB._adb-tls-pairing._tcp.    172.27.31.51:44111
         self.assertTrue(appshot["inputSchema"]["properties"]["save"]["default"])
 
         self.assertIn("android_start_recording", tool_names)
+        self.assertIn("android_start_video_recording", tool_names)
+        self.assertIn("android_stop_video_recording", tool_names)
         self.assertIn("android_create_recipe", tool_names)
         self.assertIn("android_replay_recipe", tool_names)
         self.assertIn("android_index_source", tool_names)

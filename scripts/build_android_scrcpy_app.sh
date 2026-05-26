@@ -38,6 +38,7 @@ mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 rm -rf "$ICONSET"
 mkdir -p "$ICONSET"
 python3 - "$ICON_PNG" "$ICON_WHITE_PNG" <<'PY'
+import os
 import struct
 import sys
 import zlib
@@ -106,18 +107,33 @@ if (bit_depth, color_type, compression, png_filter, interlace) != (8, 6, 0, 0, 0
     raise SystemExit("icon source must be a non-interlaced 8-bit RGBA PNG")
 compressed = b"".join(payload for kind, payload in chunks if kind == b"IDAT")
 rows = unfilter_scanlines(zlib.decompress(compressed), width, height)
+try:
+    content_scale = float(os.environ.get("ANDROID_USE_ICON_CONTENT_SCALE", "0.76"))
+except ValueError:
+    content_scale = 0.76
+content_scale = min(max(content_scale, 0.5), 1.0)
+inner_width = max(1, round(width * content_scale))
+inner_height = max(1, round(height * content_scale))
+left = (width - inner_width) // 2
+top = (height - inner_height) // 2
 encoded_rows = []
-for row in rows:
+for y in range(height):
     rgb = bytearray()
-    for i in range(0, len(row), 4):
-        red, green, blue, alpha = row[i : i + 4]
-        rgb.extend(
-            (
-                (red * alpha + 255 * (255 - alpha) + 127) // 255,
-                (green * alpha + 255 * (255 - alpha) + 127) // 255,
-                (blue * alpha + 255 * (255 - alpha) + 127) // 255,
+    for x in range(width):
+        if left <= x < left + inner_width and top <= y < top + inner_height:
+            source_x = min(width - 1, ((x - left) * width) // inner_width)
+            source_y = min(height - 1, ((y - top) * height) // inner_height)
+            offset = source_x * 4
+            red, green, blue, alpha = rows[source_y][offset : offset + 4]
+            rgb.extend(
+                (
+                    (red * alpha + 255 * (255 - alpha) + 127) // 255,
+                    (green * alpha + 255 * (255 - alpha) + 127) // 255,
+                    (blue * alpha + 255 * (255 - alpha) + 127) // 255,
+                )
             )
-        )
+        else:
+            rgb.extend((255, 255, 255))
     encoded_rows.append(b"\x00" + bytes(rgb))
 output = b"\x89PNG\r\n\x1a\n"
 output += png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))

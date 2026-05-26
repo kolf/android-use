@@ -13,7 +13,9 @@ import contextlib
 import fcntl
 import json
 import os
+import plistlib
 import re
+import signal
 import shlex
 import shutil
 import socket
@@ -43,6 +45,7 @@ RECORDINGS_DIR = ANDROID_USE_DIR / "recordings"
 RECIPES_DIR = ANDROID_USE_DIR / "recipes"
 SOURCE_MAP_DIR = ANDROID_USE_DIR / "app-maps"
 SCREEN_DIR = PLUGIN_ROOT / ".screen"
+VIDEO_RECORDINGS_DIR = SCREEN_DIR / "video-recordings"
 OPENAI_BASE_URL = "https://api.openai.com/v1"
 
 SCRCPY_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
@@ -50,6 +53,8 @@ SCRCPY_LOCK_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
 SCREEN_VIEWER_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
 WEBRTC_VIEWER_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
 ACTIVE_RECORDINGS: dict[str, dict[str, Any]] = {}
+SCRCPY_VIDEO_RECORDING_PROCESSES: dict[str, subprocess.Popen[bytes]] = {}
+SCRCPY_VIDEO_RECORDINGS: dict[str, dict[str, Any]] = {}
 SCRCPY_RESIDENT_THREAD: threading.Thread | None = None
 SCRCPY_RESIDENT_LOCK = threading.Lock()
 SCRCPY_RESIDENT_LOCK_HANDLE: Any | None = None
@@ -9144,6 +9149,29 @@ def macos_app_name(value: str | None) -> str:
     return cleaned[:80] or "Android"
 
 
+def system_android_launcher_app_path() -> Path:
+    configured = os.environ.get("ANDROID_USE_SYSTEM_ANDROID_APP_PATH")
+    if configured:
+        return Path(configured).expanduser()
+    applications_dir = Path(os.environ.get("ANDROID_USE_SYSTEM_APPLICATIONS_DIR", "/Applications")).expanduser()
+    return applications_dir / "Android Use.app"
+
+
+def ensure_system_android_launcher_app() -> dict[str, Any]:
+    if sys.platform != "darwin":
+        return {"ok": True, "skipped": "not-macos"}
+    if not env_flag("ANDROID_USE_SYSTEM_ANDROID_APP", True):
+        return {"ok": True, "skipped": "disabled-by-env"}
+    app_path = system_android_launcher_app_path()
+    if app_path.exists():
+        return {"ok": True, "skipped": "already-present", "app_path": str(app_path)}
+    try:
+        built_path = build_android_scrcpy_app(app_path, "Android Use")
+    except Exception as exc:
+        return {"ok": False, "app_path": str(app_path), "error": str(exc)}
+    return {"ok": True, "created": True, "app_path": str(built_path)}
+
+
 def android_scrcpy_app_path(args: dict[str, Any] | None = None, app_name: str | None = None) -> Path:
     args = args or {}
     if args.get("app_path"):
@@ -9151,7 +9179,34 @@ def android_scrcpy_app_path(args: dict[str, Any] | None = None, app_name: str | 
     configured = os.environ.get("ANDROID_USE_SCRCPY_APP_PATH")
     if configured:
         return Path(configured).expanduser()
-    return ANDROID_USE_DIR / f"{macos_app_name(app_name)}.app"
+    return ANDROID_USE_DIR / "Android Use.app"
+
+
+def using_default_android_scrcpy_app_path(args: dict[str, Any] | None = None) -> bool:
+    args = args or {}
+    return not args.get("app_path") and not os.environ.get("ANDROID_USE_SCRCPY_APP_PATH")
+
+
+def cleanup_legacy_android_scrcpy_apps(current_app_path: Path) -> list[str]:
+    if current_app_path.parent != ANDROID_USE_DIR:
+        return []
+    removed: list[str] = []
+    for app_dir in ANDROID_USE_DIR.glob("*.app"):
+        if app_dir == current_app_path or not app_dir.is_dir():
+            continue
+        info_path = app_dir / "Contents" / "Info.plist"
+        if not info_path.exists():
+            continue
+        try:
+            with info_path.open("rb") as file:
+                plist = plistlib.load(file)
+        except Exception:
+            continue
+        if plist.get("CFBundleIdentifier") != ANDROID_USE_BUNDLE_ID:
+            continue
+        shutil.rmtree(app_dir)
+        removed.append(str(app_dir))
+    return removed
 
 
 def build_android_scrcpy_app(app_path: Path, app_name: str = "Android") -> Path:
@@ -9166,7 +9221,7 @@ def build_android_scrcpy_app(app_path: Path, app_name: str = "Android") -> Path:
 
 
 def build_scrcpy_app_launch_command(command: list[str], app_path: Path) -> list[str]:
-    return ["open", "-na", str(app_path), "--args", "--scrcpy", command[0], *command[1:]]
+    return ["open", "-n", str(app_path), "--args", "--scrcpy", command[0], *command[1:]]
 
 
 def launch_android_scrcpy_app(command: list[str], app_path: Path) -> subprocess.CompletedProcess[bytes]:
@@ -9197,8 +9252,10 @@ def latest_scrcpy_visible_process(serial: str) -> dict[str, Any] | None:
 def start_scrcpy_app_window(args: dict[str, Any], serial: str) -> dict[str, Any]:
     child_args = dict(args)
     child_args.setdefault("window_title", android_device_display_name(serial))
-    app_name = str(child_args["window_title"])
-    app_path = build_android_scrcpy_app(android_scrcpy_app_path(args, app_name), app_name)
+    app_name = "Android Use"
+    app_path = android_scrcpy_app_path(args, app_name)
+    removed_legacy_apps = cleanup_legacy_android_scrcpy_apps(app_path) if using_default_android_scrcpy_app_path(args) else []
+    app_path = build_android_scrcpy_app(app_path, app_name)
     child_args.setdefault("max_size", 0)
     child_args.setdefault("window_scale", 0.5)
     child_args.setdefault("render_driver", "software")
@@ -9225,6 +9282,7 @@ def start_scrcpy_app_window(args: dict[str, Any], serial: str) -> dict[str, Any]
         "bundle_id": ANDROID_USE_BUNDLE_ID,
         "app_name": app_name,
         "window_title": window_title,
+        "removed_legacy_apps": removed_legacy_apps,
         "command": command,
         "launch_command": launch_command,
         "keep_alive": False,
@@ -9235,6 +9293,7 @@ def start_scrcpy_app_window(args: dict[str, Any], serial: str) -> dict[str, Any]
 
 def tool_start_scrcpy_app(args: dict[str, Any]) -> list[dict[str, Any]]:
     serial = choose_serial(args.get("serial"))
+    system_app = ensure_system_android_launcher_app()
     if not bool(args.get("force", False)):
         duplicate_pids = prune_duplicate_scrcpy_processes(serial)
         existing = scrcpy_app_wrapper_process_for_serial(serial)
@@ -9249,12 +9308,14 @@ def tool_start_scrcpy_app(args: dict[str, Any]) -> list[dict[str, Any]]:
                         "process": existing[:500],
                         "stopped_duplicate_pids": duplicate_pids,
                         "launch_mode": "macos_app",
+                        "system_app": system_app,
                         "display": "scrcpy app-wrapper window is already running for this device.",
                     }
                 )
             ]
     clear_scrcpy_user_closed(serial)
     payload = start_scrcpy_app_window(args, serial)
+    payload["system_app"] = system_app
     return [
         text_content(payload)
     ]
@@ -9334,6 +9395,20 @@ def scrcpy_app_wrapper_processes_for_serial(serial: str) -> list[dict[str, Any]]
     return [row for row in scrcpy_visible_processes_for_serial(serial) if is_android_use_app_process(row)]
 
 
+def stale_android_use_scrcpy_processes() -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for row in host_process_rows():
+        command = str(row.get("command") or "")
+        is_scrcpy_binary = re.search(r"(^|\s)(?:\S*/)?scrcpy(\s|$)", command) is not None
+        if not is_scrcpy_binary or "--serial" in command or "-s " in command:
+            continue
+        if "--no-window" in command or "android_webrtc_viewer.py" in command:
+            continue
+        if is_android_use_app_process(row):
+            rows.append(row)
+    return rows
+
+
 def scrcpy_app_wrapper_process_for_serial(serial: str) -> str | None:
     rows = scrcpy_app_wrapper_processes_for_serial(serial)
     if not rows:
@@ -9361,15 +9436,16 @@ def stop_host_process_rows(rows: Iterable[dict[str, Any]]) -> list[int]:
 
 
 def prune_duplicate_scrcpy_processes(serial: str) -> list[int]:
+    stopped_stale = stop_host_process_rows(stale_android_use_scrcpy_processes())
     rows = scrcpy_visible_processes_for_serial(serial)
     if not rows:
-        return []
+        return stopped_stale
     app_rows = [row for row in rows if is_android_use_app_process(row)]
     if not app_rows:
-        return stop_host_process_rows(rows)
+        return stopped_stale + stop_host_process_rows(rows)
     app_rows.sort(key=lambda row: int(row.get("pid") or 0), reverse=True)
     keep_pid = int(app_rows[0].get("pid") or 0)
-    return stop_host_process_rows(row for row in rows if int(row.get("pid") or 0) != keep_pid)
+    return stopped_stale + stop_host_process_rows(row for row in rows if int(row.get("pid") or 0) != keep_pid)
 
 
 def ensure_default_scrcpy_window(serial: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -9566,6 +9642,111 @@ def read_json_file(path: Path) -> dict[str, Any]:
         return {}
 
 
+def video_recording_state_path(serial: str) -> Path:
+    return SCREEN_DIR / f"scrcpy-video-recording-{slugify(serial)}.json"
+
+
+def host_pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def clear_video_recording_state(serial: str) -> None:
+    SCRCPY_VIDEO_RECORDINGS.pop(serial, None)
+    with contextlib.suppress(OSError):
+        video_recording_state_path(serial).unlink()
+
+
+def active_video_recording(serial: str) -> dict[str, Any] | None:
+    recording = SCRCPY_VIDEO_RECORDINGS.get(serial)
+    process = SCRCPY_VIDEO_RECORDING_PROCESSES.get(serial)
+    if recording and process and process.poll() is None:
+        return recording
+    payload = read_json_file(video_recording_state_path(serial))
+    if not payload:
+        return None
+    try:
+        pid = int(payload.get("pid") or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    if host_pid_alive(pid):
+        SCRCPY_VIDEO_RECORDINGS[serial] = payload
+        return payload
+    clear_video_recording_state(serial)
+    return None
+
+
+def build_video_recording_command(args: dict[str, Any], serial: str, output_path: Path) -> list[str]:
+    record_format = str(args.get("record_format") or "mp4").strip().lower()
+    if record_format not in {"mp4", "mkv"}:
+        raise AndroidUseError("record_format must be mp4 or mkv.")
+    command = [
+        scrcpy_binary(),
+        "--serial",
+        serial,
+        "--no-window",
+        "--record",
+        str(output_path),
+        "--record-format",
+        record_format,
+    ]
+    max_size = int(args.get("max_size", 0) or 0)
+    if max_size:
+        command.extend(["-m", str(max_size)])
+    bit_rate = args.get("bit_rate")
+    if bit_rate:
+        command.extend(["-b", str(bit_rate)])
+    if not args.get("audio", False):
+        command.append("--no-audio")
+    extra_args = args.get("extra_args") or []
+    if not isinstance(extra_args, list):
+        raise AndroidUseError("extra_args must be a list of scrcpy command arguments.")
+    command.extend(str(item) for item in extra_args)
+    return command
+
+
+def stop_video_recording_process(serial: str, recording: dict[str, Any], timeout_sec: float) -> bool:
+    process = SCRCPY_VIDEO_RECORDING_PROCESSES.pop(serial, None)
+    if process is not None:
+        if process.poll() is not None:
+            return False
+        process.send_signal(signal.SIGINT)
+        try:
+            process.wait(timeout=timeout_sec)
+            return True
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            return True
+
+    try:
+        pid = int(recording.get("pid") or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    if pid <= 0 or not host_pid_alive(pid):
+        return False
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.kill(pid, signal.SIGINT)
+    deadline = time.monotonic() + max(timeout_sec, 0.1)
+    while time.monotonic() < deadline:
+        if not host_pid_alive(pid):
+            return True
+        time.sleep(0.05)
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.kill(pid, signal.SIGTERM)
+    return True
+
+
 def terminate_process(process: subprocess.Popen[bytes], *, timeout: float = 3) -> bool:
     if process.poll() is not None:
         return False
@@ -9576,6 +9757,103 @@ def terminate_process(process: subprocess.Popen[bytes], *, timeout: float = 3) -
         process.kill()
         return True
     return True
+
+
+def tool_start_video_recording(args: dict[str, Any]) -> list[dict[str, Any]]:
+    serial = choose_serial(args.get("serial"))
+    existing = active_video_recording(serial)
+    if existing:
+        return [
+            text_content(
+                {
+                    "ok": True,
+                    "serial": serial,
+                    "skipped": "already-recording",
+                    "pid": existing.get("pid"),
+                    "file_path": existing.get("file_path"),
+                    "started_at": existing.get("started_at"),
+                }
+            )
+        ]
+
+    record_format = str(args.get("record_format") or "mp4").strip().lower()
+    name = slugify(str(args.get("name") or "android-video"), "android-video")
+    if args.get("output_path"):
+        output_path = Path(str(args["output_path"])).expanduser()
+    else:
+        output_path = VIDEO_RECORDINGS_DIR / f"{time.strftime('%Y%m%d-%H%M%S', time.localtime())}-{name}.{record_format}"
+    if output_path.suffix.lower() != f".{record_format}":
+        output_path = output_path.with_suffix(f".{record_format}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path = output_path.with_suffix(output_path.suffix + ".log")
+    command = build_video_recording_command(args, serial, output_path)
+    try:
+        with log_path.open("ab") as log_file:
+            process = subprocess.Popen(
+                command,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                env=tool_env(),
+            )
+    except FileNotFoundError as exc:
+        raise AndroidUseError(f"Command not found: {command[0]}") from exc
+    time.sleep(0.2)
+    if process.poll() is not None:
+        log_tail = ""
+        with contextlib.suppress(OSError):
+            log_tail = log_path.read_text(errors="replace")[-1200:]
+        raise AndroidUseError(f"scrcpy video recording failed to start.\n{log_tail}".rstrip())
+
+    recording = {
+        "ok": True,
+        "serial": serial,
+        "pid": process.pid,
+        "file_path": str(output_path),
+        "log_path": str(log_path),
+        "started_at": timestamp_iso(),
+        "started_at_epoch": time.time(),
+        "record_format": record_format,
+        "command": command,
+    }
+    SCRCPY_VIDEO_RECORDING_PROCESSES[serial] = process
+    SCRCPY_VIDEO_RECORDINGS[serial] = recording
+    write_json(video_recording_state_path(serial), recording)
+    return [
+        text_content(
+            {
+                **recording,
+                "message": "scrcpy video recording started. Stop it with android_stop_video_recording.",
+            }
+        )
+    ]
+
+
+def tool_stop_video_recording(args: dict[str, Any]) -> list[dict[str, Any]]:
+    serial = choose_serial(args.get("serial"))
+    recording = active_video_recording(serial)
+    if not recording:
+        raise AndroidUseError(f"No active scrcpy video recording for device {serial}.")
+    timeout_sec = max(0.1, min(float(args.get("timeout_sec", 5)), 30.0))
+    stopped = stop_video_recording_process(serial, recording, timeout_sec)
+    clear_video_recording_state(serial)
+    output_path = Path(str(recording.get("file_path") or "")).expanduser()
+    size_bytes = output_path.stat().st_size if output_path.exists() else 0
+    duration_sec = round(time.time() - float(recording.get("started_at_epoch") or time.time()), 3)
+    return [
+        text_content(
+            {
+                "ok": True,
+                "serial": serial,
+                "stopped": stopped,
+                "pid": recording.get("pid"),
+                "file_path": str(output_path),
+                "log_path": recording.get("log_path"),
+                "size_bytes": size_bytes,
+                "duration_sec": duration_sec,
+                "markdown": f"![android-video-recording]({output_path})",
+            }
+        )
+    ]
 
 
 def tool_start_scrcpy(args: dict[str, Any]) -> list[dict[str, Any]]:
@@ -9608,6 +9886,7 @@ def tool_start_scrcpy(args: dict[str, Any]) -> list[dict[str, Any]]:
         ]
 
     serial = choose_serial(args.get("serial"))
+    system_app = ensure_system_android_launcher_app()
     if not bool(args.get("force", False)):
         duplicate_pids = prune_duplicate_scrcpy_processes(serial)
         existing = scrcpy_app_wrapper_process_for_serial(serial)
@@ -9622,6 +9901,7 @@ def tool_start_scrcpy(args: dict[str, Any]) -> list[dict[str, Any]]:
                         "process": existing[:500],
                         "stopped_duplicate_pids": duplicate_pids,
                         "launch_mode": "macos_app",
+                        "system_app": system_app,
                         "display": "scrcpy app-wrapper window is already running for this device.",
                     }
                 )
@@ -9632,6 +9912,7 @@ def tool_start_scrcpy(args: dict[str, Any]) -> list[dict[str, Any]]:
     child_args.setdefault("window_scale", 0.5)
     child_args.setdefault("render_driver", "software")
     payload = start_scrcpy_app_window(child_args, serial)
+    payload["system_app"] = system_app
     payload["requested_keep_alive"] = bool(args.get("keep_alive", True))
     payload["keep_alive"] = False
     payload["keep_alive_note"] = "Visible scrcpy windows are always launched through the macOS app wrapper; resident/on-demand checks reopen the app when needed."
@@ -11758,6 +12039,49 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_replay_recipe,
+    },
+    "android_start_video_recording": {
+        "description": "Immediately start a scrcpy MP4 screen recording for the selected Android device without observing or planning.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "serial": {"type": "string"},
+                "name": {"type": "string", "description": "Optional file name slug for the generated recording."},
+                "output_path": {"type": "string", "description": "Optional local output path. Defaults under .screen/video-recordings/."},
+                "record_format": {
+                    "type": "string",
+                    "default": "mp4",
+                    "enum": ["mp4", "mkv"],
+                    "description": "scrcpy recording container format. Use mp4 for user-facing video.",
+                },
+                "max_size": {
+                    "type": "integer",
+                    "default": 0,
+                    "description": "scrcpy max video size. 0 keeps the device stream at native size.",
+                },
+                "bit_rate": {"type": "string", "default": "8M"},
+                "audio": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Enable audio capture/forwarding. Disabled by default for reliability.",
+                },
+                "extra_args": {"type": "array", "items": {"type": "string"}},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_start_video_recording,
+    },
+    "android_stop_video_recording": {
+        "description": "Immediately stop the active scrcpy video recording and return the MP4 path for display in Codex.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "serial": {"type": "string"},
+                "timeout_sec": {"type": "number", "default": 5},
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_stop_video_recording,
     },
     "android_index_source": {
         "description": "Scan Android app source code and write an app-map JSON with activities, routes, ids, and visible labels.",

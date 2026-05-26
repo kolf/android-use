@@ -54,6 +54,8 @@ def main() -> int:
             "android_agent_step",
             "android_start_scrcpy",
             "android_start_scrcpy_app",
+            "android_start_video_recording",
+            "android_stop_video_recording",
             "android_wireless_pair",
             "android_wireless_reconnect",
         }
