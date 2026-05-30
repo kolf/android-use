@@ -68,7 +68,31 @@ assert "android-use" in mcp["mcpServers"], mcp
 print("ok   plugin manifest and mcp config")
 PY
 
-python3 -m py_compile "$ROOT/scripts/android_use_mcp.py" "$ROOT/scripts/test_android_use_mcp.py"
+ROOT="$ROOT" python3 - <<'PY'
+import os
+from pathlib import Path
+
+root = Path(os.environ["ROOT"])
+limit = 2000
+paths = [
+    path
+    for path in (root / "scripts").rglob("*.py")
+    if "__pycache__" not in path.parts
+]
+offenders = []
+for path in paths:
+    line_count = len(path.read_text().splitlines())
+    if line_count > limit:
+        offenders.append(f"{path.relative_to(root)}: {line_count}")
+assert not offenders, "Python source files exceed 2000 lines: " + ", ".join(offenders)
+print("ok   Python source line count <= 2000")
+PY
+
+python3 -m py_compile \
+  "$ROOT/scripts/android_use_mcp.py" \
+  "$ROOT"/scripts/android_use_parts/*.py \
+  "$ROOT/scripts/test_android_use_mcp.py" \
+  "$ROOT"/scripts/android_use_test_parts/*.py
 python3 "$ROOT/scripts/test_android_use_mcp.py"
 
 if [ -f "$CODEX_CACHE_PLUGIN_PATH/.codex-plugin/plugin.json" ]; then

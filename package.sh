@@ -26,7 +26,12 @@ zip -r "$OUT" "$NAME" \
   -x "$NAME/tools/*" \
   -x "$NAME/.codex/*" \
   -x "$NAME/__pycache__/*" \
+  -x "$NAME/scripts/__pycache__" \
   -x "$NAME/scripts/__pycache__/*" \
+  -x "$NAME/scripts/*/__pycache__" \
+  -x "$NAME/scripts/*/__pycache__/*" \
+  -x "$NAME/scripts/*/*/__pycache__" \
+  -x "$NAME/scripts/*/*/__pycache__/*" \
   -x "$NAME/skills/*/__pycache__/*" \
   -x "$NAME/dist/*" \
   -x "$NAME/.DS_Store" \

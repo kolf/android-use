@@ -477,9 +477,14 @@ export ANDROID_USE_SCRCPY_RESIDENT_SERIALS=设备1序列号,设备2序列号
 
 ### 可以不用 USB 线吗
 
-可以用 adb wireless，但第一次配置通常还是需要 USB 线。小白用户建议先用 USB 跑通，稳定后再让 Codex 帮你配置无线调试。
+可以用 adb wireless。没有设备时，Android 插件会提示两种连接方式：
 
-一台设备配对成功后，`android_wireless_pair` 会把它追加到 `~/.config/android-use/env` 的 `ANDROID_USE_WIRELESS_DEVICES` 和 `ANDROID_USE_SCRCPY_RESIDENT_SERIALS`。多台设备分别配对后，可以调用：
+- 有线：用 USB 线连接设备，打开开发者选项里的 USB 调试，并在设备弹窗里允许调试。
+- 无线：调用 `android_wireless_pair_qr(action="create")` 生成配对二维码，在设备的无线调试页面选择“使用二维码配对设备”扫码；扫码后调用 `android_wireless_pair_qr(action="complete", session_id="返回的 session_id")` 完成 `adb pair`、保存配置并重连。
+
+也可以继续用手输配对码的方式：在设备无线调试页选择“使用配对码配对设备”，再调用 `android_wireless_pair(host="设备 IP", pair_port=配对端口, code="配对码")`。
+
+一台设备配对成功后，`android_wireless_pair_qr` 或 `android_wireless_pair` 会把它追加到 `~/.config/android-use/env` 的 `ANDROID_USE_WIRELESS_DEVICES` 和 `ANDROID_USE_SCRCPY_RESIDENT_SERIALS`。多台设备分别配对后，可以调用：
 
 ```text
 android_wireless_reconnect(all=true, start_scrcpy=true)
