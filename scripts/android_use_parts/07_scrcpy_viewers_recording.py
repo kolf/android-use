@@ -315,8 +315,6 @@ def is_visible_scrcpy_command(command: str, serial: str) -> bool:
         return False
     if "--no-window" in command:
         return False
-    if "android_webrtc_viewer.py" in command:
-        return False
     return True
 
 
@@ -366,7 +364,7 @@ def stale_android_use_scrcpy_processes() -> list[dict[str, Any]]:
         is_scrcpy_binary = re.search(r"(^|\s)(?:\S*/)?scrcpy(\s|$)", command) is not None
         if not is_scrcpy_binary or "--serial" in command or "-s " in command:
             continue
-        if "--no-window" in command or "android_webrtc_viewer.py" in command:
+        if "--no-window" in command:
             continue
         if is_android_use_app_process(row):
             rows.append(row)
@@ -1085,7 +1083,7 @@ def tool_stop_scrcpy(args: dict[str, Any]) -> list[dict[str, Any]]:
         for row in host_process_rows():
             command = str(row.get("command") or "")
             is_visible = re.search(r"(^|\s)(?:\S*/)?scrcpy(\s|$)", command) is not None and "--no-window" not in command
-            if is_visible and "android_webrtc_viewer.py" not in command:
+            if is_visible:
                 pids.append(int(row["pid"]))
     else:
         pids = []
@@ -1117,11 +1115,101 @@ def pick_free_port(host: str) -> int:
         return int(sock.getsockname()[1])
 
 
+def screen_viewer_session_dir(serial: str, requested: str | None = None) -> Path:
+    if requested:
+        return Path(requested).expanduser()
+    return SCREEN_DIR / "timelines" / f"{slugify(serial)}-{int(time.time() * 1000)}"
+
+
+def redact_timeline_value(key: str, value: Any) -> Any:
+    lowered = key.casefold()
+    if any(secret in lowered for secret in ("password", "token", "secret", "api_key", "apikey", "authorization")):
+        return {"redacted": True, "chars": len(str(value))}
+    if lowered == "text":
+        return {"redacted": True, "chars": len(str(value))}
+    if isinstance(value, dict):
+        return {str(child_key): redact_timeline_value(str(child_key), child_value) for child_key, child_value in value.items()}
+    if isinstance(value, list):
+        return [redact_timeline_value(key, item) for item in value[:20]]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def redact_timeline_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {str(key): redact_timeline_value(str(key), value) for key, value in payload.items() if key != "serial"}
+
+
+def append_screen_timeline_event(session: dict[str, Any], event: dict[str, Any]) -> None:
+    events_path = Path(str(session["events_path"]))
+    events_path.parent.mkdir(parents=True, exist_ok=True)
+    with events_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
+def timeline_action_after_delay_sec() -> float:
+    raw = os.environ.get("ANDROID_USE_TIMELINE_AFTER_DELAY_SEC", "0.8")
+    try:
+        delay = float(raw)
+    except (TypeError, ValueError):
+        delay = 0.8
+    return max(0.0, min(delay, 5.0))
+
+
+def append_screen_timeline_action(
+    serial: str,
+    action: str,
+    args: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    before: dict[str, Any] | None = None,
+) -> None:
+    session = SCREEN_VIEWER_SESSIONS.get(serial)
+    if not session:
+        return
+    session_dir = Path(str(session["session_dir"]))
+    shots_dir = session_dir / "shots"
+    shots_dir.mkdir(parents=True, exist_ok=True)
+    after_delay_sec = timeline_action_after_delay_sec()
+    if after_delay_sec > 0:
+        time.sleep(after_delay_sec)
+    png = screenshot_png(serial)
+    event_id = f"{int(time.time() * 1000)}-action-{slugify(action)}"
+    filename = f"{event_id}.png"
+    shot_path = shots_dir / filename
+    shot_path.write_bytes(png)
+    arguments = redact_timeline_payload(args)
+    detail = ", ".join(f"{key}={value}" for key, value in arguments.items() if value not in (None, "", {}))
+    event = {
+        "id": event_id,
+        "kind": "action",
+        "title": action,
+        "detail": detail[:500],
+        "timestamp": timestamp_iso(),
+        "timestamp_epoch": time.time(),
+        "serial": serial,
+        "action": action,
+        "after_delay_sec": after_delay_sec,
+        "arguments": arguments,
+        "focused_window_before": (before or {}).get("state", {}).get("focused_window") if isinstance(before, dict) else None,
+        "screenshot_path": str(shot_path),
+        "screenshot_url": f"/shots/{filename}",
+        "screen": png_size(png),
+        "bytes": len(png),
+        "digest": hashlib.sha256(png).hexdigest()[:16],
+        "result": {key: result.get(key) for key in ("ok", "action", "focused_window", "x", "y", "url", "path") if key in result},
+    }
+    append_screen_timeline_event(session, event)
+
+
 def tool_start_screen_viewer(args: dict[str, Any]) -> list[dict[str, Any]]:
     serial = choose_serial(args.get("serial"))
     host = str(args.get("host", "127.0.0.1"))
     port = int(args.get("port") or pick_free_port(host))
     interval_ms = max(250, min(int(args.get("interval_ms", 1000)), 10000))
+    max_events = max(10, min(int(args.get("max_events", 80)), 500))
+    session_dir = screen_viewer_session_dir(serial, args.get("session_dir") if args.get("session_dir") else None)
+    events_path = session_dir / "events.jsonl"
     viewer_script = PLUGIN_ROOT / "scripts" / "android_screen_viewer.py"
     if not viewer_script.exists():
         raise AndroidUseError(f"Screen viewer script not found: {viewer_script}")
@@ -1137,11 +1225,16 @@ def tool_start_screen_viewer(args: dict[str, Any]) -> list[dict[str, Any]]:
         str(port),
         "--interval-ms",
         str(interval_ms),
+        "--session-dir",
+        str(session_dir),
+        "--max-events",
+        str(max_events),
         "--adb",
         adb_binary(),
     ]
-    log_path = SCREEN_DIR / "viewer.log"
+    log_path = session_dir / "viewer.log"
     SCREEN_DIR.mkdir(parents=True, exist_ok=True)
+    session_dir.mkdir(parents=True, exist_ok=True)
     log_handle = log_path.open("ab")
     try:
         process = subprocess.Popen(
@@ -1149,18 +1242,26 @@ def tool_start_screen_viewer(args: dict[str, Any]) -> list[dict[str, Any]]:
             stdout=log_handle,
             stderr=log_handle,
             env=tool_env(),
+            start_new_session=True,
         )
     except FileNotFoundError as exc:
         log_handle.close()
         raise AndroidUseError(f"Command not found: {command[0]}") from exc
+    log_handle.close()
 
     time.sleep(0.4)
     if process.poll() is not None:
-        log_handle.close()
         log_text = log_path.read_text(errors="replace") if log_path.exists() else ""
         raise AndroidUseError(f"Android screen viewer failed to start.\n{log_text[-2000:]}")
 
     SCREEN_VIEWER_PROCESSES[process.pid] = process
+    SCREEN_VIEWER_SESSIONS[serial] = {
+        "pid": process.pid,
+        "serial": serial,
+        "session_dir": str(session_dir),
+        "events_path": str(events_path),
+        "url": f"http://{host}:{port}/",
+    }
     url = f"http://{host}:{port}/"
     return [
         text_content(
@@ -1170,7 +1271,11 @@ def tool_start_screen_viewer(args: dict[str, Any]) -> list[dict[str, Any]]:
                 "pid": process.pid,
                 "url": url,
                 "interval_ms": interval_ms,
+                "max_events": max_events,
+                "session_dir": str(session_dir),
+                "events_path": str(events_path),
                 "log_path": str(log_path),
+                "display": "Open the returned URL to view the screenshot timeline and action steps.",
             }
         )
     ]
@@ -1191,103 +1296,8 @@ def tool_stop_screen_viewer(args: dict[str, Any]) -> list[dict[str, Any]]:
         if process and process.poll() is None:
             process.terminate()
             stopped.append(pid)
-    return [text_content({"ok": True, "stopped_pids": stopped})]
-
-
-def webrtc_python_binary() -> str:
-    configured = os.environ.get("ANDROID_USE_WEBRTC_PYTHON")
-    if configured:
-        return configured
-    venv_python = PLUGIN_ROOT / ".venv" / "bin" / "python"
-    if venv_python.exists():
-        return str(venv_python)
-    return sys.executable
-
-
-def tool_start_webrtc_viewer(args: dict[str, Any]) -> list[dict[str, Any]]:
-    serial = choose_serial(args.get("serial"))
-    host = str(args.get("host", "127.0.0.1"))
-    port = int(args.get("port") or pick_free_port(host))
-    max_size = int(args.get("max_size", 960))
-    bit_rate = str(args.get("bit_rate", "4M"))
-    max_fps = int(args.get("max_fps", 30))
-    viewer_script = PLUGIN_ROOT / "scripts" / "android_webrtc_viewer.py"
-    if not viewer_script.exists():
-        raise AndroidUseError(f"WebRTC viewer script not found: {viewer_script}")
-
-    command = [
-        webrtc_python_binary(),
-        str(viewer_script),
-        "--serial",
-        serial,
-        "--host",
-        host,
-        "--port",
-        str(port),
-        "--adb",
-        adb_binary(),
-        "--scrcpy",
-        scrcpy_binary(),
-        "--max-size",
-        str(max_size),
-        "--bit-rate",
-        bit_rate,
-        "--max-fps",
-        str(max_fps),
-    ]
-    SCREEN_DIR.mkdir(parents=True, exist_ok=True)
-    log_path = SCREEN_DIR / "webrtc-viewer.log"
-    log_handle = log_path.open("ab")
-    try:
-        process = subprocess.Popen(
-            command,
-            stdout=log_handle,
-            stderr=log_handle,
-            env=tool_env(),
-            start_new_session=True,
-        )
-    except FileNotFoundError as exc:
-        log_handle.close()
-        raise AndroidUseError(f"Command not found: {command[0]}") from exc
-    log_handle.close()
-    time.sleep(0.8)
-    if process.poll() is not None:
-        log_text = log_path.read_text(errors="replace") if log_path.exists() else ""
-        raise AndroidUseError(f"Android WebRTC viewer failed to start.\n{log_text[-3000:]}")
-
-    WEBRTC_VIEWER_PROCESSES[process.pid] = process
-    url = f"http://{host}:{port}/"
-    return [
-        text_content(
-            {
-                "ok": True,
-                "serial": serial,
-                "pid": process.pid,
-                "url": url,
-                "log_path": str(log_path),
-                "python": command[0],
-                "max_size": max_size,
-                "bit_rate": bit_rate,
-                "max_fps": max_fps,
-                "display": "Open the returned URL in Codex to view the Android screen over WebRTC.",
-            }
-        )
-    ]
-
-
-def tool_stop_webrtc_viewer(args: dict[str, Any]) -> list[dict[str, Any]]:
-    stopped: list[int] = []
-    requested_pid = args.get("pid")
-    if requested_pid:
-        pids = [int(requested_pid)]
-    elif args.get("all", True):
-        pids = list(WEBRTC_VIEWER_PROCESSES)
-    else:
-        pids = []
-
-    for pid in pids:
-        process = WEBRTC_VIEWER_PROCESSES.pop(pid, None)
-        if process and process.poll() is None:
-            process.terminate()
-            stopped.append(pid)
+    stopped_set = set(stopped)
+    for session_serial, session in list(SCREEN_VIEWER_SESSIONS.items()):
+        if int(session.get("pid") or -1) in stopped_set:
+            SCREEN_VIEWER_SESSIONS.pop(session_serial, None)
     return [text_content({"ok": True, "stopped_pids": stopped})]

@@ -563,7 +563,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_xiaoluxue_map_snapshot,
     },
     "xiaoluxue_open_native_subject": {
-        "description": "Open Xiaoluxue native study subject map through the app-only SchemeProxyActivity route, e.g. subject_id=1 for 语文, without using a browser or WebRTC.",
+        "description": "Open Xiaoluxue native study subject map through the app-only SchemeProxyActivity route, e.g. subject_id=1 for 语文, without using a browser.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1179,7 +1179,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_start_scrcpy_app,
     },
     "android_scrcpy_resident_status": {
-        "description": "Report and start the background monitor. It never starts WebRTC and respects manual scrcpy window closes until the next Android tool call.",
+        "description": "Report and start the background monitor. It respects manual scrcpy window closes until the next Android tool call.",
         "inputSchema": {
             "type": "object",
             "properties": {},
@@ -1200,14 +1200,20 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_stop_scrcpy,
     },
     "android_start_screen_viewer": {
-        "description": "Start a local Codex-friendly web viewer that refreshes the Android screen image.",
+        "description": "Start a local Codex-friendly Android action timeline web UI backed by screenshots. It records only Android Use tool action steps, without video streaming or periodic screen polling.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "serial": {"type": "string"},
                 "host": {"type": "string", "default": "127.0.0.1"},
                 "port": {"type": "integer", "description": "Optional local port. Uses a free port when omitted."},
-                "interval_ms": {"type": "integer", "default": 1000},
+                "interval_ms": {
+                    "type": "integer",
+                    "default": 1000,
+                    "description": "Local event-stream file check interval. It does not capture screenshots.",
+                },
+                "session_dir": {"type": "string", "description": "Optional directory for timeline events and screenshots."},
+                "max_events": {"type": "integer", "default": 80},
             },
             "additionalProperties": False,
         },
@@ -1224,34 +1230,6 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_stop_screen_viewer,
-    },
-    "android_start_webrtc_viewer": {
-        "description": "Start a local WebRTC viewer that streams the Android screen from scrcpy into a Codex-openable web page.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "serial": {"type": "string"},
-                "host": {"type": "string", "default": "127.0.0.1"},
-                "port": {"type": "integer", "description": "Optional local port. Uses a free port when omitted."},
-                "max_size": {"type": "integer", "default": 960},
-                "bit_rate": {"type": "string", "default": "4M"},
-                "max_fps": {"type": "integer", "default": 30},
-            },
-            "additionalProperties": False,
-        },
-        "handler": tool_start_webrtc_viewer,
-    },
-    "android_stop_webrtc_viewer": {
-        "description": "Stop Android WebRTC viewer processes launched by this MCP server.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "pid": {"type": "integer"},
-                "all": {"type": "boolean", "default": True},
-            },
-            "additionalProperties": False,
-        },
-        "handler": tool_stop_webrtc_viewer,
     },
     "android_agent_step": {
         "description": "Run one Agent-TARS-style Android step. Hybrid mode first tries UIAutomator text grounding, then VLM visual grounding.",
@@ -1280,7 +1258,7 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "show_scrcpy": {
                     "type": "boolean",
                     "default": True,
-                    "description": "Ensure a visible desktop scrcpy window before executing. Reuses an existing visible scrcpy process and does not start WebRTC.",
+                    "description": "Ensure a visible desktop scrcpy window before executing. Reuses an existing visible scrcpy process.",
                 },
             },
             "required": ["instruction"],
@@ -1316,7 +1294,7 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "show_scrcpy": {
                     "type": "boolean",
                     "default": True,
-                    "description": "Ensure a visible desktop scrcpy window before executing. Reuses an existing visible scrcpy process and does not start WebRTC.",
+                    "description": "Ensure a visible desktop scrcpy window before executing. Reuses an existing visible scrcpy process.",
                 },
             },
             "required": ["instruction"],

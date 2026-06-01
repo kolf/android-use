@@ -212,7 +212,10 @@ class AndroidUseMcpTestsPart3(unittest.TestCase):
         self.assertIn("android_observe", tool_names)
         self.assertIn("android_tap_text", tool_names)
         self.assertIn("android_start_screen_viewer", tool_names)
-        self.assertIn("android_start_webrtc_viewer", tool_names)
+        old_stream_tool = "android_start_" + "web" + "rtc_viewer"
+        old_stop_tool = "android_stop_" + "web" + "rtc_viewer"
+        self.assertNotIn(old_stream_tool, tool_names)
+        self.assertNotIn(old_stop_tool, tool_names)
         self.assertIn("android_agent_run", tool_names)
         self.assertIn("android_agent_tars_run", tool_names)
         self.assertIn("android_start_scrcpy_app", tool_names)
@@ -237,6 +240,10 @@ class AndroidUseMcpTestsPart3(unittest.TestCase):
         appshot = next(tool for tool in mcp.tool_descriptors() if tool["name"] == "android_appshot")
         self.assertTrue(appshot["inputSchema"]["properties"]["include_image"]["default"])
         self.assertTrue(appshot["inputSchema"]["properties"]["save"]["default"])
+
+        screen_viewer = next(tool for tool in mcp.tool_descriptors() if tool["name"] == "android_start_screen_viewer")
+        self.assertIn("session_dir", screen_viewer["inputSchema"]["properties"])
+        self.assertIn("max_events", screen_viewer["inputSchema"]["properties"])
 
         self.assertIn("android_start_recording", tool_names)
         self.assertIn("android_start_video_recording", tool_names)
@@ -370,15 +377,17 @@ class AndroidUseMcpTestsPart3(unittest.TestCase):
         original_focus = mcp.get_focused_window
         original_observe = mcp.observe_ui
         original_adb = mcp.adb
-        original_type = mcp.type_focused_text_fast
+        original_type = mcp.xiaoluxue_type_login_text
         original_record = mcp.append_recording_step
         login_focus = f"{mcp.XIAOLUXUE_STUDENT_PACKAGE}/{mcp.XIAOLUXUE_LOGIN_ACTIVITY}"
         home_focus = f"{mcp.XIAOLUXUE_STUDENT_PACKAGE}/com.xiaoluxue.ai.student.LauncherActivity"
         focus_values = [login_focus, home_focus]
         typed: list[str] = []
+        password_value = ""
         taps: list[tuple[str, ...]] = []
         records: list[dict[str, object]] = []
         agreement_checked = False
+        submitted = False
 
         def node(resource: str, bounds: str, text: str = "", checked: bool = False) -> dict[str, object]:
             parsed = mcp.parse_bounds(bounds)
@@ -397,12 +406,16 @@ class AndroidUseMcpTestsPart3(unittest.TestCase):
             mcp.get_focused_window = lambda serial: focus_values.pop(0) if focus_values else home_focus
 
             def fake_observe(serial: str, include_xml: bool = False, limit: int = 160) -> dict[str, object]:
+                if submitted:
+                    return {"state": {"focused_window": home_focus}, "ui": {"nodes": []}}
                 return {
                     "state": {"focused_window": login_focus},
                     "ui": {
                         "nodes": [
                             node("edit_input", "[720,230][1280,310]", text="jvdz162974"),
-                            node("edit_input", "[720,430][1280,510]"),
+                            node("edit_input", "[720,430][1280,510]", text=password_value),
+                            node("edit_account", "[700,220][1300,320]"),
+                            node("edit_password", "[700,420][1300,520]"),
                             node("cb_agreement", "[690,620][730,660]", checked=agreement_checked),
                             node("button", "[720,700][1280,800]", text="登录"),
                         ]
@@ -410,16 +423,25 @@ class AndroidUseMcpTestsPart3(unittest.TestCase):
                 }
 
             def fake_adb(command: list[str], serial: str | None = None, timeout: int | float = 30, **kwargs: object) -> bytes:
-                nonlocal agreement_checked
+                nonlocal agreement_checked, submitted
                 if command[:3] == ["shell", "input", "tap"]:
                     taps.append(tuple(command))
                     if command[-2:] == ["710", "640"]:
                         agreement_checked = True
+                    if command[-2:] == ["1000", "750"]:
+                        submitted = True
                 return b""
 
             mcp.observe_ui = fake_observe
             mcp.adb = fake_adb
-            mcp.type_focused_text_fast = lambda serial, text, **kwargs: typed.append(text) or "adb_keyboard_broadcast"
+
+            def fake_type(serial: str, text: str, **kwargs: object) -> str:
+                nonlocal password_value
+                typed.append(text)
+                password_value = "•" * len(text)
+                return "adb_shell_batch_login"
+
+            mcp.xiaoluxue_type_login_text = fake_type
             mcp.append_recording_step = lambda serial, action, arguments, result, **kwargs: records.append(arguments)
 
             result = mcp.run_xiaoluxue_login_fast_path(
@@ -431,7 +453,7 @@ class AndroidUseMcpTestsPart3(unittest.TestCase):
             mcp.get_focused_window = original_focus
             mcp.observe_ui = original_observe
             mcp.adb = original_adb
-            mcp.type_focused_text_fast = original_type
+            mcp.xiaoluxue_type_login_text = original_type
             mcp.append_recording_step = original_record
 
         self.assertTrue(result["ok"])
@@ -440,6 +462,248 @@ class AndroidUseMcpTestsPart3(unittest.TestCase):
         self.assertIn(("shell", "input", "tap", "710", "640"), taps)
         self.assertTrue(records[-1]["password_redacted"])
         self.assertNotIn("secret", json.dumps(records, ensure_ascii=False))
+
+    def test_xiaoluxue_login_fast_path_reports_business_failure_from_logcat(self) -> None:
+        original_focus = mcp.get_focused_window
+        original_observe = mcp.observe_ui
+        original_adb = mcp.adb
+        original_type = mcp.xiaoluxue_type_login_text
+        login_focus = f"{mcp.XIAOLUXUE_STUDENT_PACKAGE}/{mcp.XIAOLUXUE_LOGIN_ACTIVITY}"
+        password_value = ""
+
+        def node(resource: str, bounds: str, text: str = "", checked: bool = False) -> dict[str, object]:
+            parsed = mcp.parse_bounds(bounds)
+            return {
+                "text": text,
+                "content_desc": "",
+                "resource_id": f"{mcp.XIAOLUXUE_STUDENT_PACKAGE}:id/{resource}",
+                "bounds": parsed,
+                "center": mcp.bounds_center(parsed),
+                "clickable": True,
+                "enabled": True,
+                "checked": checked,
+            }
+
+        try:
+            mcp.get_focused_window = lambda serial: login_focus
+
+            def fake_observe(serial: str, include_xml: bool = False, limit: int = 160) -> dict[str, object]:
+                return {
+                    "state": {"focused_window": login_focus},
+                    "ui": {
+                        "nodes": [
+                            node("edit_input", "[720,230][1280,310]", text="26291234"),
+                            node("edit_input", "[720,430][1280,510]", text=password_value),
+                            node("edit_account", "[700,220][1300,320]"),
+                            node("edit_password", "[700,420][1300,520]"),
+                            node("cb_agreement", "[690,620][730,660]", checked=True),
+                            node("button", "[720,700][1280,800]", text="登录"),
+                        ]
+                    },
+                }
+
+            def fake_adb(command: list[str], serial: str | None = None, timeout: int | float = 30, **kwargs: object) -> bytes:
+                if command[:3] == ["logcat", "-d", "-v"]:
+                    return (
+                        b"05-30 15:56:30.257 E/LoginActivity: login failed, "
+                        b"code: 100400, message: \xe8\xaf\xb7\xe8\xbe\x93\xe5\x85\xa5\xe6\xad\xa3\xe7\xa1\xae\xe7\x9a\x84\xe8\xb4\xa6\xe5\x8f\xb7\xe5\xaf\x86\xe7\xa0\x81"
+                    )
+                return b""
+
+            mcp.observe_ui = fake_observe
+            mcp.adb = fake_adb
+
+            def fake_type(serial: str, text: str, **kwargs: object) -> str:
+                nonlocal password_value
+                password_value = "•" * len(text)
+                return "adb_shell_batch_login"
+
+            mcp.xiaoluxue_type_login_text = fake_type
+
+            with self.assertRaises(mcp.AndroidUseError) as context:
+                mcp.run_xiaoluxue_login_fast_path(
+                    "device-1",
+                    {"account": "26291234", "password": "secret", "timeout_sec": 2},
+                    record=False,
+                )
+        finally:
+            mcp.get_focused_window = original_focus
+            mcp.observe_ui = original_observe
+            mcp.adb = original_adb
+            mcp.xiaoluxue_type_login_text = original_type
+
+        self.assertIn("请输入正确的账号密码", str(context.exception))
+        self.assertIn("100400", str(context.exception))
+
+    def test_xiaoluxue_login_fast_path_hides_keyboard_between_fields(self) -> None:
+        original_focus = mcp.get_focused_window
+        original_observe = mcp.observe_ui
+        original_adb = mcp.adb
+        original_type = mcp.xiaoluxue_type_login_text
+        original_keyboard_visible = mcp.xiaoluxue_soft_keyboard_visible
+        login_focus = f"{mcp.XIAOLUXUE_STUDENT_PACKAGE}/{mcp.XIAOLUXUE_LOGIN_ACTIVITY}"
+        home_focus = f"{mcp.XIAOLUXUE_STUDENT_PACKAGE}/.HomeActivity"
+        events: list[tuple[str, str]] = []
+        account_value = "wrong"
+        password_value = ""
+        submitted = False
+
+        def node(resource: str, bounds: str, text: str = "", checked: bool = False) -> dict[str, object]:
+            parsed = mcp.parse_bounds(bounds)
+            return {
+                "text": text,
+                "content_desc": "",
+                "resource_id": f"{mcp.XIAOLUXUE_STUDENT_PACKAGE}:id/{resource}",
+                "bounds": parsed,
+                "center": mcp.bounds_center(parsed),
+                "clickable": True,
+                "enabled": True,
+                "checked": checked,
+            }
+
+        try:
+            mcp.get_focused_window = lambda serial: home_focus if submitted else login_focus
+
+            def fake_observe(serial: str, include_xml: bool = False, limit: int = 160) -> dict[str, object]:
+                if submitted:
+                    return {"state": {"focused_window": home_focus}, "ui": {"nodes": []}}
+                return {
+                    "state": {"focused_window": login_focus},
+                    "ui": {
+                        "nodes": [
+                            node("edit_account", "[700,220][1300,320]"),
+                            node("edit_input", "[720,230][1280,310]", text=account_value),
+                            node("edit_password", "[700,420][1300,520]"),
+                            node("edit_input", "[720,430][1280,510]", text=password_value),
+                            node("cb_agreement", "[690,620][730,660]", checked=True),
+                            node("button", "[720,700][1280,800]", text="登录"),
+                        ]
+                    },
+                }
+
+            def fake_type(serial: str, text: str, **kwargs: object) -> str:
+                nonlocal account_value, password_value
+                events.append(("type", text))
+                if text == "26291234":
+                    account_value = text
+                else:
+                    password_value = "•" * len(text)
+                return "adb_keyboard_broadcast"
+
+            def fake_adb(command: list[str], serial: str | None = None, timeout: int | float = 30, **kwargs: object) -> bytes:
+                nonlocal submitted
+                if command[:3] == ["shell", "input", "keyevent"]:
+                    events.append(("key", command[-1]))
+                if command[:3] == ["shell", "input", "tap"]:
+                    point = ",".join(command[-2:])
+                    events.append(("tap", point))
+                    if command[-2:] == ["1000", "750"]:
+                        submitted = True
+                return b""
+
+            visible_values = iter([False, False, True, False, True])
+            mcp.observe_ui = fake_observe
+            mcp.adb = fake_adb
+            mcp.xiaoluxue_type_login_text = fake_type
+            mcp.xiaoluxue_soft_keyboard_visible = lambda serial: next(visible_values, False)
+
+            result = mcp.run_xiaoluxue_login_fast_path(
+                "device-1",
+                {"account": "26291234", "password": "secret", "timeout_sec": 5},
+                record=False,
+            )
+        finally:
+            mcp.get_focused_window = original_focus
+            mcp.observe_ui = original_observe
+            mcp.adb = original_adb
+            mcp.xiaoluxue_type_login_text = original_type
+            mcp.xiaoluxue_soft_keyboard_visible = original_keyboard_visible
+
+        self.assertTrue(result["ok"])
+        password_tap_index = events.index(("tap", "1000,470"))
+        self.assertIn(("key", "KEYCODE_BACK"), events[:password_tap_index])
+        self.assertIn(("key", "KEYCODE_BACK"), events[password_tap_index:])
+
+    def test_xiaoluxue_soft_keyboard_visible_ignores_hidden_input_view(self) -> None:
+        original_shell = mcp.shell
+        try:
+            mcp.shell = lambda serial, command, timeout=30: "\n".join(
+                [
+                    "mShowRequested=false mInputShown=false",
+                    "mDecorViewVisible=false mWindowVisible=false",
+                    "mIsInputViewShown=true",
+                ]
+            )
+            self.assertFalse(mcp.xiaoluxue_soft_keyboard_visible("device-1"))
+
+            mcp.shell = lambda serial, command, timeout=30: "\n".join(
+                [
+                    "mShowRequested=true mInputShown=true",
+                    "mDecorViewVisible=true mWindowVisible=true",
+                    "mIsFullscreen=true",
+                ]
+            )
+            self.assertTrue(mcp.xiaoluxue_soft_keyboard_visible("device-1"))
+        finally:
+            mcp.shell = original_shell
+
+    def test_xiaoluxue_student_focus_excludes_leakcanary(self) -> None:
+        self.assertFalse(
+            mcp.xiaoluxue_is_student_app_focus(
+                f"{mcp.XIAOLUXUE_STUDENT_PACKAGE}/leakcanary.internal.activity.LeakLauncherActivity"
+            )
+        )
+        self.assertTrue(
+            mcp.xiaoluxue_is_student_app_focus(
+                f"{mcp.XIAOLUXUE_STUDENT_PACKAGE}/com.xiaoluxue.ai.student.LauncherActivity"
+            )
+        )
+
+    def test_xiaoluxue_login_observe_falls_back_when_uiautomator_is_killed(self) -> None:
+        original_observe = mcp.observe_ui
+        original_focus = mcp.get_focused_window
+        original_screenshot = mcp.screenshot_png
+        login_focus = f"{mcp.XIAOLUXUE_STUDENT_PACKAGE}/{mcp.XIAOLUXUE_LOGIN_ACTIVITY}"
+        try:
+            mcp.observe_ui = lambda serial, limit=260: (_ for _ in ()).throw(mcp.AndroidUseError("exit code 137"))
+            mcp.get_focused_window = lambda serial: login_focus
+            mcp.screenshot_png = lambda serial: make_png(2000, 1200)
+
+            observation = mcp.xiaoluxue_login_observe("device-1")
+        finally:
+            mcp.observe_ui = original_observe
+            mcp.get_focused_window = original_focus
+            mcp.screenshot_png = original_screenshot
+
+        nodes = observation["ui"]["nodes"]
+        self.assertTrue(observation["ui"]["synthetic"])
+        self.assertEqual(len(mcp.xiaoluxue_login_input_nodes(nodes)), 2)
+        self.assertIsNotNone(mcp.xiaoluxue_login_node_by_resource(nodes, "button"))
+
+    def test_xiaoluxue_login_field_nodes_use_parent_containers_when_order_drifts(self) -> None:
+        def node(resource: str, bounds: str, text: str = "") -> dict[str, object]:
+            parsed = mcp.parse_bounds(bounds)
+            return {
+                "text": text,
+                "content_desc": "",
+                "resource_id": f"{mcp.XIAOLUXUE_STUDENT_PACKAGE}:id/{resource}",
+                "bounds": parsed,
+                "center": mcp.bounds_center(parsed),
+                "clickable": True,
+                "enabled": True,
+            }
+
+        nodes = [
+            node("edit_password", "[640,533][1360,661]"),
+            node("edit_input", "[688,533][1280,661]", text="password-field"),
+            node("edit_account", "[640,404][1360,532]"),
+            node("edit_input", "[688,404][1312,532]", text="account-field"),
+        ]
+
+        account_node, password_node = mcp.xiaoluxue_login_field_nodes(nodes)
+
+        self.assertEqual(account_node["text"], "account-field")
+        self.assertEqual(password_node["text"], "password-field")
 
     def test_recipe_from_trace_prefers_selectors(self) -> None:
         trace = {

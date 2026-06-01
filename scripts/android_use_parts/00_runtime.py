@@ -13,6 +13,7 @@ import base64
 import ast
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import plistlib
@@ -53,7 +54,7 @@ OPENAI_BASE_URL = "https://api.openai.com/v1"
 SCRCPY_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
 SCRCPY_LOCK_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
 SCREEN_VIEWER_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
-WEBRTC_VIEWER_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
+SCREEN_VIEWER_SESSIONS: dict[str, dict[str, Any]] = {}
 ACTIVE_RECORDINGS: dict[str, dict[str, Any]] = {}
 SCRCPY_VIDEO_RECORDING_PROCESSES: dict[str, subprocess.Popen[bytes]] = {}
 SCRCPY_VIDEO_RECORDINGS: dict[str, dict[str, Any]] = {}

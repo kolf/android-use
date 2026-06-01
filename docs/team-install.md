@@ -170,7 +170,7 @@ cd ~/plugins/android-use-plugins
 [@Android] 进入语文 1.5 题型突破
 ```
 
-默认会弹出一个 scrcpy 桌面窗口，方便人工观察和接管。插件默认只保留一个窗口，不会自动启动 WebRTC。
+默认会弹出一个 scrcpy 桌面窗口，方便人工观察和接管。需要在 Codex 里查看 Android Use 操作步骤证据时，使用 `android_start_screen_viewer` 打开截图时间线 Web UI。
 
 ## 输入速度
 

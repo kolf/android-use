@@ -242,7 +242,6 @@ cd ~/plugins/android-use-plugins
 - Android 工具被调用时自动弹出；
 - 同一个设备只保留一个 scrcpy 窗口；
 - `ANDROID_USE_SCRCPY_RESIDENT_SERIALS` 写入多个序列号时，会为每台已连接设备分别保活一个 scrcpy 窗口；
-- 不会自动启动 WebRTC；
 - 自动弹窗、`android_start_scrcpy`、`android_start_scrcpy_app`、无线调试 `start_scrcpy=true`、resident monitor 都走同一个 `.app` wrapper 启动路径；
 - 启动 `.app` wrapper 时会检查 `/Applications/Android Use.app`，已有就跳过，没有就自动创建一个系统「应用程序」里的 Android Use 启动图标；
 - 默认启动时会清理 `.android-use/` 下旧的同 bundle id 设备专属 `.app`，只保留固定的 `Android Use.app`；
@@ -492,9 +491,9 @@ android_wireless_reconnect(all=true, start_scrcpy=true)
 
 这样会批量重连已保存的无线设备，并为每台设备启动一个 `.app` wrapper scrcpy 投屏窗口。
 
-### WebRTC 要不要开
+### 时间线 Web UI
 
-默认不要开。日常使用优先看 scrcpy 桌面窗口。只有明确需要在 Codex 内嵌页面看视频流时，再调用 `android_start_webrtc_viewer`。
+需要在 Codex 里看 Android Use 操作步骤证据时，调用 `android_start_screen_viewer`。它会打开一个本地 Web UI，用截图而不是视频流记录插件工具动作步骤；页面不持续轮询设备屏幕，也不会自动记录普通屏幕变化。每个动作默认等待 0.8 秒后截图，避免截到操作前状态，可用 `ANDROID_USE_TIMELINE_AFTER_DELAY_SEC` 调整。截图和事件会保存到 `.screen/timelines/`。
 
 ## 项目边界
 

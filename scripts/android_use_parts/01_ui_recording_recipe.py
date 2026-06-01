@@ -1194,6 +1194,10 @@ def append_recording_step(
     *,
     before: dict[str, Any] | None = None,
 ) -> None:
+    timeline_hook = globals().get("append_screen_timeline_action")
+    if callable(timeline_hook):
+        with contextlib.suppress(Exception):
+            timeline_hook(serial, action, args, result, before=before)
     recording = active_recording(serial)
     if not recording:
         return

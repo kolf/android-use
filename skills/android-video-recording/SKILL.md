@@ -11,7 +11,7 @@ Use this skill for exact user intents such as "开始录制视频", "开始录�
 
 When the user asks to start recording video, immediately call `android_start_video_recording`.
 
-Do not observe the screen first. Do not call dependency checks, screenshots, UIAutomator, WebRTC, or natural-language agent loops first. Let the tool choose the configured/default serial unless the user provided one.
+Do not observe the screen first. Do not call dependency checks, screenshots, UIAutomator, timeline viewers, or natural-language agent loops first. Let the tool choose the configured/default serial unless the user provided one.
 
 Default arguments:
 

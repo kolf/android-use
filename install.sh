@@ -160,13 +160,16 @@ for name in items:
         continue
     dst = target / name
     if src.is_dir():
+        if dst.exists():
+            shutil.rmtree(dst)
         shutil.copytree(
             src,
             dst,
-            dirs_exist_ok=True,
             ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".DS_Store"),
         )
     else:
+        if dst.exists() and dst.is_dir():
+            shutil.rmtree(dst)
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
 PY

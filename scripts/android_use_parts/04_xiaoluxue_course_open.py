@@ -325,6 +325,148 @@ def xiaoluxue_login_input_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, A
     return sorted(inputs, key=lambda node: int((node.get("bounds") or {}).get("top") or 0))
 
 
+def node_bounds_contains(outer: dict[str, int] | None, inner: dict[str, int] | None) -> bool:
+    if not outer or not inner:
+        return False
+    return (
+        int(outer.get("left", 0)) <= int(inner.get("left", 0))
+        and int(outer.get("top", 0)) <= int(inner.get("top", 0))
+        and int(outer.get("right", 0)) >= int(inner.get("right", 0))
+        and int(outer.get("bottom", 0)) >= int(inner.get("bottom", 0))
+    )
+
+
+def xiaoluxue_login_input_node_for(nodes: list[dict[str, Any]], field: str) -> dict[str, Any] | None:
+    container = xiaoluxue_login_node_by_resource(nodes, f"edit_{field}")
+    container_bounds = container.get("bounds") if container else None
+    candidates = xiaoluxue_login_input_nodes(nodes)
+    if container_bounds:
+        for node in candidates:
+            if node_bounds_contains(container_bounds, node.get("bounds")):
+                return node
+    index = 0 if field == "account" else 1
+    return candidates[index] if len(candidates) > index else None
+
+
+def xiaoluxue_login_field_nodes(nodes: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
+    account_node = xiaoluxue_login_input_node_for(nodes, "account")
+    password_node = xiaoluxue_login_input_node_for(nodes, "password")
+    if not account_node or not password_node:
+        raise AndroidUseError("Expected account and password fields on Xiaoluxue login page.")
+    return account_node, password_node
+
+
+def xiaoluxue_login_surface_from_nodes(nodes: list[dict[str, Any]]) -> bool:
+    labels = {label for node in nodes for label in node_labels(node)}
+    resource_ids = {str(node.get("resource_id") or "") for node in nodes}
+    if xiaoluxue_login_resource_id("activity_login_root") in resource_ids:
+        return True
+    login_prompts = {"请输入账号", "请输入密码", "勾选同意 用户服务协议 与 隐私协议"}
+    if labels & login_prompts:
+        return True
+    return len(xiaoluxue_login_input_nodes(nodes)) >= 2 and "登录" in labels
+
+
+def xiaoluxue_login_surface_observation(serial: str) -> dict[str, Any] | None:
+    with contextlib.suppress(Exception):
+        observation = observe_ui(serial, limit=260)
+        nodes = observation.get("ui", {}).get("nodes") or []
+        if xiaoluxue_login_surface_from_nodes(nodes):
+            return observation
+    return None
+
+
+def xiaoluxue_soft_keyboard_visible(serial: str) -> bool:
+    with contextlib.suppress(Exception):
+        output = shell(serial, "dumpsys input_method", timeout=4)
+        window_visible = "mWindowVisible=true" in output or "mDecorViewVisible=true" in output
+        if "mInputShown=true" in output:
+            return True
+        if "mIsInputViewShown=true" in output and window_visible:
+            return True
+        show_requested = "mShowRequested=true" in output or "mShowInputRequested=true" in output
+        fullscreen = any(
+            marker in output
+            for marker in ("mInFullscreenMode=true", "mFullscreenMode=true", "mIsFullscreen=true")
+        )
+        return window_visible and show_requested and fullscreen
+    return False
+
+
+def xiaoluxue_hide_soft_keyboard(serial: str) -> bool:
+    if not xiaoluxue_soft_keyboard_visible(serial):
+        return False
+    adb(["shell", "input", "keyevent", "KEYCODE_BACK"], serial=serial, timeout=4)
+    time.sleep(0.18)
+    return True
+
+
+def xiaoluxue_is_student_app_focus(focus: str) -> bool:
+    return f"{XIAOLUXUE_STUDENT_PACKAGE}/" in focus and "leakcanary." not in focus
+
+
+def xiaoluxue_wait_for_student_focus(serial: str, timeout_sec: float) -> str:
+    deadline = time.monotonic() + max(timeout_sec, 0.0)
+    focus = get_focused_window(serial) or ""
+    while time.monotonic() < deadline:
+        if xiaoluxue_is_student_app_focus(focus):
+            return focus
+        time.sleep(0.08)
+        focus = get_focused_window(serial) or ""
+    return focus
+
+
+def xiaoluxue_synthetic_login_node(
+    name: str,
+    bounds: tuple[int, int, int, int],
+    *,
+    text: str = "",
+    checked: bool = False,
+) -> dict[str, Any]:
+    parsed = {"left": bounds[0], "top": bounds[1], "right": bounds[2], "bottom": bounds[3]}
+    return {
+        "text": text,
+        "content_desc": "",
+        "resource_id": xiaoluxue_login_resource_id(name),
+        "class": "android.view.View",
+        "package": XIAOLUXUE_STUDENT_PACKAGE,
+        "bounds": parsed,
+        "center": bounds_center(parsed),
+        "clickable": True,
+        "enabled": True,
+        "checkable": name == "cb_agreement",
+        "checked": checked,
+        "synthetic": True,
+    }
+
+
+def xiaoluxue_synthetic_login_observation(serial: str, focus: str, error: Exception) -> dict[str, Any]:
+    size = {"width": 2000, "height": 1200}
+    with contextlib.suppress(Exception):
+        shot_size = png_size(screenshot_png(serial))
+        if shot_size.get("width") and shot_size.get("height"):
+            size = {"width": int(shot_size["width"]), "height": int(shot_size["height"])}
+    width = int(size["width"])
+    height = int(size["height"])
+
+    def box(left: float, top: float, right: float, bottom: float) -> tuple[int, int, int, int]:
+        return (round(width * left), round(height * top), round(width * right), round(height * bottom))
+
+    nodes = [
+        xiaoluxue_synthetic_login_node("activity_login_root", (0, 0, width, height)),
+        xiaoluxue_synthetic_login_node("edit_account", box(0.32, 0.337, 0.68, 0.443), text=""),
+        xiaoluxue_synthetic_login_node("edit_input", box(0.344, 0.337, 0.656, 0.443), text=""),
+        xiaoluxue_synthetic_login_node("edit_password", box(0.32, 0.444, 0.68, 0.551), text=""),
+        xiaoluxue_synthetic_login_node("edit_input", box(0.344, 0.444, 0.64, 0.551), text=""),
+        xiaoluxue_synthetic_login_node("cb_agreement", box(0.397, 0.738, 0.411, 0.767), checked=False),
+        xiaoluxue_synthetic_login_node("button", box(0.32, 0.591, 0.68, 0.684), text="登录"),
+    ]
+    return {
+        "state": {"serial": serial, "focused_window": focus, "screen": size},
+        "ui": {"nodes": nodes, "count": len(nodes), "synthetic": True, "fallback_error": str(error)},
+    }
+
+
 def xiaoluxue_login_click_node(serial: str, node: dict[str, Any] | None, description: str) -> dict[str, int]:
     point = node_click_point(node) if node else None
     if not point:
@@ -333,12 +475,86 @@ def xiaoluxue_login_click_node(serial: str, node: dict[str, Any] | None, descrip
     return point
 
 
+def xiaoluxue_type_login_text(
+    serial: str,
+    text: str,
+    *,
+    clear_count: int,
+) -> str:
+    if not text_needs_unicode_input(text) and "\n" not in text:
+        adb_shell_batch_type_text(serial, text, clear_first=True, clear_count=clear_count)
+        time.sleep(0.25)
+        return "adb_shell_batch_login"
+    method = type_focused_text_fast(serial, text, clear_first=True, clear_count=clear_count)
+    time.sleep(0.35)
+    return method
+
+
 def xiaoluxue_login_observe(serial: str) -> dict[str, Any]:
-    observation = observe_ui(serial, limit=260)
+    try:
+        observation = observe_ui(serial, limit=260)
+    except AndroidUseError as exc:
+        focus = get_focused_window(serial) or ""
+        if XIAOLUXUE_LOGIN_ACTIVITY in focus:
+            return xiaoluxue_synthetic_login_observation(serial, focus, exc)
+        raise
     focus = str(observation.get("state", {}).get("focused_window") or "")
-    if XIAOLUXUE_LOGIN_ACTIVITY not in focus:
+    nodes = observation.get("ui", {}).get("nodes") or []
+    if XIAOLUXUE_LOGIN_ACTIVITY not in focus and not xiaoluxue_login_surface_from_nodes(nodes):
         raise AndroidUseError(f"Current Xiaoluxue screen is not LoginActivity. focused_window={focus}")
     return observation
+
+
+def xiaoluxue_wait_for_login_fields(
+    serial: str,
+    *,
+    account: str,
+    password_required: bool,
+    timeout_sec: float = 2.5,
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
+    deadline = time.monotonic() + max(timeout_sec, 0.0)
+    last: tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any], dict[str, Any]] | None = None
+    while True:
+        observation = xiaoluxue_login_observe(serial)
+        nodes = observation["ui"]["nodes"]
+        account_node, password_node = xiaoluxue_login_field_nodes(nodes)
+        last = (observation, nodes, account_node, password_node)
+        synthetic = bool(observation.get("ui", {}).get("synthetic"))
+        account_ok = str(account_node.get("text") or "").strip() == account
+        password_ok = bool(str(password_node.get("text") or "")) if password_required else True
+        if account_ok and password_ok and not synthetic:
+            return last
+        if time.monotonic() >= deadline:
+            return last
+        time.sleep(0.1)
+
+
+def xiaoluxue_clear_login_logcat(serial: str) -> None:
+    with contextlib.suppress(Exception):
+        adb(["logcat", "-c"], serial=serial, timeout=5)
+
+
+def xiaoluxue_login_failure_from_logcat(serial: str) -> dict[str, Any] | None:
+    with contextlib.suppress(Exception):
+        raw = decode_bytes(adb(["logcat", "-d", "-v", "time"], serial=serial, timeout=8))
+        for line in reversed(raw.splitlines()):
+            if "login failed" in line:
+                match = re.search(r"code:\s*([^,]+),\s*message:\s*(.+)$", line)
+                if match:
+                    return {
+                        "code": match.group(1).strip(),
+                        "message": match.group(2).strip(),
+                        "source": "LoginActivity",
+                    }
+            if "/access/login" in line and '"message"' in line:
+                match = re.search(r'"code"\s*:\s*([^,}]+).*?"message"\s*:\s*"([^"]+)"', line)
+                if match:
+                    return {
+                        "code": match.group(1).strip(),
+                        "message": match.group(2).strip(),
+                        "source": "login_api",
+                    }
+    return None
 
 
 def run_xiaoluxue_login_fast_path(serial: str, args: dict[str, Any], *, record: bool) -> dict[str, Any]:
@@ -357,11 +573,15 @@ def run_xiaoluxue_login_fast_path(serial: str, args: dict[str, Any], *, record: 
     focus = get_focused_window(serial) or ""
     if XIAOLUXUE_LOGIN_ACTIVITY not in focus:
         if bool(args.get("open_app_if_needed", True)):
-            adb(["shell", "monkey", "-p", XIAOLUXUE_STUDENT_PACKAGE, "-c", "android.intent.category.LAUNCHER", "1"], serial=serial, timeout=10)
-            time.sleep(min(max(float(args.get("after_open_wait_sec", 0.25)), 0), 2))
-            focus = get_focused_window(serial) or ""
+            adb(["shell", "am", "start", "-n", XIAOLUXUE_STUDENT_LAUNCHER_COMPONENT], serial=serial, timeout=10)
+            wait_sec = min(max(float(args.get("after_open_wait_sec", 1.5)), 0), 4)
+            focus = xiaoluxue_wait_for_student_focus(serial, wait_sec)
         if XIAOLUXUE_LOGIN_ACTIVITY not in focus:
-            already_in_student = f"{XIAOLUXUE_STUDENT_PACKAGE}/" in focus
+            already_in_student = xiaoluxue_is_student_app_focus(focus)
+            if already_in_student and xiaoluxue_login_surface_observation(serial):
+                already_in_student = False
+            if not already_in_student:
+                raise AndroidUseError(f"Current Xiaoluxue screen is not LoginActivity. focused_window={focus}")
             return {
                 "ok": True,
                 "action": "xiaoluxue_login_fast_path",
@@ -371,33 +591,48 @@ def run_xiaoluxue_login_fast_path(serial: str, args: dict[str, Any], *, record: 
                 "steps": steps,
             }
 
+    if xiaoluxue_hide_soft_keyboard(serial):
+        steps.append({"action": "hide_keyboard", "phase": "before_observe"})
     observation = xiaoluxue_login_observe(serial)
     nodes = observation["ui"]["nodes"]
-    inputs = xiaoluxue_login_input_nodes(nodes)
-    if len(inputs) < 2:
-        raise AndroidUseError(f"Expected account and password fields on Xiaoluxue login page, got {len(inputs)}.")
-
-    account_node = inputs[0]
+    account_node, password_node = xiaoluxue_login_field_nodes(nodes)
     current_account = str(account_node.get("text") or "").strip()
     if current_account != account:
+        if xiaoluxue_hide_soft_keyboard(serial):
+            steps.append({"action": "hide_keyboard", "phase": "before_account"})
         point = xiaoluxue_login_click_node(serial, account_node, "account input")
-        method = type_focused_text_fast(serial, account, clear_first=True, clear_count=40)
+        method = xiaoluxue_type_login_text(serial, account, clear_count=40)
         steps.append({"action": "fill_account", "chars": len(account), "method": method, "point": point})
-        observation = xiaoluxue_login_observe(serial)
-        nodes = observation["ui"]["nodes"]
+        if xiaoluxue_hide_soft_keyboard(serial):
+            steps.append({"action": "hide_keyboard", "phase": "after_account"})
+        observation, nodes, account_node, _password_node = xiaoluxue_wait_for_login_fields(
+            serial,
+            account=account,
+            password_required=False,
+        )
+        if str(account_node.get("text") or "").strip() != account:
+            raise AndroidUseError("Xiaoluxue account field did not keep the requested account after input.")
     else:
         steps.append({"action": "fill_account", "skipped": "already-filled", "chars": len(account)})
 
-    inputs = xiaoluxue_login_input_nodes(nodes)
-    if len(inputs) < 2:
-        raise AndroidUseError("Password field disappeared from Xiaoluxue login page.")
-    password_node = inputs[1]
+    _account_node, password_node = xiaoluxue_login_field_nodes(nodes)
+    if xiaoluxue_hide_soft_keyboard(serial):
+        steps.append({"action": "hide_keyboard", "phase": "before_password"})
     point = xiaoluxue_login_click_node(serial, password_node, "password input")
-    method = type_focused_text_fast(serial, password, clear_first=True, clear_count=max(20, len(password) + 8))
+    method = xiaoluxue_type_login_text(serial, password, clear_count=max(20, len(password) + 8))
     steps.append({"action": "fill_password", "chars": len(password), "method": method, "point": point})
+    if xiaoluxue_hide_soft_keyboard(serial):
+        steps.append({"action": "hide_keyboard", "phase": "after_password"})
 
-    observation = xiaoluxue_login_observe(serial)
-    nodes = observation["ui"]["nodes"]
+    observation, nodes, account_node, password_node = xiaoluxue_wait_for_login_fields(
+        serial,
+        account=account,
+        password_required=True,
+    )
+    if str(account_node.get("text") or "").strip() != account:
+        raise AndroidUseError("Xiaoluxue account field changed while filling password; refusing to submit.")
+    if not str(password_node.get("text") or ""):
+        raise AndroidUseError("Xiaoluxue password field is empty after input; refusing to submit.")
     agreement_node = xiaoluxue_login_node_by_resource(nodes, "cb_agreement")
     if agreement_node and not bool(agreement_node.get("checked")):
         point = xiaoluxue_login_click_node(serial, agreement_node, "agreement checkbox")
@@ -408,14 +643,24 @@ def run_xiaoluxue_login_fast_path(serial: str, args: dict[str, Any], *, record: 
         steps.append({"action": "check_agreement", "skipped": "already-checked" if agreement_node else "not-found"})
 
     login_node = xiaoluxue_login_node_by_resource(nodes, "button") or find_ui_node(nodes, "登录", exact=True)
+    xiaoluxue_clear_login_logcat(serial)
     point = xiaoluxue_login_click_node(serial, login_node, "login button")
     submitted_at = time.monotonic()
     steps.append({"action": "submit", "point": point})
 
     final_focus = ""
+    last_failure_check = 0.0
     while time.monotonic() < deadline:
         final_focus = get_focused_window(serial) or ""
-        if f"{XIAOLUXUE_STUDENT_PACKAGE}/" in final_focus and XIAOLUXUE_LOGIN_ACTIVITY not in final_focus:
+        if xiaoluxue_is_student_app_focus(final_focus) and XIAOLUXUE_LOGIN_ACTIVITY not in final_focus:
+            login_surface = xiaoluxue_login_surface_observation(serial)
+            if login_surface:
+                nodes = login_surface.get("ui", {}).get("nodes") or []
+                labels = visible_labels(nodes, limit=8)
+                steps.append({"action": "still_on_login_surface", "focused_window": final_focus, "labels": labels})
+                final_focus = str(login_surface.get("state", {}).get("focused_window") or final_focus)
+                time.sleep(0.1)
+                continue
             result = {
                 "ok": True,
                 "action": "xiaoluxue_login_fast_path",
@@ -438,7 +683,24 @@ def run_xiaoluxue_login_fast_path(serial: str, args: dict[str, Any], *, record: 
                     result,
                 )
             return result
+        now = time.monotonic()
+        if XIAOLUXUE_LOGIN_ACTIVITY in final_focus and now - submitted_at >= 0.25 and now - last_failure_check >= 0.4:
+            last_failure_check = now
+            failure = xiaoluxue_login_failure_from_logcat(serial)
+            if failure:
+                raise AndroidUseError(
+                    "Xiaoluxue login failed: "
+                    f"{failure.get('message') or 'unknown error'}"
+                    f" (code={failure.get('code') or 'unknown'}, source={failure.get('source')})"
+                )
         time.sleep(0.1)
+    failure = xiaoluxue_login_failure_from_logcat(serial)
+    if failure:
+        raise AndroidUseError(
+            "Xiaoluxue login failed: "
+            f"{failure.get('message') or 'unknown error'}"
+            f" (code={failure.get('code') or 'unknown'}, source={failure.get('source')})"
+        )
     raise AndroidUseError(
         f"Xiaoluxue login did not reach home within {timeout:.1f}s. focused_window={final_focus or focus}"
     )
