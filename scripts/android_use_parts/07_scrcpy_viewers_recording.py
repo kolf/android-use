@@ -616,6 +616,47 @@ def video_recording_start_marker_path(output_path: Path) -> Path:
     return output_path.with_suffix(output_path.suffix + ".start.png")
 
 
+def split_host_command(command: str) -> list[str]:
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return command.split()
+
+
+def command_has_scrcpy_binary(parts: list[str]) -> bool:
+    return any(Path(part).name == "scrcpy" for part in parts)
+
+
+def command_has_serial_arg(parts: list[str], serial: str) -> bool:
+    for index, part in enumerate(parts):
+        if part in {"--serial", "-s"} and index + 1 < len(parts):
+            if parts[index + 1] == serial:
+                return True
+        if part.startswith("--serial=") and part.split("=", 1)[1] == serial:
+            return True
+    return False
+
+
+def scrcpy_record_output_path(parts: list[str]) -> Path | None:
+    for index, part in enumerate(parts):
+        if part in {"--record", "-r"} and index + 1 < len(parts):
+            return Path(parts[index + 1]).expanduser()
+        if part.startswith("--record="):
+            value = part.split("=", 1)[1]
+            if value:
+                return Path(value).expanduser()
+    return None
+
+
+def is_scrcpy_recording_command(command: str, serial: str) -> bool:
+    parts = split_host_command(command)
+    return (
+        command_has_scrcpy_binary(parts)
+        and command_has_serial_arg(parts, serial)
+        and scrcpy_record_output_path(parts) is not None
+    )
+
+
 def host_pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -634,6 +675,52 @@ def clear_video_recording_state(serial: str) -> None:
         video_recording_state_path(serial).unlink()
 
 
+def discover_active_scrcpy_video_recording(serial: str) -> dict[str, Any] | None:
+    candidates: list[dict[str, Any]] = []
+    for row in host_process_rows():
+        command = str(row.get("command") or "")
+        if not is_scrcpy_recording_command(command, serial):
+            continue
+        try:
+            pid = int(row.get("pid") or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        if pid <= 0:
+            continue
+        output_path = scrcpy_record_output_path(split_host_command(command))
+        if output_path is None:
+            continue
+        metadata_path = video_recording_metadata_path(output_path)
+        metadata = read_json_file(metadata_path)
+        discovered_at_epoch = time.time()
+        candidates.append(
+            {
+                "ok": True,
+                "serial": serial,
+                "pid": pid,
+                "file_path": str(output_path),
+                "log_path": metadata.get("log_path"),
+                "metadata_path": str(metadata_path),
+                "started_at": metadata.get("started_at") or timestamp_iso(),
+                "started_at_epoch": metadata.get("started_at_epoch") or discovered_at_epoch,
+                "record_format": output_path.suffix.lstrip(".").lower() or metadata.get("record_format") or "mp4",
+                "command": split_host_command(command),
+                "discovered_from": "host-process",
+                "discovered_at": timestamp_iso(),
+                "discovered_at_epoch": discovered_at_epoch,
+                "start_anchor": metadata.get("start_anchor"),
+                "timing": metadata.get("timing"),
+            }
+        )
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: int(item.get("pid") or 0), reverse=True)
+    recording = candidates[0]
+    SCRCPY_VIDEO_RECORDINGS[serial] = recording
+    write_json(video_recording_state_path(serial), recording)
+    return recording
+
+
 def active_video_recording(serial: str) -> dict[str, Any] | None:
     recording = SCRCPY_VIDEO_RECORDINGS.get(serial)
     process = SCRCPY_VIDEO_RECORDING_PROCESSES.get(serial)
@@ -641,7 +728,7 @@ def active_video_recording(serial: str) -> dict[str, Any] | None:
         return recording
     payload = read_json_file(video_recording_state_path(serial))
     if not payload:
-        return None
+        return discover_active_scrcpy_video_recording(serial)
     try:
         pid = int(payload.get("pid") or 0)
     except (TypeError, ValueError):
@@ -650,7 +737,7 @@ def active_video_recording(serial: str) -> dict[str, Any] | None:
         SCRCPY_VIDEO_RECORDINGS[serial] = payload
         return payload
     clear_video_recording_state(serial)
-    return None
+    return discover_active_scrcpy_video_recording(serial)
 
 
 def update_video_recording_metadata(metadata_path: Path, updates: dict[str, Any]) -> None:

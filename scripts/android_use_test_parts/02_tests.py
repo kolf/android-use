@@ -132,6 +132,7 @@ class AndroidUseMcpTestsPart2(unittest.TestCase):
         original_popen = mcp.subprocess.Popen
         original_sleep = mcp.time.sleep
         original_state_path = mcp.video_recording_state_path
+        original_rows = mcp.host_process_rows
         calls: list[list[str]] = []
 
         class FakeProcess:
@@ -151,6 +152,7 @@ class AndroidUseMcpTestsPart2(unittest.TestCase):
                     AssertionError("start_video_recording should not use a fixed startup sleep")
                 )
                 mcp.video_recording_state_path = lambda _serial: tmp_path / "active.json"
+                mcp.host_process_rows = lambda: []
 
                 def fake_popen(command: list[str], **_kwargs: object) -> FakeProcess:
                     calls.append(command)
@@ -174,6 +176,7 @@ class AndroidUseMcpTestsPart2(unittest.TestCase):
                 mcp.subprocess.Popen = original_popen  # type: ignore[assignment]
                 mcp.time.sleep = original_sleep
                 mcp.video_recording_state_path = original_state_path
+                mcp.host_process_rows = original_rows
                 mcp.SCRCPY_VIDEO_RECORDINGS.clear()
                 mcp.SCRCPY_VIDEO_RECORDING_PROCESSES.clear()
 
@@ -190,6 +193,7 @@ class AndroidUseMcpTestsPart2(unittest.TestCase):
         original_popen = mcp.subprocess.Popen
         original_marker = mcp.schedule_video_recording_start_marker
         original_state_path = mcp.video_recording_state_path
+        original_rows = mcp.host_process_rows
         scheduled: list[tuple[str, Path, Path]] = []
 
         class FakeProcess:
@@ -206,6 +210,7 @@ class AndroidUseMcpTestsPart2(unittest.TestCase):
                 mcp.choose_serial = lambda _serial=None: "device-1"
                 mcp.scrcpy_binary = lambda: "scrcpy"
                 mcp.video_recording_state_path = lambda _serial: tmp_path / "active.json"
+                mcp.host_process_rows = lambda: []
 
                 def fake_popen(command: list[str], **_kwargs: object) -> FakeProcess:
                     return FakeProcess()
@@ -231,6 +236,7 @@ class AndroidUseMcpTestsPart2(unittest.TestCase):
                 mcp.subprocess.Popen = original_popen  # type: ignore[assignment]
                 mcp.schedule_video_recording_start_marker = original_marker  # type: ignore[assignment]
                 mcp.video_recording_state_path = original_state_path
+                mcp.host_process_rows = original_rows
                 mcp.SCRCPY_VIDEO_RECORDINGS.clear()
                 mcp.SCRCPY_VIDEO_RECORDING_PROCESSES.clear()
 
@@ -314,6 +320,61 @@ class AndroidUseMcpTestsPart2(unittest.TestCase):
         self.assertEqual(payload["duration_sec"], 3.0)
         self.assertEqual(payload["markdown"], f"![android-video-recording]({output_path})")
         self.assertEqual(process.signal_seen, mcp.signal.SIGINT)
+
+    def test_stop_video_recording_discovers_orphan_scrcpy_process(self) -> None:
+        original_choose = mcp.choose_serial
+        original_state_path = mcp.video_recording_state_path
+        original_rows = mcp.host_process_rows
+        original_alive = mcp.host_pid_alive
+        original_kill = mcp.os.kill
+        original_sleep = mcp.time.sleep
+
+        killed: list[tuple[int, int]] = []
+        alive = {"value": True}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            output_path = tmp_path / "orphan.mp4"
+            output_path.write_bytes(b"mp4")
+            try:
+                mcp.SCRCPY_VIDEO_RECORDINGS.clear()
+                mcp.SCRCPY_VIDEO_RECORDING_PROCESSES.clear()
+                mcp.choose_serial = lambda _serial=None: "device-1"
+                mcp.video_recording_state_path = lambda _serial: tmp_path / "missing-active.json"
+                mcp.host_process_rows = lambda: [
+                    {
+                        "pid": 9876,
+                        "ppid": 1,
+                        "command": f"scrcpy --serial device-1 --no-window --record {output_path} --record-format mp4",
+                    }
+                ]
+                mcp.host_pid_alive = lambda _pid: alive["value"]
+
+                def fake_kill(pid: int, sig: int) -> None:
+                    killed.append((pid, sig))
+                    if sig == mcp.signal.SIGINT:
+                        alive["value"] = False
+
+                mcp.os.kill = fake_kill
+                mcp.time.sleep = lambda _seconds: None
+
+                content = mcp.tool_stop_video_recording({"serial": "device-1"})
+            finally:
+                mcp.choose_serial = original_choose
+                mcp.video_recording_state_path = original_state_path
+                mcp.host_process_rows = original_rows
+                mcp.host_pid_alive = original_alive
+                mcp.os.kill = original_kill
+                mcp.time.sleep = original_sleep
+                mcp.SCRCPY_VIDEO_RECORDINGS.clear()
+                mcp.SCRCPY_VIDEO_RECORDING_PROCESSES.clear()
+
+        payload = json.loads(content[0]["text"])
+        self.assertTrue(payload["stopped"])
+        self.assertEqual(payload["pid"], 9876)
+        self.assertEqual(payload["file_path"], str(output_path))
+        self.assertEqual(payload["size_bytes"], 3)
+        self.assertIn((9876, mcp.signal.SIGINT), killed)
 
     def test_android_device_display_name_prefers_device_name(self) -> None:
         original_shell = mcp.shell
