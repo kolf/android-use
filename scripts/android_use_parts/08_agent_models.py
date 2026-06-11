@@ -758,18 +758,6 @@ def execute_action(serial: str, action: dict[str, Any]) -> list[dict[str, Any]]:
             f"open_app(app_name={app_name!r}) needs a package name on Android. "
             "Ask the model to click the launcher icon if it is visible, or use android_open_app with a package."
         )
-    if action_type == "xiaoluxue_map_fast_path":
-        result = run_xiaoluxue_map_fast_path(serial, action, record=True)
-        return [text_content({"ok": True, "serial": serial, **result})]
-    if action_type == "xiaoluxue_lesson_fast_path":
-        result = run_xiaoluxue_lesson_fast_path(serial, action, record=True)
-        return [text_content({"ok": True, "serial": serial, **result})]
-    if action_type == "xiaoluxue_open_native_subject":
-        result = run_xiaoluxue_open_native_subject(serial, action, record=True)
-        return [text_content({"ok": True, "serial": serial, **result})]
-    if action_type == "xiaoluxue_login_fast_path":
-        result = run_xiaoluxue_login_fast_path(serial, action, record=True)
-        return [text_content({"ok": True, "serial": serial, **result})]
     if action_type == "wait":
         seconds = min(float(action.get("seconds", 1)), 10)
         time.sleep(seconds)

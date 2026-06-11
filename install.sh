@@ -2,7 +2,7 @@
 set -euo pipefail
 
 PLUGIN_NAME="android-use-plugins"
-REPO_URL="${ANDROID_USE_PLUGIN_REPO_URL:-https://gitlab.xiaoluxue.cn/shixiankang/android-use.git}"
+REPO_URL="${ANDROID_USE_PLUGIN_REPO_URL:-}"
 CODEX_CONFIG_PATH="${ANDROID_USE_CODEX_CONFIG:-$HOME/.codex/config.toml}"
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -120,10 +120,51 @@ ensure_command_with_brew() {
   fi
 }
 
+ensure_brew_formula() {
+  local formula="$1"
+  local label="$2"
+  if brew_available && brew list --formula "$formula" >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! env_flag "$AUTO_INSTALL_DEPS"; then
+    fail "缺少 $label。已关闭自动安装，请手动安装后重试。"
+  fi
+  brew_install_quiet "$label" install "$formula"
+}
+
+ensure_optional_command_with_brew() {
+  local command_name="$1"
+  local label="$2"
+  shift 2
+  if command -v "$command_name" >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! env_flag "$AUTO_INSTALL_DEPS"; then
+    warn "缺少可选依赖 $label；核心 adb 控制仍可继续。"
+    return 0
+  fi
+  brew_install_quiet "$label" "$@"
+}
+
+ensure_node_dependencies() {
+  ensure_command_with_brew node "Node.js（Playwright Android WebView）" install node
+  ensure_command_with_brew npm "npm（安装 Playwright Android 运行依赖）" install node
+}
+
 ensure_system_dependencies() {
   ensure_command_with_brew python3 "Python 3" install python
-  ensure_command_with_brew adb "Android Platform Tools (adb)" install --cask android-platform-tools
-  ensure_command_with_brew scrcpy "scrcpy" install scrcpy
+  ensure_command_with_brew adb "Android platform-tools（adb 设备传输）" install android-platform-tools
+  ensure_node_dependencies
+  ensure_optional_command_with_brew scrcpy "scrcpy（可选镜像/录屏工具）" install scrcpy
+}
+
+install_node_runtime_dependencies() {
+  local install_dir="$1"
+  if [ ! -f "$install_dir/package.json" ]; then
+    return 0
+  fi
+  info "Installing Playwright Android runtime dependencies in $install_dir"
+  (cd "$install_dir" && npm install --omit=dev --no-audit --no-fund)
 }
 
 copy_bundle_contents() {
@@ -149,6 +190,8 @@ items = [
     "install.sh",
     "doctor.sh",
     "package.sh",
+    "package.json",
+    "package-lock.json",
     "marketplace-entry.json",
     "marketplace.example.json",
     ".gitignore",
@@ -212,13 +255,16 @@ install_or_update_plugin() {
     return 1
   fi
   require_command git
+  if [ -z "$REPO_URL" ]; then
+    fail "未设置 ANDROID_USE_PLUGIN_REPO_URL，且当前目录不是完整插件包；请在本地插件包目录执行，或设置仓库地址后重试。"
+  fi
   if git clone "$REPO_URL" "$INSTALL_DIR"; then
     clear_quarantine "$INSTALL_DIR"
     return
   fi
   info "Git clone failed, installing from local checkout"
   mkdir -p "$INSTALL_DIR"
-  for item in .codex-plugin .mcp.json README.md scripts macos skills assets docs install.sh doctor.sh marketplace-entry.json marketplace.example.json .gitignore; do
+  for item in .codex-plugin .mcp.json README.md scripts macos skills assets docs install.sh doctor.sh package.sh package.json package-lock.json marketplace-entry.json marketplace.example.json .gitignore; do
     if [ -e "$SOURCE_DIR/$item" ]; then
       cp -R "$SOURCE_DIR/$item" "$INSTALL_DIR/"
     fi
@@ -258,7 +304,7 @@ entry = {
         "logo": icon_path,
     },
 }
-legacy_plugin_names = {"android-use", "xiaoluxue-android-use"}
+legacy_plugin_names = {"android-use"}
 if path.exists():
     try:
         payload = json.loads(path.read_text())
@@ -271,10 +317,10 @@ else:
         "plugins": [],
     }
 
-if payload.get("name") in (None, "", "xiaoluxue-codex-plugins", "android-use-plugins", "[TODO: marketplace-name]"):
+if payload.get("name") in (None, "", "android-use-plugins", "[TODO: marketplace-name]"):
     payload["name"] = "local"
 interface = payload.setdefault("interface", {})
-if interface.get("displayName") in (None, "", "Xiaoluxue Codex Plugins", "Android", "[TODO: Marketplace Display Name]"):
+if interface.get("displayName") in (None, "", "Android", "[TODO: Marketplace Display Name]"):
     interface["displayName"] = "Local Plugins"
 plugins = payload.setdefault("plugins", [])
 if not isinstance(plugins, list):
@@ -340,7 +386,7 @@ plugin_name = os.environ["PLUGIN_NAME"]
 local_source = str(Path(os.environ["LOCAL_MARKETPLACE_SOURCE"]).expanduser())
 text = path.read_text()
 original = text
-for legacy_name in ("android-use", "xiaoluxue-android-use"):
+for legacy_name in ("android-use",):
     text = text.replace(f'[plugins."{legacy_name}@local"]', f'[plugins."{plugin_name}@local"]')
     text = text.replace(f'[plugins."{legacy_name}@local".', f'[plugins."{plugin_name}@local".')
 
@@ -400,10 +446,13 @@ PY
 main() {
   ensure_system_dependencies
   install_or_update_plugin
+  install_node_runtime_dependencies "$INSTALL_DIR"
   marketplace="$(write_marketplace "$MARKETPLACE_PATH")"
   install_agents_compat
+  install_node_runtime_dependencies "$AGENTS_INSTALL_DIR"
   clear_quarantine "$AGENTS_INSTALL_DIR"
   install_codex_cache_compat
+  install_node_runtime_dependencies "$CODEX_CACHE_INSTALL_DIR"
   agents_marketplace="$(write_marketplace "$AGENTS_MARKETPLACE_PATH")"
   config="$(configure_codex_config || true)"
   info "Marketplace updated: $marketplace"

@@ -1044,8 +1044,6 @@ def should_auto_show_scrcpy_for_tool(name: str, arguments: dict[str, Any]) -> bo
         return False
     if arguments.get("show_scrcpy") is False:
         return False
-    if name.startswith("xiaoluxue_"):
-        return True
     return name in AUTO_SCRCPY_TOOL_NAMES
 
 
@@ -1229,8 +1227,6 @@ def tool_start_screen_viewer(args: dict[str, Any]) -> list[dict[str, Any]]:
         str(session_dir),
         "--max-events",
         str(max_events),
-        "--adb",
-        adb_binary(),
     ]
     log_path = session_dir / "viewer.log"
     SCREEN_DIR.mkdir(parents=True, exist_ok=True)

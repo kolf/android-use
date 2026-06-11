@@ -196,20 +196,6 @@ def quoted_phrases(text: str) -> list[str]:
 
 
 def fast_ui_action_from_instruction(serial: str, instruction: str) -> dict[str, Any] | None:
-    lesson_action = xiaoluxue_lesson_fast_action_from_instruction(instruction)
-    if lesson_action:
-        focus = get_focused_window(serial) or ""
-        if XIAOLUXUE_LESSON_ACTIVITY in focus:
-            return lesson_action
-
-    map_action = xiaoluxue_map_fast_action_from_instruction(instruction)
-    if map_action:
-        if map_action.get("subject_id"):
-            return map_action
-        focus = get_focused_window(serial) or ""
-        if XIAOLUXUE_STUDY_SUBJECT_ACTIVITY in focus:
-            return map_action
-
     observation = observe_ui(serial, limit=220)
     nodes = observation["ui"]["nodes"]
     labels: list[str] = []
@@ -376,93 +362,6 @@ def raw_screenshot_content_stats(raw: bytes) -> dict[str, Any]:
         "non_white_ratio": round(non_white_ratio, 4),
         "blue_ratio": round(blue_ratio, 4),
         "dark_ratio": round(dark_ratio, 4),
-    }
-
-
-def raw_screenshot_region_stats(frame: dict[str, Any], base_region: tuple[int, int, int, int]) -> dict[str, Any]:
-    width = int(frame["width"])
-    height = int(frame["height"])
-    data = frame["data"]
-    data_offset = int(frame["data_offset"])
-    base_x1, base_y1, base_x2, base_y2 = base_region
-    x1 = min(max(round(base_x1 * width / XIAOLUXUE_NATIVE_BASE_WIDTH), 0), width - 1)
-    y1 = min(max(round(base_y1 * height / XIAOLUXUE_NATIVE_BASE_HEIGHT), 0), height - 1)
-    x2 = min(max(round(base_x2 * width / XIAOLUXUE_NATIVE_BASE_WIDTH), x1 + 1), width)
-    y2 = min(max(round(base_y2 * height / XIAOLUXUE_NATIVE_BASE_HEIGHT), y1 + 1), height)
-    x_step = max((x2 - x1) // 56, 1)
-    y_step = max((y2 - y1) // 28, 1)
-    samples = 0
-    dark = 0
-    light = 0
-    blue = 0
-    for y in range(y1, y2, y_step):
-        row_offset = data_offset + y * width * 4
-        for x in range(x1, x2, x_step):
-            offset = row_offset + x * 4
-            r, g, b = data[offset], data[offset + 1], data[offset + 2]
-            samples += 1
-            if max(r, g, b) < 118:
-                dark += 1
-            if min(r, g, b) > 238:
-                light += 1
-            if b > 150 and g > 90 and r < 210:
-                blue += 1
-    if not samples:
-        return {"samples": 0, "dark_ratio": 0.0, "light_ratio": 0.0, "blue_ratio": 0.0}
-    return {
-        "samples": samples,
-        "dark_ratio": round(dark / samples, 4),
-        "light_ratio": round(light / samples, 4),
-        "blue_ratio": round(blue / samples, 4),
-    }
-
-
-def raw_screenshot_lesson_answer_stats(raw: bytes) -> dict[str, Any]:
-    frame = raw_screenshot_frame(raw)
-    if not frame.get("ok"):
-        return {"ready": False, **{key: value for key, value in frame.items() if key not in {"ok", "data"}}}
-    top_bar = raw_screenshot_region_stats(frame, (44, 52, 430, 135))
-    answer_area = raw_screenshot_region_stats(frame, (1030, 140, 1950, 740))
-    bottom_bar = raw_screenshot_region_stats(frame, (1520, 1020, 1960, 1168))
-    ready = (
-        top_bar["dark_ratio"] >= 0.006
-        and answer_area["light_ratio"] >= 0.08
-        and (answer_area["dark_ratio"] >= 0.004 or bottom_bar["blue_ratio"] >= 0.18)
-    )
-    return {
-        "ready": bool(ready),
-        "width": int(frame["width"]),
-        "height": int(frame["height"]),
-        "format": int(frame["format"]),
-        "top_bar": top_bar,
-        "answer_area": answer_area,
-        "bottom_bar": bottom_bar,
-    }
-
-
-def raw_screenshot_lesson_card_list_stats(raw: bytes) -> dict[str, Any]:
-    frame = raw_screenshot_frame(raw)
-    if not frame.get("ok"):
-        return {"ready": False, **{key: value for key, value in frame.items() if key not in {"ok", "data"}}}
-    title_center = raw_screenshot_region_stats(frame, (760, 70, 1250, 130))
-    middle_card = raw_screenshot_region_stats(frame, (610, 420, 1290, 990))
-    middle_button = raw_screenshot_region_stats(frame, (650, 880, 1250, 980))
-    right_options = raw_screenshot_region_stats(frame, (1030, 140, 1950, 740))
-    ready = (
-        title_center["dark_ratio"] >= 0.035
-        and middle_card["light_ratio"] >= 0.25
-        and middle_button["blue_ratio"] >= 0.20
-        and right_options["dark_ratio"] <= 0.006
-    )
-    return {
-        "ready": bool(ready),
-        "width": int(frame["width"]),
-        "height": int(frame["height"]),
-        "format": int(frame["format"]),
-        "title_center": title_center,
-        "middle_card": middle_card,
-        "middle_button": middle_button,
-        "right_options": right_options,
     }
 
 
@@ -784,159 +683,6 @@ def recipe_from_trace(trace: dict[str, Any], recipe_name: str | None = None) -> 
                 step["activity"] = args.get("activity")
         elif action == "wake_unlock":
             step["dismiss_keyguard"] = bool(args.get("dismiss_keyguard", True))
-        elif action == "xiaoluxue_set_speed":
-            step["rate"] = float(args.get("rate", 2.0))
-        elif action == "xiaoluxue_goto_widget":
-            step["index"] = int(args.get("index", 0))
-            step["mode"] = str(args.get("mode", "reload"))
-        elif action == "xiaoluxue_course_fast_path":
-            step.update(
-                {
-                    key: args[key]
-                    for key in (
-                        "guide_index",
-                        "guide_name_contains",
-                        "set_speed",
-                        "rate",
-                        "target_index",
-                        "target_name_contains",
-                        "target_last",
-                        "target_mode",
-                    )
-                    if key in args
-                }
-            )
-        elif action == "xiaoluxue_map_fast_path":
-            step.update(
-                {
-                    key: args[key]
-                    for key in (
-                        "index",
-                        "subject_id",
-                        "subject",
-                        "action_name",
-                        "instruction",
-                        "route_if_subject",
-                        "route_wait_sec",
-                        "close_progress_popup",
-                        "close_progress_wait_sec",
-                        "close_progress_taps",
-                        "prefer_predicted",
-                        "open_report_when_done",
-                        "enter_direct_practice",
-                    )
-                    if key in args
-                }
-            )
-        elif action == "xiaoluxue_lesson_fast_path":
-            step.update(
-                {
-                    key: args[key]
-                    for key in (
-                        "action_name",
-                        "instruction",
-                        "direct_practice_wait_sec",
-                        "lesson_focus_timeout_sec",
-                        "after_direct_practice_wait_sec",
-                        "answer_ready_timeout_sec",
-                        "answer_ready_poll_sec",
-                        "tap_direct_practice_until_answer_ready",
-                        "direct_practice_tap_interval_sec",
-                        "answer_ready_poll_after_taps",
-                        "after_continue_wait_sec",
-                        "after_finish_wait_sec",
-                        "min_answer_ready_after_continue_sec",
-                        "tap_card_direct_practice_if_needed",
-                        "card_direct_practice_taps",
-                        "card_direct_practice_interval_sec",
-                        "transition_skip_taps",
-                        "disable_system_animations",
-                        "restore_system_animations",
-                    )
-                    if key in args
-                }
-            )
-        elif action == "xiaoluxue_open_native_subject":
-            step.update(
-                {
-                    key: args[key]
-                    for key in (
-                        "subject_id",
-                        "subject",
-                        "textbook_id",
-                        "chapter_id",
-                        "knowledge_id",
-                        "go_next_knowledge",
-                        "route_wait_sec",
-                        "close_progress_popup",
-                        "close_progress_wait_sec",
-                        "close_progress_taps",
-                    )
-                    if key in args
-                }
-            )
-        elif action == "xiaoluxue_open_knowledge_guide":
-            step.update(
-                {
-                    key: args[key]
-                    for key in (
-                        "subject_id",
-                        "knowledge_index",
-                        "knowledge_id",
-                        "guide_widget_index",
-                        "rate",
-                        "prefer_client_route",
-                        "use_shortcut_url",
-                        "refresh_session",
-                    )
-                    if key in args
-                }
-            )
-        elif action == "xiaoluxue_login_fast_path":
-            step.update({key: args[key] for key in ("account", "account_chars", "password_chars", "password_redacted", "timeout_sec") if key in args})
-        elif action == "xiaoluxue_switch_env":
-            step.update(
-                {
-                    key: args[key]
-                    for key in (
-                        "env",
-                        "open_student",
-                        "force_submit",
-                        "force_stop_student",
-                        "timeout_sec",
-                    )
-                    if key in args
-                }
-            )
-        elif action == "xiaoluxue_exercise_action":
-            step.update(
-                {
-                    key: args[key]
-                    for key in ("action_name", "option_key", "option_index", "option_text", "answer_text", "button_text")
-                    if key in args
-                }
-            )
-        elif action == "xiaoluxue_exercise_fast_path":
-            step.update(
-                {
-                    key: args[key]
-                    for key in (
-                        "option_key",
-                        "option_index",
-                        "option_text",
-                        "answer_text",
-                        "submit",
-                        "continue_after_submit",
-                        "action_name",
-                        "button_text",
-                        "after_action_wait_sec",
-                        "max_steps",
-                        "step_wait_sec",
-                        "click_report",
-                    )
-                    if key in args
-                }
-            )
         else:
             continue
         after = record.get("after") if isinstance(record.get("after"), dict) else {}
@@ -1023,39 +769,6 @@ def execute_recipe_step(serial: str, step: dict[str, Any], *, dry_run: bool = Fa
         if step.get("dismiss_keyguard", True):
             adb(["shell", "wm", "dismiss-keyguard"], serial=serial, timeout=10)
         return {"ok": True, "action": "wake_unlock"}
-    if action == "xiaoluxue_set_speed":
-        page = xiaoluxue_page(serial)
-        rate = float(step.get("rate", 2.0))
-        result = cdp_eval_value(page, xiaoluxue_set_speed_expression(rate), timeout=15)
-        return {"ok": True, "action": "xiaoluxue_set_speed", "rate": rate, "result": result}
-    if action == "xiaoluxue_goto_widget":
-        page = xiaoluxue_page(serial)
-        index = int(step.get("index", 0))
-        mode = str(step.get("mode", "reload"))
-        result = cdp_eval_value(page, xiaoluxue_goto_widget_expression(index, mode), timeout=15)
-        return {"ok": True, "action": "xiaoluxue_goto_widget", "index": index, "mode": mode, "result": result}
-    if action == "xiaoluxue_course_fast_path":
-        return run_xiaoluxue_course_fast_path(serial, step, record=False)
-    if action == "xiaoluxue_open_native_subject":
-        return run_xiaoluxue_open_native_subject(serial, step, record=False)
-    if action == "xiaoluxue_map_fast_path":
-        return run_xiaoluxue_map_fast_path(serial, step, record=False)
-    if action == "xiaoluxue_lesson_fast_path":
-        return run_xiaoluxue_lesson_fast_path(serial, step, record=False)
-    if action == "xiaoluxue_open_knowledge_guide":
-        return run_xiaoluxue_open_knowledge_guide(serial, step, record=False)
-    if action == "xiaoluxue_login_fast_path":
-        if step.get("password_redacted") and not step.get("password"):
-            raise AndroidUseError("Recipe password is redacted; edit the recipe and provide `password` before replay.")
-        return run_xiaoluxue_login_fast_path(serial, step, record=False)
-    if action == "xiaoluxue_switch_env":
-        return run_xiaoluxue_switch_env(serial, step, record=False)
-    if action == "xiaoluxue_exercise_action":
-        page = xiaoluxue_exercise_page(serial)
-        result = cdp_eval_value(page, xiaoluxue_exercise_action_expression(step), timeout=15)
-        return {"ok": True, "action": "xiaoluxue_exercise_action", "result": result}
-    if action == "xiaoluxue_exercise_fast_path":
-        return run_xiaoluxue_exercise_fast_path(serial, step, record=False)
     raise AndroidUseError(f"Unsupported recipe action: {action}")
 
 
@@ -1255,6 +968,170 @@ def append_recording_checkpoint(serial: str, label: str) -> dict[str, Any]:
     }
     recording["steps"].append(step)
     return step
+
+
+def recording_trace_payload(recording: dict[str, Any], *, stopped_at: str | None = None) -> dict[str, Any]:
+    payload = {
+        "schema_version": 1,
+        "id": recording["id"],
+        "name": recording["name"],
+        "serial": recording["serial"],
+        "started_at": recording["started_at"],
+        "steps": recording.get("steps", []),
+        "errors": recording.get("errors", []),
+    }
+    if stopped_at:
+        payload["stopped_at"] = stopped_at
+    return payload
+
+
+def write_recording_trace(recording: dict[str, Any], *, stopped_at: str | None = None) -> Path:
+    trace_path = Path(recording["trace_path"])
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
+    trace_path.write_text(json.dumps(recording_trace_payload(recording, stopped_at=stopped_at), ensure_ascii=False, indent=2) + "\n")
+    return trace_path
+
+
+def tool_start_recording(args: dict[str, Any]) -> list[dict[str, Any]]:
+    serial = choose_serial(args.get("serial"))
+    if active_recording(serial):
+        raise AndroidUseError("A recording is already active for this device. Stop it with android_stop_recording first.")
+    name = slugify(str(args.get("name") or "android-recording"))
+    recording_id = f"{time.strftime('%Y%m%d-%H%M%S', time.localtime())}-{name}"
+    directory = RECORDINGS_DIR / recording_id
+    directory.mkdir(parents=True, exist_ok=True)
+    recording = {
+        "id": recording_id,
+        "name": name,
+        "serial": serial,
+        "started_at": timestamp_iso(),
+        "dir": str(directory),
+        "trace_path": str(directory / "trace.json"),
+        "include_screenshots": bool(args.get("include_screenshots", False)),
+        "redact_text": bool(args.get("redact_text", False)),
+        "after_delay_sec": float(args.get("after_delay_sec", 0.25)),
+        "steps": [],
+        "errors": [],
+    }
+    ACTIVE_RECORDINGS[serial] = recording
+    write_recording_trace(recording)
+    return [text_content({"ok": True, "recording": recording_trace_payload(recording), "trace_path": recording["trace_path"]})]
+
+
+def tool_record_checkpoint(args: dict[str, Any]) -> list[dict[str, Any]]:
+    serial = choose_serial(args.get("serial"))
+    label = slugify(str(args.get("label") or "checkpoint"), default="checkpoint")
+    checkpoint = append_recording_checkpoint(serial, label)
+    recording = active_recording(serial)
+    if recording:
+        write_recording_trace(recording)
+    return [text_content({"ok": True, "serial": serial, "checkpoint": checkpoint})]
+
+
+def tool_stop_recording(args: dict[str, Any]) -> list[dict[str, Any]]:
+    serial = choose_serial(args.get("serial"))
+    recording = active_recording(serial)
+    if not recording:
+        raise AndroidUseError("No active recording for this device.")
+    stopped_at = timestamp_iso()
+    trace_path = write_recording_trace(recording, stopped_at=stopped_at)
+    ACTIVE_RECORDINGS.pop(serial, None)
+    return [
+        text_content(
+            {
+                "ok": True,
+                "serial": serial,
+                "recording_id": recording["id"],
+                "trace_path": str(trace_path),
+                "steps": len(recording.get("steps", [])),
+                "errors": recording.get("errors", []),
+                "stopped_at": stopped_at,
+            }
+        )
+    ]
+
+
+def resolve_recording_trace_path(value: str) -> Path:
+    raw = str(value or "").strip()
+    if not raw:
+        raise AndroidUseError("trace is required.")
+    path = Path(raw).expanduser()
+    if path.is_dir():
+        path = path / "trace.json"
+    if path.exists():
+        return path
+    candidate = RECORDINGS_DIR / raw / "trace.json"
+    if candidate.exists():
+        return candidate
+    matches = sorted(RECORDINGS_DIR.glob(f"*{slugify(raw, default='trace')}*/trace.json"))
+    if matches:
+        return matches[-1]
+    raise AndroidUseError(f"Recording trace not found: {raw}")
+
+
+def resolve_recipe_path(value: str) -> Path:
+    raw = str(value or "").strip()
+    if not raw:
+        raise AndroidUseError("recipe is required.")
+    path = Path(raw).expanduser()
+    if path.is_dir():
+        path = path / "recipe.json"
+    if path.exists():
+        return path
+    candidate = RECIPES_DIR / raw / "recipe.json"
+    if candidate.exists():
+        return candidate
+    matches = sorted(RECIPES_DIR.glob(f"*{slugify(raw, default='recipe')}*/recipe.json"))
+    if matches:
+        return matches[-1]
+    raise AndroidUseError(f"Recipe not found: {raw}")
+
+
+def tool_create_recipe(args: dict[str, Any]) -> list[dict[str, Any]]:
+    trace_path = resolve_recording_trace_path(str(args.get("trace") or ""))
+    trace = json.loads(trace_path.read_text())
+    name = slugify(str(args.get("name") or trace.get("name") or trace_path.parent.name), default="android-recipe")
+    recipe = recipe_from_trace(trace, recipe_name=name)
+    if args.get("output_path"):
+        output_path = Path(str(args["output_path"])).expanduser()
+    else:
+        output_path = RECIPES_DIR / f"{time.strftime('%Y%m%d-%H%M%S', time.localtime())}-{name}" / "recipe.json"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(recipe, ensure_ascii=False, indent=2) + "\n")
+    return [text_content({"ok": True, "recipe": recipe, "path": str(output_path), "steps": len(recipe.get("steps", []))})]
+
+
+def tool_replay_recipe(args: dict[str, Any]) -> list[dict[str, Any]]:
+    recipe_path = resolve_recipe_path(str(args.get("recipe") or ""))
+    recipe = json.loads(recipe_path.read_text())
+    serial = choose_serial(args.get("serial") or recipe.get("serial"))
+    dry_run = bool(args.get("dry_run", False))
+    strict_verify = bool(args.get("strict_verify", False))
+    step_delay_sec = max(0.0, min(float(args.get("step_delay_sec", 0.25)), 5.0))
+    results: list[dict[str, Any]] = []
+    for index, step in enumerate(recipe.get("steps", []), start=1):
+        if not isinstance(step, dict):
+            continue
+        result = execute_recipe_step(serial, step, dry_run=dry_run)
+        verification = verify_recipe_step(serial, step) if not dry_run else {"checked": False, "ok": True}
+        entry = {"index": index, "step": step, "result": result, "verify": verification}
+        results.append(entry)
+        if strict_verify and verification.get("checked") and not verification.get("ok"):
+            raise AndroidUseError(f"Recipe verification failed at step {index}: {verification}")
+        if step_delay_sec > 0 and index < len(recipe.get("steps", [])):
+            time.sleep(step_delay_sec)
+    return [
+        text_content(
+            {
+                "ok": True,
+                "serial": serial,
+                "recipe": str(recipe_path),
+                "dry_run": dry_run,
+                "steps": len(results),
+                "results": results,
+            }
+        )
+    ]
 
 
 KEY_ALIASES = {

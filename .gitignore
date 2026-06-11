@@ -3,9 +3,11 @@
 .screen/
 .codex/
 .venv/
+node_modules/
 Library/
 tools/
 dist/
 __pycache__/
 *.py[cod]
+*.swp
 .DS_Store

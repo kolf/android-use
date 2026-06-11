@@ -24,6 +24,7 @@ zip -r "$OUT" "$NAME" \
   -x "$NAME/.screen/*" \
   -x "$NAME/Library/*" \
   -x "$NAME/tools/*" \
+  -x "$NAME/node_modules/*" \
   -x "$NAME/.codex/*" \
   -x "$NAME/__pycache__/*" \
   -x "$NAME/scripts/__pycache__" \

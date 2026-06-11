@@ -1,6 +1,6 @@
 # Android 插件小白安装说明
 
-`android-use-plugins` 是小鹿内部 Codex Android 控制插件。安装后，Codex 可以通过 adb、scrcpy、截图、WebView 调试和小鹿爱学快路径控制安卓设备。
+`android-use-plugins` 是 Codex Android 通用控制插件。安装后，Codex 默认通过 adb、截图、UIAutomator 和 Playwright Android WebView 控制安卓设备。
 
 这份文档面向不熟悉命令行的同学。
 
@@ -35,18 +35,18 @@ dist/android-use-plugins.zip
 - macOS；
 - Codex 桌面端；
 - Python 3；
-- Android Platform Tools，也就是 `adb`；
-- `scrcpy`，用于显示安卓设备镜像窗口；
+- Android platform-tools / `adb`，用于设备传输；
+- Node.js 和 npm，用于安装 Playwright Android WebView 运行依赖；
+- `scrcpy` 是可选依赖，用于镜像窗口和 MP4 录屏；
 - 一根能传数据的 USB 线。
 
-执行 `./install.sh` 时，脚本会默认自动安装缺失的 Python 3、adb 和 scrcpy。自动安装依赖需要电脑上已有 Homebrew。
+执行 `./install.sh` 时，脚本会默认自动安装缺失的 Python 3、Android platform-tools、Node.js/npm、Playwright 运行依赖，并可选补装 scrcpy。自动安装依赖需要电脑上已有 Homebrew。
 
 检查命令：
 
 ```bash
 python3 --version
-adb version
-scrcpy --version
+./doctor.sh
 ```
 
 通常不需要手动安装依赖，直接执行：
@@ -58,8 +58,10 @@ scrcpy --version
 安装脚本会默认静默补齐缺失依赖：
 
 - 缺少 Python 3 时，自动执行 `brew install python`；
-- 缺少 `adb` 时，自动执行 `brew install --cask android-platform-tools`；
-- 缺少 `scrcpy` 时，自动执行 `brew install scrcpy`；
+- 缺少 `adb` 时，自动执行 `brew install android-platform-tools`；
+- 缺少 Node.js/npm 时，自动执行 `brew install node`；
+- 缺少 Playwright Android 运行依赖时，在插件目录执行 `npm install --omit=dev`；
+- 缺少 `scrcpy` 时，可选执行 `brew install scrcpy`；
 - 安装日志写入 `/tmp/android-use-install-deps.log`，失败时才展示最近日志。
 
 如果不希望安装脚本自动安装依赖，可以这样执行：
@@ -88,10 +90,10 @@ ANDROID_USE_AUTO_INSTALL_DEPS=0 ./install.sh
 电脑上验证：
 
 ```bash
-adb devices -l
+./doctor.sh
 ```
 
-看到 `device` 就是授权成功。
+依赖检查通过后，再在 Codex 里调用 `android_list_devices` 看设备是否为 `device`。
 
 如果看到 `unauthorized`，说明设备还没有点允许；重新插拔 USB，看设备弹窗。
 
@@ -153,7 +155,7 @@ cd android-use
 开发同学可以使用：
 
 ```bash
-git clone https://gitlab.xiaoluxue.cn/shixiankang/android-use.git ~/plugins/android-use-plugins
+git clone <你的仓库地址> ~/plugins/android-use-plugins
 cd ~/plugins/android-use-plugins
 ./install.sh
 ./doctor.sh
@@ -167,18 +169,18 @@ cd ~/plugins/android-use-plugins
 [@Android] 列出设备
 [@Android] 打开并截图
 [@Android] 显示当前 Android 屏幕
-[@Android] 进入语文 1.5 题型突破
+[@Android] 点击“登录”
 ```
 
-默认会弹出一个 scrcpy 桌面窗口，方便人工观察和接管。需要在 Codex 里查看 Android Use 操作步骤证据时，使用 `android_start_screen_viewer` 打开截图时间线 Web UI。
+需要在 Codex 里查看 Android Use 操作步骤证据时，可以使用 `android_start_screen_viewer` 打开截图时间线 Web UI；需要实时镜像时使用 `android_start_scrcpy`。
 
 ## 输入速度
 
 插件会自动选择更快的输入方式：
 
-- 可调试 WebView 页面：优先直接给当前输入框赋值，不走键盘输入，适合小鹿爱学答题输入框；
+- 可调试 WebView 页面：优先通过 Playwright Android 直接给当前输入框赋值，不走键盘输入，适合混合 App、表单页和富文本输入框；
 - 中文、长文本、清空后输入：优先使用 ADB Keyboard 广播；
-- 短英文：使用一次性批量 `adb shell input`；
+- 短英文：使用 adb 批量 `shell input`；
 - 录制回放里的输入：也使用同一套快路径。
 
 如果不希望插件直接写 WebView DOM，可以在环境变量里写：
@@ -227,30 +229,24 @@ cd ~/plugins/android-use-plugins
 先看：
 
 ```bash
-adb devices -l
-```
-
-设备状态必须是 `device`。
-
-### scrcpy 没窗口
-
-检查：
-
-```bash
-scrcpy --version
-cd ~/plugins/android-use-plugins
 ./doctor.sh
 ```
 
-如果之前手动关过窗口，下一次调用 Android 工具会重新打开。
+检查 adb 和 Playwright Android 运行依赖是否通过，并确认设备已开启 USB 调试和授权。
 
-### 小鹿爱学链接打不开
+### scrcpy 没窗口
 
-`stu.xiaoluxue.com` 和 `*.xiaoluxue.cn` 不要用普通浏览器打开。插件会通过小鹿爱学 App 内部 route 或 WebView 打开。
+如果没有看到 scrcpy 窗口，需要可视证据时也可以使用：
+
+```bash
+android_start_screen_viewer
+```
+
+`android_start_scrcpy` 会通过 adb-backed scrcpy 启动或复用窗口。
 
 ### 视觉模型必须配置吗
 
-不是必须。adb、scrcpy、截图、UIAutomator、WebView 和小鹿爱学快路径都可以不依赖视觉模型。
+不是必须。adb、截图、UIAutomator、Playwright WebView 和直接控制工具都可以不依赖视觉模型。
 
 只有需要自然语言看图操作时，才配置视觉模型。配置建议写到：
 

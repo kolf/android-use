@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MCP server for Android device control through adb and scrcpy.
+"""MCP server for generic Android device control through adb and Playwright.
 
 The implementation is split into domain-focused files under
 ``scripts/android_use_parts`` so each source file stays readable and below the
@@ -20,10 +20,7 @@ _PART_FILES = [
     "01_wireless_qr.py",
     "01_ui_recording_recipe.py",
     "02_input_and_basic_tools.py",
-    "03_xiaoluxue_runtime_course.py",
-    "04_xiaoluxue_course_open.py",
-    "05_xiaoluxue_native_map.py",
-    "06_xiaoluxue_env_exercise_recording.py",
+    "03_playwright_webview.py",
     "07_scrcpy_viewers_recording.py",
     "08_agent_models.py",
     "09_tool_catalog.py",

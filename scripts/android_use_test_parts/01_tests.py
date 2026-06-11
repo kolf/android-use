@@ -101,9 +101,9 @@ adb-ANMB9X5A10G00857      _adb-tls-connect._tcp  192.168.86.39:37123
 
     def test_wireless_pair_qr_complete_pairs_discovered_service(self) -> None:
         original_android_dir = mcp.ANDROID_USE_DIR
-        original_run_command = mcp.run_command
+        original_pairing_services = mcp.adb_mdns_pairing_services
+        original_pair = mcp.adb_pair_wireless
         original_reconnect = mcp.wireless_reconnect
-        commands: list[list[str]] = []
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 mcp.ANDROID_USE_DIR = Path(tmpdir) / ".android-use"
@@ -119,19 +119,24 @@ adb-ANMB9X5A10G00857      _adb-tls-connect._tcp  192.168.86.39:37123
                     }
                 )
 
-                def fake_run_command(command: list[str], **_kwargs: object) -> tuple[bytes, bytes]:
-                    commands.append(command)
-                    if command[1:3] == ["mdns", "services"]:
-                        return (
-                            b"List of discovered mdns services\n"
-                            b"studio-AbC123xYz9          _adb-tls-pairing._tcp  192.168.86.39:55861\n",
-                            b"",
-                        )
-                    if command[1] == "pair":
-                        self.assertEqual(command[2], "192.168.86.39:55861")
-                        self.assertEqual(command[3], "Pass12345678")
-                        return b"Successfully paired", b""
-                    raise AssertionError(command)
+                def fake_pairing_services(**kwargs: object) -> list[dict[str, object]]:
+                    self.assertEqual(kwargs["service_name"], "studio-AbC123xYz9")
+                    return [
+                        {
+                            "service_name": "studio-AbC123xYz9",
+                            "service_type": "_adb-tls-pairing._tcp",
+                            "host": "192.168.86.39",
+                            "port": 55861,
+                            "serial": "192.168.86.39:55861",
+                        }
+                    ]
+
+                def fake_pair(host: str, port: int, password: str, **kwargs: object) -> dict[str, object]:
+                    self.assertEqual(host, "192.168.86.39")
+                    self.assertEqual(port, 55861)
+                    self.assertEqual(password, "Pass12345678")
+                    self.assertEqual(kwargs["service_name"], "studio-AbC123xYz9")
+                    return {"ok": True, "output": "Successfully paired"}
 
                 def fake_reconnect(**kwargs: object) -> dict[str, object]:
                     self.assertEqual(kwargs["host"], "192.168.86.39")
@@ -139,7 +144,8 @@ adb-ANMB9X5A10G00857      _adb-tls-connect._tcp  192.168.86.39:37123
                     self.assertTrue(kwargs["start_scrcpy"])
                     return {"ok": True, "serial": "192.168.86.39:37123"}
 
-                mcp.run_command = fake_run_command
+                mcp.adb_mdns_pairing_services = fake_pairing_services  # type: ignore[assignment]
+                mcp.adb_pair_wireless = fake_pair  # type: ignore[assignment]
                 mcp.wireless_reconnect = fake_reconnect
 
                 content = mcp.tool_wireless_pair_qr(
@@ -148,12 +154,12 @@ adb-ANMB9X5A10G00857      _adb-tls-connect._tcp  192.168.86.39:37123
                 payload = json.loads(content[0]["text"])
         finally:
             mcp.ANDROID_USE_DIR = original_android_dir
-            mcp.run_command = original_run_command
+            mcp.adb_mdns_pairing_services = original_pairing_services
+            mcp.adb_pair_wireless = original_pair
             mcp.wireless_reconnect = original_reconnect
 
         self.assertEqual(payload["pair_target"], "192.168.86.39:55861")
         self.assertEqual(payload["reconnect"]["serial"], "192.168.86.39:37123")
-        self.assertTrue(any(command[1] == "pair" for command in commands))
 
     def test_wireless_configs_from_env_reads_multiple_devices_and_legacy(self) -> None:
         original_read = mcp.read_user_env_values
@@ -615,389 +621,3 @@ adb-ANMB9X5A10G00857      _adb-tls-connect._tcp  192.168.86.39:37123
         sockets = mcp.parse_webview_devtools_sockets(proc_net_unix)
 
         self.assertEqual(sockets, ["webview_devtools_remote_twe_32675", "webview_devtools_remote_123"])
-
-    def test_normalize_xiaoluxue_knowledge_index(self) -> None:
-        self.assertEqual(mcp.normalize_xiaoluxue_knowledge_index("1.1.11"), "1111")
-        self.assertEqual(mcp.normalize_xiaoluxue_knowledge_index("1.1.1.1"), "1111")
-
-    def test_xiaoluxue_app_only_url_detection(self) -> None:
-        self.assertTrue(mcp.is_xiaoluxue_app_only_url("https://stu.xiaoluxue.com/course?knowledgeId=3785"))
-        self.assertTrue(mcp.is_xiaoluxue_app_only_url("http://stu.test.xiaoluxue.cn/exercise?studySessionId=1"))
-        self.assertTrue(mcp.is_xiaoluxue_app_only_url("https://gw-stu.test.xiaoluxue.cn/path"))
-        self.assertFalse(mcp.is_xiaoluxue_app_only_url("https://example.com/course"))
-        self.assertFalse(mcp.is_xiaoluxue_app_only_url("xlx://router/vessel/webview"))
-
-    def test_xiaoluxue_url_kind_supports_test_hosts(self) -> None:
-        self.assertEqual(mcp.xiaoluxue_url_kind("http://stu.test.xiaoluxue.cn/course?knowledgeId=1"), "course")
-        self.assertEqual(mcp.xiaoluxue_url_kind("http://stu.test.xiaoluxue.cn/exercise?studySessionId=1"), "exercise")
-        self.assertEqual(mcp.xiaoluxue_url_kind("https://stu.xiaoluxue.com/"), "any")
-        self.assertIsNone(mcp.xiaoluxue_url_kind("https://example.com/course"))
-
-    def test_xiaoluxue_vessel_route_quotes_target(self) -> None:
-        route = mcp.xiaoluxue_vessel_webview_url("https://gw-stu.test.xiaoluxue.cn/course?a=1&b=数学")
-
-        self.assertTrue(route.startswith("xlx://router/vessel/webview?url="))
-        self.assertIn("gw-stu.test.xiaoluxue.cn%2Fcourse", route)
-        self.assertIn("full_screen=true", route)
-        self.assertIn("title_bar=false", route)
-
-    def test_xiaoluxue_runtime_url_matches_course_identity(self) -> None:
-        target = "https://stu.xiaoluxue.com/course?knowledgeId=3785&lessonId=1"
-        current = "https://stu.xiaoluxue.com/course?lessonId=1&knowledgeId=3785&redirectWidgetIndex=4"
-
-        self.assertTrue(mcp.xiaoluxue_runtime_url_matches(target, current))
-        self.assertFalse(mcp.xiaoluxue_runtime_url_matches(target, "https://stu.xiaoluxue.com/course?knowledgeId=9999&lessonId=1"))
-
-    def test_xiaoluxue_rebase_h5_url_uses_current_test_host(self) -> None:
-        target = "https://stu.xiaoluxue.com/course?knowledgeId=3785&lessonId=1"
-        current = "http://stu.test.xiaoluxue.cn/exercise?studySessionId=1"
-
-        self.assertEqual(
-            mcp.xiaoluxue_rebase_h5_url(target, current),
-            "http://stu.test.xiaoluxue.cn/course?knowledgeId=3785&lessonId=1",
-        )
-
-    def test_xiaoluxue_native_scaled_point(self) -> None:
-        self.assertEqual(
-            mcp.xiaoluxue_native_scaled_point((690, 280), {"width": 2000, "height": 1200}),
-            (690, 280),
-        )
-        self.assertEqual(
-            mcp.xiaoluxue_native_scaled_point((690, 280), {"width": 1000, "height": 600}),
-            (345, 140),
-        )
-
-    def test_xiaoluxue_map_instruction_and_action_normalization(self) -> None:
-        self.assertTrue(mcp.xiaoluxue_instruction_looks_like_map("进入 1.5 题型突破"))
-        self.assertTrue(mcp.xiaoluxue_instruction_looks_like_map("进入数学的巩固练习，随便一节课"))
-        self.assertFalse(mcp.xiaoluxue_instruction_looks_like_map("首页 -> 数学 1.1.11 知识讲解 2x"))
-        self.assertEqual(mcp.normalize_xiaoluxue_map_index("进入 1.5 题型突破"), "1.5")
-        self.assertEqual(mcp.normalize_xiaoluxue_map_action("打开 1.5 错题"), "wrong")
-        self.assertEqual(mcp.normalize_xiaoluxue_map_action("打开 1.5 笔记本"), "notebook")
-        self.assertEqual(mcp.normalize_xiaoluxue_map_action("看报告"), "report")
-        self.assertEqual(mcp.normalize_xiaoluxue_map_action("进入数学 专属精练"), "expand")
-        self.assertEqual(mcp.normalize_xiaoluxue_map_action("进入数学 巩固练习"), "expand")
-        self.assertEqual(mcp.normalize_xiaoluxue_lesson_action("直接练"), "direct_practice")
-        self.assertEqual(mcp.normalize_xiaoluxue_lesson_action("继续到下一题"), "continue_answer")
-        self.assertEqual(mcp.normalize_xiaoluxue_lesson_action("完成返回地图"), "finish_result")
-        self.assertEqual(mcp.normalize_xiaoluxue_subject_id("进入语文 1.5 题型突破"), 1)
-        self.assertEqual(mcp.normalize_xiaoluxue_subject_id("打开 subject_id=2 地图"), 2)
-        self.assertEqual(
-            mcp.xiaoluxue_study_subject_route_url(1),
-            "xlx://router/study/subject?subject_id=1",
-        )
-        self.assertEqual(
-            mcp.xiaoluxue_map_fast_action_from_instruction("进入语文 1.5 题型突破"),
-            {
-                "action": "xiaoluxue_map_fast_path",
-                "instruction": "进入语文 1.5 题型突破",
-                "action_name": "practise",
-                "source": "xiaoluxue-native-map",
-                "index": "1.5",
-                "subject_id": 1,
-                "route_if_subject": True,
-            },
-        )
-        self.assertEqual(
-            mcp.xiaoluxue_map_fast_action_from_instruction("进入数学 1.5 题型突破 直接练"),
-            {
-                "action": "xiaoluxue_map_fast_path",
-                "instruction": "进入数学 1.5 题型突破 直接练",
-                "action_name": "practise",
-                "source": "xiaoluxue-native-map",
-                "index": "1.5",
-                "subject_id": 2,
-                "route_if_subject": True,
-                "enter_direct_practice": True,
-            },
-        )
-        self.assertEqual(
-            mcp.xiaoluxue_map_fast_action_from_instruction("进入数学 专属精练"),
-            {
-                "action": "xiaoluxue_map_fast_path",
-                "instruction": "进入数学 专属精练",
-                "action_name": "expand",
-                "source": "xiaoluxue-native-map",
-                "subject_id": 2,
-                "route_if_subject": True,
-            },
-        )
-        self.assertEqual(
-            mcp.xiaoluxue_lesson_fast_action_from_instruction("进入 直接练"),
-            {
-                "action": "xiaoluxue_lesson_fast_path",
-                "instruction": "进入 直接练",
-                "action_name": "direct_practice",
-                "source": "xiaoluxue-native-lesson",
-            },
-        )
-        self.assertEqual(
-            mcp.xiaoluxue_lesson_fast_action_from_instruction("完成返回地图"),
-            {
-                "action": "xiaoluxue_lesson_fast_path",
-                "instruction": "完成返回地图",
-                "action_name": "finish_result",
-                "source": "xiaoluxue-native-lesson",
-            },
-        )
-
-    def test_xiaoluxue_native_course_sequence_taps_continue_quickly(self) -> None:
-        original_tap = mcp.xiaoluxue_native_tap
-        original_wait = mcp.xiaoluxue_wait_for_site_page
-        original_sleep = mcp.time.sleep
-        labels: list[str] = []
-        try:
-            mcp.xiaoluxue_native_tap = lambda serial, point, info, label, steps, started_at: labels.append(label)
-            mcp.xiaoluxue_wait_for_site_page = lambda serial, deadline: {"id": "page", "url": "http://stu.test/course"}
-            mcp.time.sleep = lambda seconds: None
-
-            result = mcp.xiaoluxue_try_native_course_sequence(
-                "serial",
-                {"width": 2000, "height": 1200},
-                [],
-                0.0,
-                999999999.0,
-                label="subject_map",
-                tap_math=False,
-            )
-
-            self.assertTrue(result["ok"])
-            self.assertEqual(
-                labels,
-                [
-                    "subject_map:dismiss_progress_popup",
-                    "subject_map:guide_bubble",
-                    "subject_map:continue:1",
-                ],
-            )
-        finally:
-            mcp.xiaoluxue_native_tap = original_tap
-            mcp.xiaoluxue_wait_for_site_page = original_wait
-            mcp.time.sleep = original_sleep
-
-    def test_xiaoluxue_open_knowledge_prefers_native_entry_before_vessel(self) -> None:
-        original_any_page = mcp.xiaoluxue_any_page
-        original_native_entry = mcp.xiaoluxue_open_native_course_entry
-        original_vessel_entry = mcp.xiaoluxue_open_vessel_course_page
-        original_cdp_eval = mcp.cdp_eval_value
-        calls: list[str] = []
-        target_url = str(mcp.XIAOLUXUE_KNOWLEDGE_SHORTCUTS[(2, "1111")]["targetUrl"])
-        fake_page = {
-            "id": "page-1",
-            "url": target_url,
-            "runtimeHref": target_url,
-            "webSocketDebuggerUrl": "ws://127.0.0.1:1/devtools/page/page-1",
-        }
-        try:
-            mcp.xiaoluxue_any_page = lambda *args, **kwargs: (_ for _ in ()).throw(mcp.AndroidUseError("no current page"))
-
-            def fake_native_entry(*args, **kwargs):
-                calls.append("native")
-                return {"attempted": True, "ok": True, "page": fake_page}
-
-            def fake_vessel_entry(*args, **kwargs):
-                calls.append("vessel")
-                raise AssertionError("vessel should not be attempted before successful native entry")
-
-            def fake_cdp_eval(page, expression, **kwargs):
-                if expression == "location.href":
-                    return target_url
-                text = str(expression)
-                if "readyState" in text and "targetWidget" not in text:
-                    return {"ok": True, "before": {"readyState": "complete"}, "after": {"readyState": "complete"}}
-                if "targetWidget" in text:
-                    return {
-                        "ok": True,
-                        "readyState": "complete",
-                        "targetWidget": {"dataName": "初识集合——集合与元素的定义", "loaded": True},
-                        "videos": [{"playbackRate": 2}],
-                    }
-                if "turbo" in text or "video" in text:
-                    return {"ok": True, "video": True}
-                return {"ok": True}
-
-            mcp.xiaoluxue_open_native_course_entry = fake_native_entry
-            mcp.xiaoluxue_open_vessel_course_page = fake_vessel_entry
-            mcp.cdp_eval_value = fake_cdp_eval
-
-            result = mcp.run_xiaoluxue_open_knowledge_guide(
-                "serial",
-                {
-                    "subject_id": 2,
-                    "knowledge_index": "1.1.11",
-                    "rate": 2,
-                    "timeout_sec": 3,
-                    "prefer_native_entry_first": True,
-                },
-                record=False,
-            )
-
-            self.assertTrue(result["ok"])
-            self.assertEqual(calls, ["native"])
-            self.assertTrue(result["native_entry"]["ok"])
-            self.assertFalse(result["vessel_entry"]["attempted"])
-        finally:
-            mcp.xiaoluxue_any_page = original_any_page
-            mcp.xiaoluxue_open_native_course_entry = original_native_entry
-            mcp.xiaoluxue_open_vessel_course_page = original_vessel_entry
-            mcp.cdp_eval_value = original_cdp_eval
-
-    def test_xiaoluxue_open_knowledge_prefers_direct_vessel_for_known_shortcut_by_default(self) -> None:
-        original_any_page = mcp.xiaoluxue_any_page
-        original_native_entry = mcp.xiaoluxue_open_native_course_entry
-        original_vessel_entry = mcp.xiaoluxue_open_vessel_course_page
-        original_cdp_eval = mcp.cdp_eval_value
-        calls: list[str] = []
-        captured_timeout: list[float] = []
-        target_url = str(mcp.XIAOLUXUE_KNOWLEDGE_SHORTCUTS[(2, "1111")]["targetUrl"])
-        fake_page = {
-            "id": "page-1",
-            "url": target_url,
-            "runtimeHref": target_url,
-            "webSocketDebuggerUrl": "ws://127.0.0.1:1/devtools/page/page-1",
-        }
-        try:
-            mcp.xiaoluxue_any_page = lambda *args, **kwargs: (_ for _ in ()).throw(mcp.AndroidUseError("no current page"))
-
-            def fake_native_entry(*args, **kwargs):
-                calls.append("native")
-                raise AssertionError("native should not be attempted for a known shortcut by default")
-
-            def fake_vessel_entry(*args, **kwargs):
-                calls.append("vessel")
-                captured_timeout.append(float(kwargs["timeout_sec"]))
-                return {"attempted": True, "ok": True, "page": fake_page}
-
-            def fake_cdp_eval(page, expression, **kwargs):
-                if expression == "location.href":
-                    return target_url
-                text = str(expression)
-                if "readyState" in text and "targetWidget" not in text:
-                    return {"ok": True, "before": {"readyState": "complete"}, "after": {"readyState": "complete"}}
-                if "targetWidget" in text:
-                    return {
-                        "ok": True,
-                        "readyState": "complete",
-                        "targetWidget": {"dataName": "初识集合——集合与元素的定义", "loaded": True},
-                        "videos": [{"playbackRate": 2}],
-                    }
-                if "turbo" in text or "video" in text:
-                    return {"ok": True, "video": True}
-                return {"ok": True}
-
-            mcp.xiaoluxue_open_native_course_entry = fake_native_entry
-            mcp.xiaoluxue_open_vessel_course_page = fake_vessel_entry
-            mcp.cdp_eval_value = fake_cdp_eval
-
-            result = mcp.run_xiaoluxue_open_knowledge_guide(
-                "serial",
-                {"subject_id": 2, "knowledge_index": "1.1.11", "rate": 2, "timeout_sec": 5},
-                record=False,
-            )
-
-            self.assertTrue(result["ok"])
-            self.assertEqual(calls, ["vessel"])
-            self.assertGreaterEqual(captured_timeout[0], 4.0)
-            self.assertTrue(result["vessel_entry"]["ok"])
-            self.assertFalse(result["native_entry"]["attempted"])
-            self.assertEqual(result["stop_loading"]["skipped"], "entry-opened-target-course")
-            self.assertEqual(result["prefetch"]["skipped"], "entry-opened-target-course")
-            self.assertEqual(result["rate_prepare"]["skipped"], "entry-opened-target-course")
-        finally:
-            mcp.xiaoluxue_any_page = original_any_page
-            mcp.xiaoluxue_open_native_course_entry = original_native_entry
-            mcp.xiaoluxue_open_vessel_course_page = original_vessel_entry
-            mcp.cdp_eval_value = original_cdp_eval
-
-    def test_xiaoluxue_hidden_course_webview_behind_native_map_is_not_foreground(self) -> None:
-        original_focus = mcp.get_focused_window
-        try:
-            mcp.get_focused_window = lambda serial: (
-                f"Window{{1 u0 {mcp.XIAOLUXUE_STUDENT_PACKAGE}/{mcp.XIAOLUXUE_STUDY_SUBJECT_ACTIVITY}}}"
-            )
-            with self.assertRaises(mcp.AndroidUseError):
-                mcp.xiaoluxue_ensure_foreground_webview(
-                    "serial",
-                    {
-                        "url": "https://stu.xiaoluxue.com/course?knowledgeId=3785",
-                        "descriptionParsed": {"visible": False},
-                    },
-                )
-        finally:
-            mcp.get_focused_window = original_focus
-
-    def test_xiaoluxue_hidden_course_webview_behind_leakcanary_is_not_foreground(self) -> None:
-        original_focus = mcp.get_focused_window
-        try:
-            mcp.get_focused_window = lambda serial: (
-                f"{mcp.XIAOLUXUE_STUDENT_PACKAGE}/leakcanary.internal.activity.LeakLauncherActivity"
-            )
-            with self.assertRaises(mcp.AndroidUseError):
-                mcp.xiaoluxue_ensure_foreground_webview(
-                    "serial",
-                    {
-                        "url": "https://stu.xiaoluxue.com/course?knowledgeId=3785",
-                        "descriptionParsed": {"visible": False},
-                    },
-                )
-        finally:
-            mcp.get_focused_window = original_focus
-
-    def test_xiaoluxue_wait_for_target_course_page_accepts_static_target_url_after_eval_race(self) -> None:
-        original_discover = mcp.discover_webview_pages
-        original_eval = mcp.cdp_eval_value
-        original_sleep = mcp.time.sleep
-        original_monotonic = mcp.time.monotonic
-        calls = 0
-        page = {
-            "id": "page-1",
-            "url": "https://stu.xiaoluxue.com/course?knowledgeId=3785&lessonId=1",
-            "webSocketDebuggerUrl": "ws://127.0.0.1/devtools/page/page-1",
-            "descriptionParsed": {"visible": True},
-        }
-        try:
-            mcp.discover_webview_pages = lambda serial: [page]
-            mcp.cdp_eval_value = lambda *args, **kwargs: (_ for _ in ()).throw(mcp.AndroidUseError("runtime href race"))
-            mcp.time.sleep = lambda seconds: None
-
-            def fake_monotonic() -> float:
-                nonlocal calls
-                calls += 1
-                return 0.0 if calls <= 2 else 1.0
-
-            mcp.time.monotonic = fake_monotonic
-
-            result = mcp.xiaoluxue_wait_for_target_course_page(
-                "serial",
-                0.5,
-                knowledge_id=3785,
-                poll_interval=0,
-            )
-
-            self.assertEqual(result["url"], page["url"])
-        finally:
-            mcp.discover_webview_pages = original_discover
-            mcp.cdp_eval_value = original_eval
-            mcp.time.sleep = original_sleep
-            mcp.time.monotonic = original_monotonic
-
-    def test_xiaoluxue_route_app_url_uses_scheme_proxy_component(self) -> None:
-        original_adb = mcp.adb
-        commands: list[list[str]] = []
-        try:
-            mcp.adb = lambda command, serial=None, timeout=30: commands.append(list(command)) or b"Starting: Intent {}"
-
-            result = mcp.xiaoluxue_route_app_url(
-                "serial",
-                "https://stu.xiaoluxue.com/course?knowledgeId=3785",
-                force_stop=True,
-            )
-
-            command = commands[0]
-            self.assertTrue(result["ok"])
-            self.assertIn("-S", command)
-            self.assertIn("-n", command)
-            self.assertIn(f"{mcp.XIAOLUXUE_STUDENT_PACKAGE}/{mcp.XIAOLUXUE_SCHEME_PROXY_ACTIVITY}", command)
-            self.assertNotIn("-p", command)
-        finally:
-            mcp.adb = original_adb

@@ -6,12 +6,11 @@
 
 - 打开 Android App；
 - 查看和截图当前设备屏幕；
-- 弹出 scrcpy 桌面镜像窗口，方便人工观察和接管；
-- 点击、滑动、输入文字、按返回键、执行 adb shell；
+- 通过 adb 查看和控制设备，WebView 操作用 Playwright Android；
+- 点击、滑动、输入文字、按返回键、执行设备 shell；
 - 调试 WebView；
 - 录制常用操作并复放；
-- 使用可选视觉模型做自然语言操作；
-- 内置小鹿爱学 App 的课程、练习、WebView、原生地图等快路径。
+- 使用可选视觉模型做自然语言操作。
 
 ## 一句话安装
 
@@ -32,11 +31,12 @@
 - macOS；
 - Codex 桌面端；
 - Python 3，执行 `python3 --version` 能看到版本；
-- Android 调试工具 `adb`；
-- `scrcpy`，用于弹出安卓设备镜像窗口；
+- Android platform-tools / `adb`，用于设备传输；
+- Node.js 和 npm，用于安装 Playwright Android WebView 运行依赖；
+- `scrcpy` 是可选项，用于镜像窗口和 MP4 录屏；
 - 一根支持数据传输的 USB 线。
 
-执行 `./install.sh` 时，脚本会默认自动安装缺失的 Python 3、adb 和 scrcpy。自动安装依赖需要电脑上已有 Homebrew。
+执行 `./install.sh` 时，脚本会默认自动安装缺失的 Python 3、Android platform-tools、Node.js/npm、Playwright 运行依赖，并可选补装 scrcpy。自动安装依赖需要电脑上已有 Homebrew。
 
 安卓设备上需要：
 
@@ -56,16 +56,17 @@
 安装脚本会默认静默补齐缺失依赖：
 
 - 缺少 Python 3 时，自动执行 `brew install python`；
-- 缺少 `adb` 时，自动执行 `brew install --cask android-platform-tools`；
-- 缺少 `scrcpy` 时，自动执行 `brew install scrcpy`；
+- 缺少 `adb` 时，自动执行 `brew install android-platform-tools`；
+- 缺少 Node.js/npm 时，自动执行 `brew install node`；
+- 缺少 Playwright Android 运行依赖时，在插件目录执行 `npm install --omit=dev`；
+- 缺少 `scrcpy` 时，可选执行 `brew install scrcpy`；
 - 安装日志写入 `/tmp/android-use-install-deps.log`，失败时才展示最近日志。
 
 如果你想手动检查：
 
 ```bash
 python3 --version
-adb version
-scrcpy --version
+./doctor.sh
 ```
 
 如果不希望安装脚本自动安装依赖，可以这样执行：
@@ -95,10 +96,10 @@ ANDROID_USE_AUTO_INSTALL_DEPS=0 ./install.sh
 9. 用 USB 数据线连接电脑。
 10. 设备弹出「是否允许 USB 调试」时，选择「允许」，建议勾选「始终允许使用这台计算机进行调试」。
 
-在电脑上验证：
+在电脑上验证插件依赖：
 
 ```bash
-adb devices -l
+./doctor.sh
 ```
 
 正常会看到类似：
@@ -194,7 +195,7 @@ cd android-use
 开发同学也可以从 Git 仓库安装：
 
 ```bash
-git clone https://gitlab.xiaoluxue.cn/shixiankang/android-use.git ~/plugins/android-use-plugins
+git clone <你的仓库地址> ~/plugins/android-use-plugins
 cd ~/plugins/android-use-plugins
 ./install.sh
 ./doctor.sh
@@ -220,7 +221,7 @@ cd ~/plugins/android-use-plugins
 [@Android] 生成当前 Android AppShot
 ```
 
-正常情况下，插件会识别到 adb 设备，并弹出一个 scrcpy 桌面窗口。
+正常情况下，插件会通过 `adb devices -l` 识别设备。需要可视证据时，可以使用 `android_start_screen_viewer` 打开截图时间线 Web UI，也可以使用 `android_start_scrcpy` 打开镜像窗口。
 
 ## AppShot 证据快照
 
@@ -235,15 +236,13 @@ cd ~/plugins/android-use-plugins
 
 ## scrcpy 窗口说明
 
-插件默认会通过原生 macOS `.app` wrapper 启动 scrcpy 桌面镜像窗口，保证 Codex Attach/AppShot 识别到稳定的 app 名称、bundle id 和 Android 图标。不要直接裸启动 scrcpy 可见窗口。
-
-默认行为：
+`android_start_scrcpy` 会通过 adb-backed scrcpy 启动或复用镜像窗口。`Android Use.app` wrapper 仍会自动创建，用来稳定启动 scrcpy，但它只是后台启动包装器，不是用户需要打开或关注的独立 App。
 
 - Android 工具被调用时自动弹出；
 - 同一个设备只保留一个 scrcpy 窗口；
 - `ANDROID_USE_SCRCPY_RESIDENT_SERIALS` 写入多个序列号时，会为每台已连接设备分别保活一个 scrcpy 窗口；
 - 自动弹窗、`android_start_scrcpy`、`android_start_scrcpy_app`、无线调试 `start_scrcpy=true`、resident monitor 都走同一个 `.app` wrapper 启动路径；
-- 启动 `.app` wrapper 时会检查 `/Applications/Android Use.app`，已有就跳过，没有就自动创建一个系统「应用程序」里的 Android Use 启动图标；
+- 启动 `.app` wrapper 时会检查 `/Applications/Android Use.app`，已有就跳过，没有就自动准备这个后台启动包装器；
 - 默认启动时会清理 `.android-use/` 下旧的同 bundle id 设备专属 `.app`，只保留固定的 `Android Use.app`；
 - 只复用 bundle id 为 `com.kolf.android-use` 的窗口；发现旧的裸 scrcpy/supervisor 窗口会先关闭再重开；
 - 窗口稳定显示后，如果用户手动关闭，插件会尽量尊重这次关闭；
@@ -251,15 +250,9 @@ cd ~/plugins/android-use-plugins
 - 默认关闭音频，降低资源占用；
 - 默认启用文字输入优化。
 
-`.app` wrapper 的 bundle id 是 `com.kolf.android-use`，并使用 Android 图标与 software renderer 打开 scrcpy。macOS app 固定使用 `Android Use.app` 作为启动器，避免换设备时多个同 bundle id 的设备专属 `.app` 被 LaunchServices 缓存混淆；窗口标题仍默认使用设备名称，例如 `荣耀平板Z6`，取不到设备名称时使用型号，最后回退到 `Android`。默认初始窗口大小是当前设备截图尺寸的 1/2，例如横屏 `2000 x 1200` 会以 `1000 x 600` 打开；这只影响启动窗口大小，不降低 scrcpy 视频流分辨率，也不会持续锁定窗口。
+`.app` wrapper 的 bundle id 是 `com.kolf.android-use`，并使用 Android 图标与 software renderer 打开 scrcpy。macOS 侧固定使用 `Android Use.app` 作为启动器，避免换设备时多个同 bundle id 的设备专属 `.app` 被 LaunchServices 缓存混淆；窗口标题仍默认使用设备名称，例如 `荣耀平板Z6`，取不到设备名称时使用型号，最后回退到 `Android`。默认初始窗口大小是当前设备截图尺寸的 1/2，例如横屏 `2000 x 1200` 会以 `1000 x 600` 打开；这只影响启动窗口大小，不降低 scrcpy 视频流分辨率，也不会持续锁定窗口。
 
-如果不想自动创建系统「应用程序」里的 `Android Use.app`，可设置：
-
-```bash
-export ANDROID_USE_SYSTEM_ANDROID_APP=0
-```
-
-如果不想让工具调用时自动弹出 scrcpy：
+可以使用以下环境变量控制 scrcpy 自动弹窗行为：
 
 ```bash
 export ANDROID_USE_SCRCPY_ON_TOOL_CALL=0
@@ -273,7 +266,7 @@ export ANDROID_USE_SCRCPY_RESIDENT=0
 
 ## 可选：配置视觉模型
 
-没有视觉模型也能用 adb、截图、scrcpy、UIAutomator、WebView 和小鹿爱学快路径。
+没有视觉模型也能用 adb、截图、UIAutomator、Playwright WebView 和直接控制工具。
 
 只有需要自然语言看图操作时，才需要配置视觉模型。
 
@@ -307,9 +300,9 @@ ANDROID_USE_OPENAI_COMPUTER_MODEL=gpt-5.5
 
 `android_type_text` 会自动选择更快的输入方式：
 
-- 可调试 WebView 页面会优先直接给当前输入框赋值，不走键盘输入，适合小鹿爱学答题输入框；
+- 可调试 WebView 页面会优先通过 Playwright Android 直接给当前输入框赋值，不走键盘输入，适合混合 App、表单页和富文本输入框；
 - 如果设备装了 ADB Keyboard，中文、长文本、清空后输入会优先走 IME 广播；
-- 普通短英文会走一次性批量 `adb shell input`；
+- 普通短英文会走 adb `shell input`；
 - 录制 recipe 回放里的输入也会复用同一套快路径。
 
 如果不希望插件直接写 WebView DOM：
@@ -343,25 +336,20 @@ ANDROID_USE_RESTORE_IME_AFTER_TYPE=1
 [@Android] 按返回键
 ```
 
-小鹿爱学常用：
+WebView / 混合 App 常用：
 
 ```text
-[@Android] 把小鹿爱学环境切到 test
-[@Android] 打开小鹿爱学首页
-[@Android] 进入语文 1.5 题型突破
-[@Android] 打开数学 1.1.11 知识讲解，并调速到 2x
-[@Android] 小鹿爱学 /exercise 选择 A 并提交
+[@Android] 列出 WebView 页面
+[@Android] 在当前 WebView 执行 document.title
+[@Android] 打开 https://example.com
 ```
 
-## 小鹿爱学 App 注意事项
+## WebView 和深链说明
 
-- `stu.xiaoluxue.com` 和 `*.xiaoluxue.cn` 这类链接不要用普通浏览器打开；
-- 这类链接应该通过小鹿爱学 App 内部 route 或 WebView vessel 打开；
-- `/course` 页面点击屏幕任意位置可能会显示隐藏控制层；
-- WebView 能在 Chrome `chrome://inspect/#devices` 里看到时，优先用插件的 WebView 工具，而不是视觉模型；
-- 原生地图页优先用 `xiaoluxue_open_native_subject`、`xiaoluxue_map_fast_path`、`xiaoluxue_map_snapshot`；
-- 课程页优先用 `xiaoluxue_course_fast_path`；
-- `/exercise` 页优先用 `xiaoluxue_exercise_fast_path`，输入答案时传 `answer_text`，插件会直接写入 WebView 输入框。
+- `android_open_url` 使用 Android 标准 `ACTION_VIEW` intent 打开 URL；
+- 对于只能在特定 App 内打开的业务深链，请使用对应 App 的包名、Activity 或可公开处理的 URI，不在插件内硬编码业务域名；
+- WebView 能在 Chrome `chrome://inspect/#devices` 里看到时，优先用插件的 `android_webview_pages` 和 `android_webview_eval`，而不是视觉模型；
+- 任何业务 App 的页面跳转、登录、做题或播放逻辑，都应通过通用 UIAutomator、WebView、recipe 或项目外部自定义脚本组合完成。
 
 ## 录制和复放常用流程
 
@@ -379,9 +367,7 @@ recipe 会优先使用 selector，找不到时才退回坐标。
 
 ## 视频录制
 
-如果你对 Codex 说“开始录制视频”或“开始录屏”，插件应立即调用 `android_start_video_recording`，通过 scrcpy 后台录制当前安卓屏幕为 MP4，不先截图、不先分析页面，也不会为了确认启动而固定等待。
-
-开始录制返回值会包含 `timing` 和 `start_anchor`：`timing` 记录请求、进程启动和工具返回的时间；`start_anchor.path` 是后台抓取的起始画面标记 PNG，用来对齐“按下开始录制时屏幕大概在哪一帧”。这个标记不阻塞开始录制，若设备当时无法截图，会在 sidecar 元数据里记录错误。
+`android_start_video_recording` 会通过 scrcpy 启动真实 MP4 录屏。需要轻量证据时，也可以用 `android_start_screen_viewer` 获取截图时间线。
 
 如果你说“停止录制视频”或“停止录屏”，插件应立即调用 `android_stop_video_recording`，停止当前录制进程，并把返回的本地 MP4 路径作为视频发回给你。
 
@@ -428,29 +414,27 @@ cd ~/plugins/android-use-plugins
 
 然后重启 Codex，插件列表里应该直接显示 `Android`。
 
-### adb 找不到设备
+### 设备找不到
 
 运行：
 
 ```bash
-adb devices -l
+./doctor.sh
 ```
 
-如果没有设备，检查 USB 线、USB 调试、设备授权弹窗。
+如果没有设备，检查 USB 线、USB 调试、设备授权弹窗，以及 `~/.android/adbkey` 是否已被设备授权。
 
 如果是 `unauthorized`，重新插拔 USB，并在设备上点允许。
 
 ### scrcpy 没窗口
 
-运行：
+如果没有看到 scrcpy 窗口，可以手动运行：
 
 ```bash
-scrcpy --version
-cd ~/plugins/android-use-plugins
-./doctor.sh
+android_start_screen_viewer
 ```
 
-如果刚刚手动关闭过窗口，下一次调用 Android 工具时会重新弹出。
+这会返回一个本地 Web UI，用截图时间线展示 Android Use 的操作证据。
 
 ### 多台设备怎么办
 
@@ -472,14 +456,14 @@ export ANDROID_USE_SERIAL=设备序列号
 export ANDROID_USE_SCRCPY_RESIDENT_SERIALS=设备1序列号,设备2序列号
 ```
 
-也可以直接调用 `android_start_scrcpy`，传入 `serials` 列表，让每台设备各开一个 `.app` wrapper scrcpy 窗口。
+`android_start_scrcpy` 支持传入多台设备序列号，逐个启动或复用窗口。
 
 ### 可以不用 USB 线吗
 
-可以用 adb wireless。没有设备时，Android 插件会提示两种连接方式：
+可以用 Android 无线调试。没有设备时，Android 插件会提示两种连接方式：
 
 - 有线：用 USB 线连接设备，打开开发者选项里的 USB 调试，并在设备弹窗里允许调试。
-- 无线：调用 `android_wireless_pair_qr(action="create")` 生成配对二维码，在设备的无线调试页面选择“使用二维码配对设备”扫码；扫码后调用 `android_wireless_pair_qr(action="complete", session_id="返回的 session_id")` 完成 `adb pair`、保存配置并重连。
+- 无线：插件通过 adb 的 pairing/connect 和 mDNS 服务完成 Android 无线调试配对与重连。
 
 也可以继续用手输配对码的方式：在设备无线调试页选择“使用配对码配对设备”，再调用 `android_wireless_pair(host="设备 IP", pair_port=配对端口, code="配对码")`。
 
@@ -489,7 +473,7 @@ export ANDROID_USE_SCRCPY_RESIDENT_SERIALS=设备1序列号,设备2序列号
 android_wireless_reconnect(all=true, start_scrcpy=true)
 ```
 
-这样会批量重连已保存的无线设备，并为每台设备启动一个 `.app` wrapper scrcpy 投屏窗口。
+这样会批量重连已保存的无线设备；`start_scrcpy=true` 会为已连接设备启动或复用 scrcpy 窗口。
 
 ### 时间线 Web UI
 
@@ -497,4 +481,4 @@ android_wireless_reconnect(all=true, start_scrcpy=true)
 
 ## 项目边界
 
-这个插件提供 Android 通用控制能力，也包含小鹿爱学专用快路径。模型使用说明在 `skills/android-use/SKILL.md`，该文件保持英文，方便 Codex 正确调用工具。
+这个插件只提供通用 Android 控制能力，不内置业务 App 专用快路径。模型使用说明在 `skills/android-use/SKILL.md`，该文件保持英文，方便 Codex 正确调用工具。

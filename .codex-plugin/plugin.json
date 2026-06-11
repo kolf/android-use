@@ -5,19 +5,17 @@
   "icon": "./assets/android.png",
   "composerIcon": "./assets/android.png",
   "logo": "./assets/android.png",
-  "description": "在 Codex 中通过 adb、scrcpy、截图和可选视觉模型控制已连接的 Android 设备。",
+  "description": "在 Codex 中通过 adb、Playwright Android、截图、WebView 和可选视觉模型控制已连接的 Android 设备。",
   "author": {
-    "name": "Xiaoluxue",
-    "email": "shixiankang@xiaoluxue.cn",
-    "url": "https://gitlab.xiaoluxue.cn/shixiankang/android-use"
+    "name": "Android Use Maintainers"
   },
-  "homepage": "https://gitlab.xiaoluxue.cn/shixiankang/android-use",
-  "repository": "https://gitlab.xiaoluxue.cn/shixiankang/android-use",
+  "homepage": "",
+  "repository": "",
   "license": "Apache-2.0",
   "keywords": [
     "android",
     "adb",
-    "scrcpy",
+    "playwright-android",
     "computer-use",
     "gui-agent",
     "vision-language-model"
@@ -27,20 +25,20 @@
   "interface": {
     "displayName": "Android",
     "shortDescription": "在 Codex 中控制 Android 设备",
-    "longDescription": "Android Use 让 Codex 通过 adb、scrcpy、截图、输入事件和可选 OpenAI-compatible 视觉模型操作已连接的 Android 设备，并提供小鹿爱学 WebView、课程、练习和原生地图快路径。",
-    "developerName": "Xiaoluxue",
+    "longDescription": "Android Use 让 Codex 通过 adb、Playwright Android、截图、输入事件、scrcpy 和可选 OpenAI-compatible 视觉模型操作已连接的 Android 手机、平板或模拟器。插件不包含任何特定业务 App 快路径。",
+    "developerName": "Android Use Maintainers",
     "category": "Developer Tools",
     "capabilities": [
       "Android 设备控制",
-      "ADB shell",
+      "adb shell",
       "scrcpy 镜像",
       "截图观察",
-      "视觉模型动作规划",
-      "小鹿爱学快路径"
+      "Playwright Android WebView",
+      "视觉模型动作规划"
     ],
-    "websiteURL": "https://gitlab.xiaoluxue.cn/shixiankang/android-use",
-    "privacyPolicyURL": "https://gitlab.xiaoluxue.cn/shixiankang/android-use",
-    "termsOfServiceURL": "https://gitlab.xiaoluxue.cn/shixiankang/android-use",
+    "websiteURL": "",
+    "privacyPolicyURL": "",
+    "termsOfServiceURL": "",
     "defaultPrompt": [
       "显示已连接 Android 设备状态",
       "截图并判断下一步操作",

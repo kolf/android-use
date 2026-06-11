@@ -18,6 +18,16 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 
+def import_android_use_mcp() -> Any:
+    import importlib
+    import sys
+
+    scripts_dir = Path(__file__).resolve().parent
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+    return importlib.import_module("android_use_mcp")
+
+
 def decode_bytes(payload: bytes) -> str:
     return payload.decode("utf-8", errors="replace").strip()
 
@@ -42,18 +52,9 @@ def timestamp_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def screencap(adb: str, serial: str) -> bytes:
-    result = subprocess.run(
-        [adb, "-s", serial, "exec-out", "screencap", "-p"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=os.environ.copy(),
-        timeout=20,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(decode_bytes(result.stderr) or decode_bytes(result.stdout))
-    png = result.stdout
+def screencap(serial: str) -> bytes:
+    mcp = import_android_use_mcp()
+    png = mcp.adb(["exec-out", "screencap", "-p"], serial=serial, timeout=20)
     if not png.startswith(b"\x89PNG"):
         fixed = png.replace(b"\r\n", b"\n")
         if fixed.startswith(b"\x89PNG"):
@@ -64,8 +65,7 @@ def screencap(adb: str, serial: str) -> bytes:
 
 
 class TimelineStore:
-    def __init__(self, adb: str, serial: str, session_dir: Path, max_events: int) -> None:
-        self.adb = adb
+    def __init__(self, serial: str, session_dir: Path, max_events: int) -> None:
         self.serial = serial
         self.session_dir = session_dir
         self.shots_dir = session_dir / "shots"
@@ -103,7 +103,7 @@ class TimelineStore:
             handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
 
     def capture_event(self, kind: str, title: str, detail: str = "", *, force: bool = False) -> dict[str, Any] | None:
-        png = screencap(self.adb, self.serial)
+        png = screencap(self.serial)
         digest = hashlib.sha256(png).hexdigest()
         if not force and digest == self.last_digest:
             return None
@@ -178,7 +178,7 @@ def make_handler(store: TimelineStore, interval_ms: int) -> type[BaseHTTPRequest
                 return
             if path == "/screen.png":
                 try:
-                    self.send_bytes(200, "image/png", screencap(store.adb, store.serial))
+                    self.send_bytes(200, "image/png", screencap(store.serial))
                 except Exception as exc:
                     self.send_bytes(500, "text/plain; charset=utf-8", str(exc).encode("utf-8"))
                 return
@@ -602,7 +602,6 @@ def make_handler(store: TimelineStore, interval_ms: int) -> type[BaseHTTPRequest
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Serve an Android screenshot timeline web UI.")
-    parser.add_argument("--adb", required=True)
     parser.add_argument("--serial", required=True)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, required=True)
@@ -614,7 +613,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    store = TimelineStore(args.adb, args.serial, Path(args.session_dir).expanduser(), args.max_events)
+    store = TimelineStore(args.serial, Path(args.session_dir).expanduser(), args.max_events)
     handler = make_handler(store, args.interval_ms)
     server = ThreadingHTTPServer((args.host, args.port), handler)
     print(f"Android timeline viewer listening on http://{args.host}:{args.port}/", flush=True)

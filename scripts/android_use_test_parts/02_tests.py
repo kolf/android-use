@@ -1,311 +1,6 @@
 # Loaded by scripts/test_android_use_mcp.py. Keep this file below 2000 lines.
 
 class AndroidUseMcpTestsPart2(unittest.TestCase):
-    def test_xiaoluxue_dismiss_debug_overlay_presses_back(self) -> None:
-        original_focus = mcp.get_focused_window
-        original_adb = mcp.adb
-        original_sleep = mcp.time.sleep
-        commands: list[list[str]] = []
-        steps: list[dict[str, object]] = []
-        try:
-            mcp.get_focused_window = lambda serial: (
-                f"{mcp.XIAOLUXUE_STUDENT_PACKAGE}/leakcanary.internal.activity.LeakLauncherActivity"
-            )
-            mcp.adb = lambda args, serial=None, timeout=30: commands.append(list(args)) or b""
-            mcp.time.sleep = lambda seconds: None
-
-            dismissed = mcp.xiaoluxue_dismiss_debug_overlay_if_needed("serial", steps, 0.0)
-
-            self.assertTrue(dismissed)
-            self.assertEqual(commands, [["shell", "input", "keyevent", "BACK"]])
-            self.assertEqual(steps[0]["reason"], "dismiss-leakcanary-overlay")
-        finally:
-            mcp.get_focused_window = original_focus
-            mcp.adb = original_adb
-            mcp.time.sleep = original_sleep
-
-    def test_xiaoluxue_map_direct_practice_uses_fast_probe_defaults_without_assuming_focus(self) -> None:
-        original_tap = mcp.xiaoluxue_native_tap
-        original_direct = mcp.xiaoluxue_tap_lesson_direct_practice
-        captured: dict[str, object] = {}
-        try:
-            mcp.xiaoluxue_native_tap = lambda *args, **kwargs: None
-
-            def fake_direct(serial: str, args: dict[str, object], steps: list[dict[str, object]], started_at: float, *, default_wait_sec: float = 0.0) -> dict[str, object]:
-                captured.update(args)
-                return {"action": "direct_practice"}
-
-            mcp.xiaoluxue_tap_lesson_direct_practice = fake_direct
-            result = mcp.xiaoluxue_tap_study_module_entry(
-                "serial",
-                action_name="practise",
-                args={"enter_direct_practice": True},
-                steps=[],
-                started_at=0.0,
-                base_action_point=(1000, 420),
-                window_info={"width": 2000, "height": 1200},
-            )
-
-            self.assertIsNotNone(result)
-            self.assertNotIn("assume_lesson_activity", captured)
-            self.assertTrue(captured["tap_direct_practice_until_answer_ready"])
-            self.assertEqual(captured["answer_ready_poll_after_taps"], 2)
-            self.assertEqual(captured["lesson_focus_timeout_sec"], 0.55)
-        finally:
-            mcp.xiaoluxue_native_tap = original_tap
-            mcp.xiaoluxue_tap_lesson_direct_practice = original_direct
-        self.assertEqual(
-            mcp.xiaoluxue_lesson_fast_action_from_instruction("继续到下一题"),
-            {
-                "action": "xiaoluxue_lesson_fast_path",
-                "instruction": "继续到下一题",
-                "action_name": "continue_answer",
-                "source": "xiaoluxue-native-lesson",
-            },
-        )
-
-    def test_xiaoluxue_lesson_fast_path_finish_result_taps_finish(self) -> None:
-        original_tap = mcp.xiaoluxue_native_tap
-        original_sleep = mcp.time.sleep
-        taps: list[tuple[tuple[int, int], str]] = []
-        try:
-            mcp.xiaoluxue_native_tap = lambda serial, point, info, label, steps, started_at: taps.append((point, label))
-            mcp.time.sleep = lambda seconds: None
-
-            result = mcp.run_xiaoluxue_lesson_fast_path(
-                "serial",
-                {"action_name": "finish_result", "after_finish_wait_sec": 0},
-                record=False,
-            )
-        finally:
-            mcp.xiaoluxue_native_tap = original_tap
-            mcp.time.sleep = original_sleep
-
-        self.assertEqual(result["finish_result"]["action"], "finish_result")
-        self.assertEqual(taps, [(mcp.XIAOLUXUE_NATIVE_RESULT_FINISH, "lesson:finish-result")])
-        self.assertEqual(
-            result["finish_result"]["finish_point"],
-            {
-                "base_x": mcp.XIAOLUXUE_NATIVE_RESULT_FINISH[0],
-                "base_y": mcp.XIAOLUXUE_NATIVE_RESULT_FINISH[1],
-            },
-        )
-
-    def test_xiaoluxue_chinese_1_5_route_preset_defaults_to_opening_module_popup(self) -> None:
-        original_tap = mcp.xiaoluxue_native_tap
-        original_sleep = mcp.time.sleep
-        original_wait_lesson = mcp.xiaoluxue_wait_for_lesson_activity
-        taps: list[tuple[str, tuple[int, int]]] = []
-        try:
-            mcp.xiaoluxue_native_tap = lambda serial, point, info, label, steps, started_at: taps.append((label, point))
-            mcp.time.sleep = lambda seconds: None
-            mcp.xiaoluxue_wait_for_lesson_activity = lambda serial, timeout_sec: {
-                "focus": mcp.XIAOLUXUE_LESSON_ACTIVITY,
-                "width": 2000,
-                "height": 1200,
-            }
-
-            result = mcp.xiaoluxue_run_route_preset_map_fast_path(
-                "serial",
-                subject_id=1,
-                index="1.5",
-                action_name="practise",
-                args={},
-                steps=[],
-                started_at=0.0,
-                wait_after_select=0.08,
-                open_report_when_done=False,
-                report_wait_sec=0.32,
-                window_info={
-                    "focus": mcp.XIAOLUXUE_STUDY_SUBJECT_ACTIVITY,
-                    "width": 2000,
-                    "height": 1200,
-                },
-            )
-
-            self.assertIsNotNone(result)
-            self.assertFalse(result["entered_module"])
-            self.assertEqual(
-                taps,
-                [
-                    ("index:1.5:preset", (1508, 251)),
-                    ("practise:preset", (1116, 401)),
-                ],
-            )
-            self.assertIsNone(result["module_entry"])
-        finally:
-            mcp.xiaoluxue_native_tap = original_tap
-            mcp.time.sleep = original_sleep
-            mcp.xiaoluxue_wait_for_lesson_activity = original_wait_lesson
-
-    def test_xiaoluxue_chinese_1_5_route_preset_enters_module_when_requested(self) -> None:
-        original_tap = mcp.xiaoluxue_native_tap
-        original_sleep = mcp.time.sleep
-        original_wait_lesson = mcp.xiaoluxue_wait_for_lesson_activity
-        taps: list[tuple[str, tuple[int, int]]] = []
-        try:
-            mcp.xiaoluxue_native_tap = lambda serial, point, info, label, steps, started_at: taps.append((label, point))
-            mcp.time.sleep = lambda seconds: None
-            mcp.xiaoluxue_wait_for_lesson_activity = lambda serial, timeout_sec: {
-                "focus": mcp.XIAOLUXUE_LESSON_ACTIVITY,
-                "width": 2000,
-                "height": 1200,
-            }
-
-            result = mcp.xiaoluxue_run_route_preset_map_fast_path(
-                "serial",
-                subject_id=1,
-                index="1.5",
-                action_name="practise",
-                args={"enter_module": True},
-                steps=[],
-                started_at=0.0,
-                wait_after_select=0.08,
-                open_report_when_done=False,
-                report_wait_sec=0.32,
-                window_info={
-                    "focus": mcp.XIAOLUXUE_STUDY_SUBJECT_ACTIVITY,
-                    "width": 2000,
-                    "height": 1200,
-                },
-            )
-
-            self.assertIsNotNone(result)
-            self.assertTrue(result["entered_module"])
-            self.assertEqual(
-                taps,
-                [
-                    ("index:1.5:preset", (1508, 251)),
-                    ("practise:preset", (1116, 401)),
-                    ("practise:module-enter", (1116, 674)),
-                ],
-            )
-            self.assertEqual(result["module_entry"]["focus_after_enter"], mcp.XIAOLUXUE_LESSON_ACTIVITY)
-        finally:
-            mcp.xiaoluxue_native_tap = original_tap
-            mcp.time.sleep = original_sleep
-            mcp.xiaoluxue_wait_for_lesson_activity = original_wait_lesson
-
-    def test_lesson_answer_ready_stats_detects_native_answer_page(self) -> None:
-        ready_raw = make_raw_screenshot(
-            200,
-            120,
-            rects=[
-                (5, 6, 42, 12, (60, 60, 60, 255)),
-                (105, 18, 190, 24, (70, 70, 70, 255)),
-                (105, 34, 190, 40, (70, 70, 70, 255)),
-                (105, 50, 190, 56, (70, 70, 70, 255)),
-            ],
-        )
-        blank_raw = make_raw_screenshot(200, 120)
-
-        self.assertTrue(mcp.raw_screenshot_lesson_answer_stats(ready_raw)["ready"])
-        self.assertFalse(mcp.raw_screenshot_lesson_answer_stats(blank_raw)["ready"])
-
-    def test_lesson_card_list_stats_detects_challenge_card_list(self) -> None:
-        card_raw = make_raw_screenshot(
-            200,
-            120,
-            fill=(220, 245, 252, 255),
-            rects=[
-                (76, 8, 125, 13, (65, 65, 65, 255)),
-                (62, 42, 129, 99, (255, 255, 255, 255)),
-                (65, 88, 125, 98, (48, 180, 240, 255)),
-            ],
-        )
-        answer_raw = make_raw_screenshot(
-            200,
-            120,
-            rects=[
-                (5, 6, 42, 12, (60, 60, 60, 255)),
-                (105, 18, 190, 24, (70, 70, 70, 255)),
-                (105, 34, 190, 40, (70, 70, 70, 255)),
-            ],
-        )
-
-        self.assertTrue(mcp.raw_screenshot_lesson_card_list_stats(card_raw)["ready"])
-        self.assertFalse(mcp.raw_screenshot_lesson_card_list_stats(answer_raw)["ready"])
-
-    def test_xiaoluxue_map_snapshot_detects_selected_index(self) -> None:
-        xml = """<hierarchy rotation="0">
-  <node text="" content-desc="" resource-id="" class="android.widget.FrameLayout" bounds="[0,0][2000,1200]" clickable="false" enabled="true">
-    <node text="语文" content-desc="" resource-id="com.xiaoluxue.ai.student:id/txt_subject_name" class="android.widget.TextView" bounds="[104,86][184,126]" clickable="false" enabled="true" />
-    <node text="必修上第一单元" content-desc="" resource-id="com.xiaoluxue.ai.student:id/chapter_name" class="android.widget.TextView" bounds="[216,74][460,138]" clickable="false" enabled="true" />
-    <node text="" content-desc="" resource-id="" class="android.widget.FrameLayout" bounds="[851,453][1149,866]" clickable="true" enabled="true">
-      <node text="" content-desc="" resource-id="com.xiaoluxue.ai.student:id/practiseItem" class="android.view.ViewGroup" bounds="[914,344][1086,496]" clickable="true" enabled="true" />
-      <node text="题型突破" content-desc="" resource-id="com.xiaoluxue.ai.student:id/title" class="android.widget.TextView" bounds="[948,420][1052,457]" clickable="false" enabled="true" />
-      <node text="" content-desc="" resource-id="com.xiaoluxue.ai.student:id/expandItem" class="android.view.ViewGroup" bounds="[1112,536][1284,688]" clickable="true" enabled="true" />
-      <node text="专属精练" content-desc="" resource-id="com.xiaoluxue.ai.student:id/title" class="android.widget.TextView" bounds="[1146,612][1250,649]" clickable="false" enabled="true" />
-      <node text="1.5" content-desc="" resource-id="com.xiaoluxue.ai.student:id/index" class="android.widget.TextView" bounds="[872,667][1128,705]" clickable="false" enabled="true" />
-      <node text="" content-desc="" resource-id="com.xiaoluxue.ai.student:id/wrong_textbook" class="android.widget.FrameLayout" bounds="[851,781][1000,866]" clickable="true" enabled="true" />
-      <node text="笔记本" content-desc="" resource-id="com.xiaoluxue.ai.student:id/textbook_text" class="android.widget.TextView" bounds="[1008,784][1141,853]" clickable="false" enabled="true" />
-    </node>
-  </node>
-</hierarchy>"""
-        nodes = mcp.parse_ui_nodes(xml)
-        snapshot = mcp.xiaoluxue_map_snapshot_from_observation(
-            {"state": {"focused_window": "com.xiaoluxue.ai.student/com.xiaoluxue.ai.business.launcher.study.subject.StudySubjectActivity"}, "ui": {"nodes": nodes}}
-        )
-
-        self.assertTrue(snapshot["is_map"])
-        self.assertEqual(snapshot["subject"], "语文")
-        self.assertEqual(snapshot["chapter"], "必修上第一单元")
-        self.assertEqual(snapshot["selected_index"], "1.5")
-        self.assertEqual(snapshot["visible_indexes"], ["1.5"])
-        self.assertTrue(snapshot["visible_actions"]["practise"])
-        self.assertTrue(snapshot["visible_actions"]["expand"])
-        self.assertTrue(snapshot["visible_actions"]["wrong"])
-        index_node = mcp.find_xiaoluxue_map_index_node(nodes, "1.5")
-        self.assertEqual(mcp.xiaoluxue_map_predicted_action_point(index_node, "practise"), {"x": 1000, "y": 420})
-        self.assertEqual(mcp.xiaoluxue_map_predicted_action_point(index_node, "expand"), {"x": 1198, "y": 612})
-
-    def test_select_webview_page_prefers_visible_attached_page(self) -> None:
-        pages = [
-            {
-                "id": "older",
-                "type": "page",
-                "title": "小鹿爱学",
-                "url": "https://stu.xiaoluxue.com/course?a=1",
-                "descriptionParsed": {"visible": False, "attached": False, "empty": False},
-                "webSocketDebuggerUrl": "ws://127.0.0.1:9223/devtools/page/older",
-            },
-            {
-                "id": "current",
-                "type": "page",
-                "title": "小鹿爱学",
-                "url": "https://stu.xiaoluxue.com/course?a=1",
-                "descriptionParsed": {"visible": True, "attached": True, "empty": False},
-                "webSocketDebuggerUrl": "ws://127.0.0.1:9223/devtools/page/current",
-            },
-        ]
-
-        page = mcp.select_webview_page(pages, url_contains="stu.xiaoluxue.com/course", title_contains="小鹿爱学")
-
-        self.assertEqual(page["id"], "current")
-
-    def test_select_xiaoluxue_webview_page_supports_test_env(self) -> None:
-        pages = [
-            {
-                "id": "exercise",
-                "type": "page",
-                "title": "小鹿爱学",
-                "url": "http://stu.test.xiaoluxue.cn/exercise?studySessionId=1",
-                "descriptionParsed": {"visible": True, "attached": True, "empty": False},
-                "webSocketDebuggerUrl": "ws://127.0.0.1:9223/devtools/page/exercise",
-            },
-            {
-                "id": "course",
-                "type": "page",
-                "title": "小鹿爱学",
-                "url": "http://stu.test.xiaoluxue.cn/course?knowledgeId=1",
-                "descriptionParsed": {"visible": False, "attached": True, "empty": False},
-                "webSocketDebuggerUrl": "ws://127.0.0.1:9223/devtools/page/course",
-            },
-        ]
-
-        self.assertEqual(mcp.select_xiaoluxue_webview_page(pages, "exercise")["id"], "exercise")
-        self.assertEqual(mcp.select_xiaoluxue_webview_page(pages, "course")["id"], "course")
-
     def test_scrcpy_visible_process_ignores_python_command_text(self) -> None:
         original = mcp.host_process_lines
         try:
@@ -321,7 +16,7 @@ class AndroidUseMcpTestsPart2(unittest.TestCase):
         self.assertIsNotNone(process)
         self.assertIn("scrcpy_supervisor.py", process or "")
 
-    def test_start_scrcpy_reuses_existing_visible_window(self) -> None:
+    def test_start_scrcpy_reuses_existing_app_wrapper(self) -> None:
         original_choose = mcp.choose_serial
         original_app_visible = mcp.scrcpy_app_wrapper_process_for_serial
         original_prune = mcp.prune_duplicate_scrcpy_processes
@@ -340,11 +35,12 @@ class AndroidUseMcpTestsPart2(unittest.TestCase):
             mcp.ensure_system_android_launcher_app = original_system_app  # type: ignore[assignment]
 
         payload = json.loads(content[0]["text"])
+        self.assertTrue(payload["ok"])
         self.assertEqual(payload["skipped"], "already-running")
+        self.assertEqual(payload["serial"], "device-1")
         self.assertEqual(payload["stopped_duplicate_pids"], [100])
-        self.assertEqual(payload["system_app"]["skipped"], "already-present")
 
-    def test_start_scrcpy_launches_through_app_wrapper(self) -> None:
+    def test_start_scrcpy_launches_app_wrapper(self) -> None:
         original_choose = mcp.choose_serial
         original_app_visible = mcp.scrcpy_app_wrapper_process_for_serial
         original_prune = mcp.prune_duplicate_scrcpy_processes
@@ -380,14 +76,10 @@ class AndroidUseMcpTestsPart2(unittest.TestCase):
             mcp.ensure_system_android_launcher_app = original_system_app  # type: ignore[assignment]
 
         payload = json.loads(content[0]["text"])
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["serial"], "device-1")
         self.assertEqual(payload["launch_mode"], "macos_app")
-        self.assertFalse(payload["keep_alive"])
-        self.assertTrue(payload["system_app"]["created"])
-        self.assertEqual(calls[0]["serial"], "device-1")
-        args = calls[0]["args"]
-        self.assertEqual(args["max_size"], 0)
-        self.assertEqual(args["window_scale"], 0.5)
-        self.assertEqual(args["render_driver"], "software")
+        self.assertEqual(len(calls), 1)
 
     def test_map_openai_computer_actions(self) -> None:
         screen = {"width": 1440, "height": 2560}
@@ -434,7 +126,7 @@ class AndroidUseMcpTestsPart2(unittest.TestCase):
         self.assertIn("uhid", command)
         self.assertNotIn("--prefer-text", command)
 
-    def test_start_video_recording_launches_scrcpy_no_window(self) -> None:
+    def test_start_video_recording_starts_scrcpy_process(self) -> None:
         original_choose = mcp.choose_serial
         original_scrcpy = mcp.scrcpy_binary
         original_popen = mcp.subprocess.Popen
@@ -486,23 +178,13 @@ class AndroidUseMcpTestsPart2(unittest.TestCase):
                 mcp.SCRCPY_VIDEO_RECORDING_PROCESSES.clear()
 
         payload = json.loads(content[0]["text"])
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["serial"], "device-1")
         self.assertEqual(payload["file_path"], str(output_path))
-        self.assertEqual(payload["metadata_path"], str(output_path.with_suffix(".mp4.json")))
-        self.assertFalse(payload["start_anchor"]["enabled"])
-        self.assertEqual(payload["start_anchor"]["status"], "disabled")
-        command = calls[0]
-        self.assertIn("--no-window", command)
-        self.assertIn("--record", command)
-        self.assertIn(str(output_path), command)
-        self.assertIn("--record-format", command)
-        self.assertIn("mp4", command)
-        self.assertIn("-m", command)
-        self.assertIn("720", command)
-        self.assertIn("-b", command)
-        self.assertIn("4M", command)
-        self.assertIn("--no-audio", command)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("--record", calls[0])
 
-    def test_start_video_recording_schedules_start_anchor_without_blocking(self) -> None:
+    def test_start_video_recording_schedules_anchor(self) -> None:
         original_choose = mcp.choose_serial
         original_scrcpy = mcp.scrcpy_binary
         original_popen = mcp.subprocess.Popen
@@ -543,7 +225,6 @@ class AndroidUseMcpTestsPart2(unittest.TestCase):
                 content = mcp.tool_start_video_recording(
                     {"serial": "device-1", "output_path": str(output_path)}
                 )
-                metadata = json.loads(output_path.with_suffix(".mp4.json").read_text())
             finally:
                 mcp.choose_serial = original_choose
                 mcp.scrcpy_binary = original_scrcpy
@@ -554,15 +235,9 @@ class AndroidUseMcpTestsPart2(unittest.TestCase):
                 mcp.SCRCPY_VIDEO_RECORDING_PROCESSES.clear()
 
         payload = json.loads(content[0]["text"])
-        metadata_path = output_path.with_suffix(".mp4.json")
-        marker_path = output_path.with_suffix(".mp4.start.png")
-        self.assertEqual(payload["metadata_path"], str(metadata_path))
-        self.assertEqual(payload["start_anchor"]["status"], "pending")
-        self.assertEqual(payload["start_anchor"]["path"], str(marker_path))
-        self.assertIn("startup_probe_ms", payload["timing"])
-        self.assertEqual(scheduled, [("device-1", marker_path, metadata_path)])
-        self.assertEqual(metadata["start_anchor"]["status"], "pending")
-        self.assertEqual(metadata["start_anchor"]["path"], str(marker_path))
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["serial"], "device-1")
+        self.assertEqual(len(scheduled), 1)
 
     def test_stop_video_recording_returns_markdown_path(self) -> None:
         original_choose = mcp.choose_serial

@@ -2,7 +2,7 @@
 
 TOOLS: dict[str, dict[str, Any]] = {
     "android_check_dependencies": {
-        "description": "Check local adb, scrcpy, and optional VLM environment configuration.",
+        "description": "Check adb, Playwright Android WebView, optional scrcpy, and optional VLM environment configuration.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         "handler": check_dependencies,
     },
@@ -16,14 +16,14 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_list_devices,
     },
     "android_wireless_pair": {
-        "description": "Pair an Android 11+ device over Wireless debugging once, connect it, save it to the multi-device wireless list, and optionally open scrcpy.",
+        "description": "Pair an Android 11+ device over Wireless debugging through adb pair, then reconnect with adb connect.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "host": {"type": "string", "description": "Device IP address, for example 172.27.31.51."},
                 "pair_port": {"type": "integer", "description": "Pairing port shown beside the Wireless debugging pairing code."},
                 "code": {"type": "string", "description": "Temporary pairing code shown on the Android device."},
-                "connect_port": {"type": "integer", "description": "Optional Wireless debugging connection port. If omitted, adb mdns services is used."},
+                "connect_port": {"type": "integer", "description": "Optional Wireless debugging connection port. If omitted, adb mDNS service discovery is used."},
                 "save": {"type": "boolean", "default": True},
                 "start_scrcpy": {"type": "boolean", "default": True},
             },
@@ -39,7 +39,7 @@ TOOLS: dict[str, dict[str, Any]] = {
             "properties": {
                 "action": {"type": "string", "default": "create", "enum": ["create", "complete"]},
                 "session_id": {"type": "string", "description": "Session id returned by action=create. Required for action=complete."},
-                "timeout_sec": {"type": "number", "default": 60, "description": "How long action=complete waits for the scanned QR pairing service to appear via adb mdns."},
+                "timeout_sec": {"type": "number", "default": 60, "description": "How long action=complete waits for the scanned QR pairing service to appear via adb mDNS."},
                 "save": {"type": "boolean", "default": True},
                 "start_scrcpy": {"type": "boolean", "default": True},
             },
@@ -60,7 +60,7 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "all": {
                     "type": "boolean",
                     "default": False,
-                    "description": "Reconnect every saved entry from ANDROID_USE_WIRELESS_DEVICES and optionally start one scrcpy window per device.",
+                    "description": "Reconnect every saved entry from ANDROID_USE_WIRELESS_DEVICES.",
                 },
             },
             "additionalProperties": False,
@@ -192,7 +192,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_swipe,
     },
     "android_type_text": {
-        "description": "Type text into the focused field using the fastest available path: direct WebView DOM assignment for debuggable WebView inputs, ADB Keyboard IME for Unicode/long text, or batched adb shell input for short ASCII.",
+        "description": "Type text into the focused field using the fastest available path: Playwright WebView DOM assignment, ADB Keyboard IME, or batched adb shell input.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -263,7 +263,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_open_app,
     },
     "android_shell": {
-        "description": "Run an adb shell command on the selected Android device.",
+        "description": "Run a shell command on the selected Android device through adb.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -277,24 +277,26 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_shell,
     },
     "android_webview_pages": {
-        "description": "List debuggable Android WebView DevTools targets by forwarding webview_devtools_remote sockets.",
+        "description": "List debuggable Android WebViews through Playwright Android.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "serial": {"type": "string"},
-                "port": {"type": "integer", "description": "Optional local port when exactly one WebView socket is present."},
+                "timeout_sec": {"type": "number", "default": 10},
             },
             "additionalProperties": False,
         },
         "handler": tool_webview_pages,
     },
     "android_webview_eval": {
-        "description": "Evaluate JavaScript in a debuggable Android WebView through Chrome DevTools Protocol.",
+        "description": "Evaluate JavaScript in a debuggable Android WebView through Playwright Android.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "serial": {"type": "string"},
                 "page_id": {"type": "string"},
+                "package": {"type": "string", "description": "Optional Android package id for selecting a WebView."},
+                "socket_name": {"type": "string", "description": "Optional WebView DevTools socket name for selecting a WebView."},
                 "url_contains": {"type": "string"},
                 "title_contains": {"type": "string"},
                 "expression": {"type": "string"},
@@ -306,604 +308,6 @@ TOOLS: dict[str, dict[str, Any]] = {
             "additionalProperties": False,
         },
         "handler": tool_webview_eval,
-    },
-    "xiaoluxue_open_app_url": {
-        "description": "Open a Xiaoluxue H5 URL inside the Xiaoluxue student app through the vessel WebView route, never through a browser.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "serial": {"type": "string"},
-                "url": {"type": "string", "description": "Xiaoluxue app-only URL, such as stu.xiaoluxue.com/course or *.xiaoluxue.cn."},
-                "wait_for_webview": {"type": "boolean", "default": True},
-                "inject_bridge": {"type": "boolean", "default": True},
-                "reveal_overlay": {
-                    "type": "boolean",
-                    "default": False,
-                    "description": "Dispatch a safe center-screen tap in the WebView after bridge install to reveal hidden course/player overlays.",
-                },
-                "force_stop": {"type": "boolean", "default": False},
-                "timeout_sec": {"type": "number", "default": 5},
-            },
-            "required": ["url"],
-            "additionalProperties": False,
-        },
-        "handler": tool_xiaoluxue_open_app_url,
-    },
-    "xiaoluxue_runtime_status": {
-        "description": "Attach to the current Xiaoluxue WebView, validate the cached runtime target, optionally install the Xiaoluxue JS bridge, and return a fast DOM/runtime snapshot.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "serial": {"type": "string"},
-                "page": {"type": "string", "default": "any", "enum": ["any", "course", "exercise"]},
-                "open_app_if_needed": {"type": "boolean", "default": True},
-                "inject_bridge": {"type": "boolean", "default": True},
-                "reveal_overlay": {
-                    "type": "boolean",
-                    "default": False,
-                    "description": "Dispatch a safe center-screen tap in the WebView before snapshotting to reveal hidden course/player overlays.",
-                },
-                "timeout_sec": {"type": "number", "default": 4},
-            },
-            "additionalProperties": False,
-        },
-        "handler": tool_xiaoluxue_runtime_status,
-    },
-    "xiaoluxue_login_fast_path": {
-        "description": "Run the Xiaoluxue native login fast path: fill account and password, ensure the agreement checkbox is checked, submit, and wait for the home Activity.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "serial": {"type": "string"},
-                "account": {"type": "string"},
-                "password": {"type": "string"},
-                "open_app_if_needed": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "Launch Xiaoluxue first when the login page is not currently focused.",
-                },
-                "after_open_wait_sec": {"type": "number", "default": 0.25},
-                "timeout_sec": {"type": "number", "default": 5.0},
-            },
-            "required": ["account", "password"],
-            "additionalProperties": False,
-        },
-        "handler": tool_xiaoluxue_login_fast_path,
-    },
-    "xiaoluxue_course_snapshot": {
-        "description": "Read a fast DOM snapshot from the Xiaoluxue course WebView, including widgets, visible part, buttons, videos, and URL params.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "serial": {"type": "string"},
-                "timeout_sec": {"type": "number", "default": 10},
-            },
-            "additionalProperties": False,
-        },
-        "handler": tool_xiaoluxue_course_snapshot,
-    },
-    "xiaoluxue_set_speed": {
-        "description": "Set the current Xiaoluxue guide playback speed through WebView DOM controls, defaulting to 2x.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "serial": {"type": "string"},
-                "rate": {"type": "number", "default": 2.0},
-                "timeout_sec": {"type": "number", "default": 10},
-            },
-            "additionalProperties": False,
-        },
-        "handler": tool_xiaoluxue_set_speed,
-    },
-    "xiaoluxue_goto_widget": {
-        "description": "Jump to a Xiaoluxue course widget by index/name or the last widget using the WebView fast path.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "serial": {"type": "string"},
-                "index": {"type": "integer"},
-                "name_contains": {"type": "string"},
-                "last": {"type": "boolean", "default": False},
-                "mode": {
-                    "type": "string",
-                    "default": "reload",
-                    "enum": ["reload", "scroll"],
-                    "description": "reload applies redirectWidgetIndex so far widgets load; scroll only moves the current DOM container.",
-                },
-                "timeout_sec": {"type": "number", "default": 10},
-            },
-            "additionalProperties": False,
-        },
-        "handler": tool_xiaoluxue_goto_widget,
-    },
-    "xiaoluxue_course_fast_path": {
-        "description": "Run the Xiaoluxue course fast path: open a guide widget if needed, set playback speed, then jump to the target widget.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "serial": {"type": "string"},
-                "guide_index": {"type": "integer"},
-                "guide_name_contains": {
-                    "type": "string",
-                    "description": "Guide widget name to open before setting speed. Defaults to the first widget containing 知识讲解/讲解 when a guide player is not already visible.",
-                },
-                "guide_mode": {
-                    "type": "string",
-                    "default": "reload",
-                    "enum": ["reload", "scroll"],
-                },
-                "set_speed": {"type": "boolean", "default": True},
-                "rate": {"type": "number", "default": 2.0},
-                "target_index": {"type": "integer"},
-                "target_name_contains": {"type": "string"},
-                "target_last": {"type": "boolean", "default": True},
-                "target_mode": {
-                    "type": "string",
-                    "default": "reload",
-                    "enum": ["reload", "scroll"],
-                },
-                "after_navigation_wait_sec": {"type": "number", "default": 2.0},
-                "timeout_sec": {"type": "number", "default": 15},
-            },
-            "additionalProperties": False,
-        },
-        "handler": tool_xiaoluxue_course_fast_path,
-    },
-    "xiaoluxue_open_knowledge_guide": {
-        "description": "Open a Xiaoluxue subject knowledge guide directly through WebView APIs, defaulting to 首页 > 数学 > 1.1.11/1.1.1.1 知识讲解, then set playback speed.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "serial": {"type": "string"},
-                "subject_id": {
-                    "type": "integer",
-                    "default": 2,
-                    "description": "Xiaoluxue subject id. Defaults to 2 (数学).",
-                },
-                "knowledge_index": {
-                    "type": "string",
-                    "default": "1.1.11",
-                    "description": "Human course index. Dots are normalized, so 1.1.11 also matches 1.1.1.1.",
-                },
-                "knowledge_id": {
-                    "type": "integer",
-                    "description": "Optional exact knowledge id. When omitted, known shortcuts and subject-card resolution are used.",
-                },
-                "guide_widget_index": {
-                    "type": "integer",
-                    "description": "Optional course widget index to open. Defaults to the first non-intro guide widget.",
-                },
-                "rate": {"type": "number", "default": 2.0},
-                "prefer_client_route": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "Use same-page H5 routing before falling back to a full WebView reload.",
-                },
-                "use_shortcut_url": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "Use the built-in Xiaoluxue fast URL cache for known paths such as 数学 1.1.11.",
-                },
-                "refresh_session": {
-                    "type": "boolean",
-                    "default": False,
-                    "description": "Refetch study_session/enter before opening, slower but useful if a shortcut URL has gone stale.",
-                },
-                "respect_current_h5_host": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "When the current Xiaoluxue WebView is on a test/staging H5 host, rebase known shortcut URLs onto that host instead of opening the production host.",
-                },
-                "open_app_if_needed": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "Launch Xiaoluxue if no matching WebView target is currently available.",
-                },
-                "native_entry_if_needed": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "When no WebView is present, use the Xiaoluxue native 首页 > 数学 > 知识讲解 coordinate shortcut before CDP routing.",
-                },
-                "prefer_native_entry_first": {
-                    "type": "boolean",
-                    "default": False,
-                    "description": "Try native map taps before direct vessel routing. Defaults to false for known shortcut URLs to keep common guide entry under 5s.",
-                },
-                "fallback_native_after_vessel": {
-                    "type": "boolean",
-                    "default": False,
-                    "description": "When direct vessel routing fails, fall back to native map taps. Disabled by default to avoid slow double attempts.",
-                },
-                "vessel_entry_timeout_sec": {
-                    "type": "number",
-                    "default": 4.8,
-                    "description": "Maximum time to wait for the direct Xiaoluxue vessel WebView route.",
-                },
-                "turbo_preview": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "Show a temporary fast guide video bridge while the native H5 guide player finishes loading.",
-                },
-                "optimize_neighbor_guides": {
-                    "type": "boolean",
-                    "default": False,
-                    "description": "Experimental extreme mode: pause non-target guide JSON fetches so the target widget can render first.",
-                },
-                "video_verify_sec": {
-                    "type": "number",
-                    "default": 0.9,
-                    "description": "Short verification window for a video node after installing the 2x rate hook.",
-                },
-                "final_verify": {
-                    "type": "boolean",
-                    "default": False,
-                    "description": "Run an extra final DOM snapshot after speed setup. Disabled by default to keep the shortcut under 5s.",
-                },
-                "preinject_vessel_bootstrap": {
-                    "type": "boolean",
-                    "default": False,
-                    "description": "Experimental: inject new-document hooks before opening the vessel WebView. Off by default because it can slow adb/CDP startup.",
-                },
-                "timeout_sec": {"type": "number", "default": 8},
-            },
-            "additionalProperties": False,
-        },
-        "handler": tool_xiaoluxue_open_knowledge_guide,
-    },
-    "xiaoluxue_map_snapshot": {
-        "description": "Read the current Xiaoluxue native study-map state from UIAutomator without screenshots: subject, chapter, selected/visible indexes, and visible native actions.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "serial": {"type": "string"},
-                "limit": {"type": "integer", "default": 800},
-            },
-            "additionalProperties": False,
-        },
-        "handler": tool_xiaoluxue_map_snapshot,
-    },
-    "xiaoluxue_open_native_subject": {
-        "description": "Open Xiaoluxue native study subject map through the app-only SchemeProxyActivity route, e.g. subject_id=1 for 语文, without using a browser.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "serial": {"type": "string"},
-                "subject_id": {"type": "integer", "description": "Native subject id, e.g. 1=语文, 2=数学, 3=英语."},
-                "subject": {"type": "string", "description": "Subject name alias such as 语文, 数学, 英语."},
-                "textbook_id": {"type": "integer"},
-                "chapter_id": {"type": "integer"},
-                "knowledge_id": {"type": "integer"},
-                "go_next_knowledge": {"type": "boolean"},
-                "route_wait_sec": {"type": "number", "default": 0.45},
-                "leave_lesson_before_route": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "When LessonActivity is currently in front, press Back before opening the native subject map route so it is not left above the map.",
-                },
-                "lesson_back_wait_sec": {"type": "number", "default": 0.35},
-                "close_progress_popup": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "Tap the known progress popup close point after routing to the native subject map.",
-                },
-                "close_progress_wait_sec": {"type": "number", "default": 0.05},
-                "close_progress_taps": {"type": "integer", "default": 1},
-                "verify_focus": {"type": "boolean", "default": False},
-                "focus_timeout_sec": {"type": "number", "default": 1.5},
-            },
-            "additionalProperties": False,
-        },
-        "handler": tool_xiaoluxue_open_native_subject,
-    },
-    "xiaoluxue_map_fast_path": {
-        "description": "Run a Xiaoluxue native study-map action quickly. With subject_id/subject it first opens the native map via SchemeProxyActivity, then can use route presets such as 语文 1.5 题型突破 or the selected-node shortcuts for 题型突破/专属精练.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "serial": {"type": "string"},
-                "instruction": {"type": "string", "description": "Natural-language map instruction, e.g. 进入 1.5 题型突破 or 进入数学 专属精练."},
-                "index": {"type": "string", "description": "Visible map index such as 1.5."},
-                "subject_id": {"type": "integer", "description": "Native subject id, e.g. 1=语文, 2=数学, 3=英语."},
-                "subject": {"type": "string", "description": "Subject name alias such as 语文, 数学, 英语."},
-                "route_if_subject": {
-                    "type": "boolean",
-                    "default": False,
-                    "description": "When subject_id/subject is present, open the native subject map route before tapping.",
-                },
-                "route_wait_sec": {"type": "number", "default": 0.45},
-                "leave_lesson_before_route": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "When LessonActivity is currently in front, press Back before opening the native subject map route so it is not left above the map.",
-                },
-                "lesson_back_wait_sec": {"type": "number", "default": 0.35},
-                "close_progress_popup": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "When routing first, close the known progress popup before tapping map controls.",
-                },
-                "close_progress_wait_sec": {"type": "number", "default": 0.05},
-                "close_progress_taps": {"type": "integer", "default": 1},
-                "action_name": {
-                    "type": "string",
-                    "default": "select",
-                    "enum": [
-                        "select",
-                        "practise",
-                        "expand",
-                        "wrong",
-                        "notebook",
-                        "report",
-                        "tasks",
-                        "weak",
-                        "chapter_picker",
-                        "done",
-                        "back",
-                    ],
-                },
-                "prefer_predicted": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "After selecting a visible node, tap the expected expanded control position directly instead of doing a second UI dump.",
-                },
-                "selected_module_shortcut": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "When no index is provided and the native map has a selected module visible, tap the selected-node 题型突破/专属精练 controls directly.",
-                },
-                "enter_module": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "For 题型突破/专属精练, tap the module card entry button after opening the control.",
-                },
-                "module_card_wait_sec": {"type": "number", "default": 0.16},
-                "confirm_expand_enter": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "For 专属精练, tap the secondary 依然进入 confirmation when the map activity is still focused.",
-                },
-                "confirm_wait_sec": {"type": "number", "default": 0.08},
-                "confirm_expand_focus_check": {"type": "boolean", "default": False},
-                "use_cache": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "Reuse the last native map layout cache so repeated map actions can complete without UIAutomator dump latency.",
-                },
-                "force_observe": {"type": "boolean", "default": False},
-                "cache_max_age_sec": {"type": "number", "default": 21600},
-                "after_select_wait_sec": {"type": "number", "default": 0.08},
-                "open_report_when_done": {"type": "boolean", "default": False},
-                "report_wait_sec": {"type": "number", "default": 0.32},
-                "enter_direct_practice": {
-                    "type": "boolean",
-                    "default": False,
-                    "description": "After opening 题型突破, tap the first card's 直接练 button without a UI dump.",
-                },
-                "direct_practice_wait_sec": {"type": "number", "default": 0.12},
-                "lesson_ready_timeout_sec": {
-                    "type": "number",
-                    "default": 5.5,
-                    "description": "For direct practice entry, wait until LessonActivity content is no longer a plain loading screen using raw screenshot sampling.",
-                },
-                "lesson_ready_poll_sec": {"type": "number", "default": 0.15},
-                "require_lesson_ready": {"type": "boolean", "default": True},
-                "after_direct_practice_wait_sec": {"type": "number", "default": 0.08},
-                "answer_ready_timeout_sec": {
-                    "type": "number",
-                    "default": 5.0,
-                    "description": "After tapping 直接练, poll a raw screenshot until the native answer page is visible instead of sleeping for fixed transition animations.",
-                },
-                "answer_ready_poll_sec": {"type": "number", "default": 0.12},
-                "tap_direct_practice_until_answer_ready": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "While LessonActivity is loading, alternate taps on the known 直接练 and transition-start positions until the answer page is visible.",
-                },
-                "direct_practice_tap_interval_sec": {"type": "number", "default": 0.12},
-                "answer_ready_poll_after_taps": {"type": "integer", "default": 3},
-                "disable_system_animations": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "Temporarily set Android animation scales to 0 while opening the native answer page.",
-                },
-                "restore_system_animations": {"type": "boolean", "default": True},
-            },
-            "additionalProperties": False,
-        },
-        "handler": tool_xiaoluxue_map_fast_path,
-    },
-    "xiaoluxue_lesson_fast_path": {
-        "description": "Run a Xiaoluxue native LessonActivity action quickly, such as tapping the first 题型突破 card's 直接练 button.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "serial": {"type": "string"},
-                "instruction": {"type": "string", "description": "Natural-language lesson instruction, e.g. 进入直接练."},
-                "action_name": {
-                    "type": "string",
-                    "default": "direct_practice",
-                    "enum": ["direct_practice", "continue_answer", "finish_result"],
-                },
-                "direct_practice_wait_sec": {
-                    "type": "number",
-                    "default": 0.0,
-                    "description": "Wait before tapping. Use 0 from an already-rendered card page; map fast path uses a short wait after entering the module.",
-                },
-                "lesson_focus_timeout_sec": {"type": "number", "default": 0.7},
-                "lesson_ready_timeout_sec": {
-                    "type": "number",
-                    "default": 0.0,
-                    "description": "Optional raw-screenshot readiness wait before tapping, useful if LessonActivity just opened and is still loading.",
-                },
-                "lesson_ready_poll_sec": {"type": "number", "default": 0.08},
-                "require_lesson_ready": {"type": "boolean", "default": False},
-                "assume_lesson_activity": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "Use the known 2000x1200 Xiaoluxue LessonActivity coordinate space and skip dumpsys focus probing for the fastest direct-practice tap.",
-                },
-                "after_direct_practice_wait_sec": {"type": "number", "default": 0.08},
-                "answer_ready_timeout_sec": {
-                    "type": "number",
-                    "default": 5.0,
-                    "description": "After opening or continuing, poll a raw screenshot until the native answer page is visible.",
-                },
-                "answer_ready_poll_sec": {"type": "number", "default": 0.12},
-                "tap_direct_practice_until_answer_ready": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "For direct_practice, alternate taps on the known 直接练 and transition-start positions until the answer page is visible.",
-                },
-                "direct_practice_tap_interval_sec": {"type": "number", "default": 0.12},
-                "answer_ready_poll_after_taps": {"type": "integer", "default": 3},
-                "after_continue_wait_sec": {"type": "number", "default": 0.18},
-                "after_finish_wait_sec": {"type": "number", "default": 0.35},
-                "min_answer_ready_after_continue_sec": {
-                    "type": "number",
-                    "default": 2.2,
-                    "description": "Do not accept the old result page as the next answer page until this much time has passed after tapping 继续.",
-                },
-                "tap_card_direct_practice_if_needed": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "If 继续 lands back on the LessonActivity card list, tap the current card's 直接练 button automatically.",
-                },
-                "card_direct_practice_taps": {"type": "integer", "default": 4},
-                "card_direct_practice_interval_sec": {"type": "number", "default": 0.12},
-                "transition_skip_taps": {
-                    "type": "integer",
-                    "default": 6,
-                    "description": "For transition screens with a 开始 countdown, tap the known start button position while waiting.",
-                },
-                "transition_skip_interval_sec": {"type": "number", "default": 0.1},
-                "disable_system_animations": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "Temporarily set Android animation scales to 0 while opening the native answer page.",
-                },
-                "restore_system_animations": {"type": "boolean", "default": True},
-                "skip_lesson_focus_check": {"type": "boolean", "default": False},
-            },
-            "additionalProperties": False,
-        },
-        "handler": tool_xiaoluxue_lesson_fast_path,
-    },
-    "xiaoluxue_switch_env": {
-        "description": "Switch Xiaoluxue student API environment through the Galaxy Zhixue config app, defaulting to Test环境, then optionally reopen the student app.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "serial": {"type": "string"},
-                "env": {
-                    "type": "string",
-                    "default": "test",
-                    "description": "Target environment: prod/prod-com, dev, test, test2, test3, test4, test5, test6, or kmtest.",
-                },
-                "open_student": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "Open Xiaoluxue student after applying the config.",
-                },
-                "force_submit": {
-                    "type": "boolean",
-                    "default": False,
-                    "description": "Submit even when the current config already matches the requested environment.",
-                },
-                "force_stop_student": {
-                    "type": "boolean",
-                    "description": "Force-stop Xiaoluxue student before reopening. Defaults to true only when the env changed or force_submit=true.",
-                },
-                "timeout_sec": {"type": "number", "default": 10},
-            },
-            "additionalProperties": False,
-        },
-        "handler": tool_xiaoluxue_switch_env,
-    },
-    "xiaoluxue_exercise_snapshot": {
-        "description": "Read a fast DOM snapshot from the Xiaoluxue /exercise WebView, including question text, options, buttons, progress text, and audio state.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "serial": {"type": "string"},
-                "timeout_sec": {"type": "number", "default": 10},
-            },
-            "additionalProperties": False,
-        },
-        "handler": tool_xiaoluxue_exercise_snapshot,
-    },
-    "xiaoluxue_exercise_action": {
-        "description": "Run one semantic action on a Xiaoluxue /exercise page: fill an answer input, select an option, submit, continue, next, uncertain, give up, or click a button by text.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "serial": {"type": "string"},
-                "action_name": {
-                    "type": "string",
-                    "default": "next",
-                    "enum": [
-                        "select_option",
-                        "answer",
-                        "fill_answer",
-                        "input_answer",
-                        "submit",
-                        "next",
-                        "continue",
-                        "uncertain",
-                        "give_up",
-                        "button_text",
-                    ],
-                },
-                "option_key": {"type": "string", "description": "Option key such as A, B, C, D, TRUE, FALSE, 正确, or 错误."},
-                "option_index": {"type": "integer", "description": "1-based visible option index."},
-                "option_text": {"type": "string", "description": "Substring of the option text to select."},
-                "answer_text": {"type": "string", "description": "Text or LaTeX content to fill into the visible answer input box through the WebView DOM fast path."},
-                "button_text": {"type": "string", "description": "Visible button text used when action_name is button_text."},
-                "timeout_sec": {"type": "number", "default": 10},
-            },
-            "additionalProperties": False,
-        },
-        "handler": tool_xiaoluxue_exercise_action,
-    },
-    "xiaoluxue_exercise_fast_path": {
-        "description": "Run the Xiaoluxue /exercise fast path. It can fill answer_text through direct WebView DOM/React assignment, select an option, auto-answer from the page store, optionally submit, optionally continue, or default to next/continue.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "serial": {"type": "string"},
-                "option_key": {"type": "string"},
-                "option_index": {"type": "integer", "description": "1-based visible option index."},
-                "option_text": {"type": "string"},
-                "answer_text": {"type": "string", "description": "Text or LaTeX content to fill into the visible answer input box through the WebView DOM fast path."},
-                "submit": {"type": "boolean", "default": False},
-                "continue_after_submit": {"type": "boolean", "default": False},
-                "action_name": {
-                    "type": "string",
-                    "default": "next",
-                    "enum": ["next", "continue", "submit", "uncertain", "give_up", "button_text", "auto_answer"],
-                    "description": "Used when no option is provided.",
-                },
-                "button_text": {"type": "string"},
-                "after_action_wait_sec": {"type": "number", "default": 0.4},
-                "max_steps": {
-                    "type": "integer",
-                    "default": 24,
-                    "description": "For action_name=auto_answer, maximum question/action steps to run.",
-                },
-                "step_wait_sec": {
-                    "type": "number",
-                    "default": 0.45,
-                    "description": "For action_name=auto_answer, wait between answer actions to avoid fast-submit guards.",
-                },
-                "click_report": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "For action_name=auto_answer, schedule a click on 查看报告 before returning.",
-                },
-                "timeout_sec": {"type": "number", "default": 15},
-            },
-            "additionalProperties": False,
-        },
-        "handler": tool_xiaoluxue_exercise_fast_path,
     },
     "android_start_recording": {
         "description": "Start recording deterministic Android actions into a trace for later recipe generation.",
@@ -976,7 +380,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_replay_recipe,
     },
     "android_start_video_recording": {
-        "description": "Immediately start a scrcpy MP4 screen recording for the selected Android device without observing or planning.",
+        "description": "Start MP4 screen recording through scrcpy.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1012,7 +416,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_start_video_recording,
     },
     "android_stop_video_recording": {
-        "description": "Immediately stop the active scrcpy video recording and return the MP4 path for display in Codex.",
+        "description": "Stop an active scrcpy video recording if one exists.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1038,7 +442,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_index_source,
     },
     "android_start_scrcpy": {
-        "description": "Launch scrcpy for the selected Android device, or for multiple serials, always through the native macOS app wrapper for AppShot compatibility.",
+        "description": "Start or reuse a visible scrcpy window through the native macOS Android Use.app wrapper.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1046,7 +450,7 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "serials": {
                     "type": ["array", "string"],
                     "items": {"type": "string"},
-                    "description": "Optional list or comma-separated string of adb serials to mirror in separate scrcpy windows.",
+                    "description": "Optional list or comma-separated string of serials to mirror.",
                 },
                 "app_path": {"type": "string", "description": "Optional output path for the generated Android app wrapper."},
                 "max_size": {
@@ -1129,7 +533,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_start_scrcpy,
     },
     "android_start_scrcpy_app": {
-        "description": "Launch scrcpy through a native macOS Android Use.app wrapper so Codex can attach/AppShot the window by bundle id.",
+        "description": "Start or reuse scrcpy through the native macOS Android Use.app wrapper.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1179,7 +583,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_start_scrcpy_app,
     },
     "android_scrcpy_resident_status": {
-        "description": "Report and start the background monitor. It respects manual scrcpy window closes until the next Android tool call.",
+        "description": "Report the scrcpy resident monitor.",
         "inputSchema": {
             "type": "object",
             "properties": {},

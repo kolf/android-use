@@ -141,17 +141,21 @@ def adb_mdns_pairing_services(
     host: str | None = None,
 ) -> list[dict[str, Any]]:
     try:
-        stdout, _stderr = run_command([adb_binary(), "mdns", "services"], timeout=8)
+        output = decode_bytes(adb(["mdns", "services"], timeout=5))
     except AndroidUseError:
         return []
-    return parse_adb_mdns_pairing_services(decode_bytes(stdout), service_name=service_name, host=host)
+    services = parse_adb_mdns_pairing_services(output, service_name=service_name, host=host)
+    if service_name:
+        services = [
+            service
+            for service in services
+            if service.get("service_name") == service_name or service_name in str(service.get("service") or "")
+        ]
+    return services
 
 
 def refresh_adb_mdns_services() -> None:
-    with contextlib.suppress(Exception):
-        run_command([adb_binary(), "kill-server"], timeout=5)
-    with contextlib.suppress(Exception):
-        run_command([adb_binary(), "start-server"], timeout=10)
+    return None
 
 
 def complete_wireless_qr_session(
@@ -188,8 +192,8 @@ def complete_wireless_qr_session(
     host = str(service["host"])
     pair_port = int(service["port"])
     target = f"{host}:{pair_port}"
-    stdout, stderr = run_command([adb_binary(), "pair", target, password], timeout=30)
-    pair_output = "\n".join(part for part in [decode_bytes(stdout), decode_bytes(stderr)] if part)
+    pair_result = adb_pair_wireless(host, pair_port, password, service_name=service_name)
+    pair_output = str(pair_result.get("output") or "paired with adb")
     reconnect_result = wireless_reconnect(host=host, save=save, start_scrcpy=start_scrcpy)
     completed = {
         **session,

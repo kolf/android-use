@@ -24,18 +24,28 @@ fail() {
 
 command -v python3 >/dev/null 2>&1 && ok "python3: $(python3 --version 2>&1)" || fail "python3 not found"
 command -v git >/dev/null 2>&1 && ok "git: $(git --version)" || warn "git not found; zip install does not require Git"
+command -v adb >/dev/null 2>&1 && ok "adb: $(adb version | head -1)" || fail "adb not found; install Android platform-tools"
+command -v node >/dev/null 2>&1 && ok "node: $(node --version)" || fail "node not found"
+command -v npm >/dev/null 2>&1 && ok "npm: $(npm --version)" || fail "npm not found"
 
-if command -v adb >/dev/null 2>&1; then
-  ok "adb: $(command -v adb)"
-  adb devices -l || warn "adb devices failed"
-else
-  warn "adb not found. Install Android platform tools."
-fi
+PYTHONPATH="$ROOT/scripts" python3 - <<'PY'
+import json
+import android_use_mcp as mcp
+
+status = mcp.playwright_android_status()
+print("ok   Playwright Android status: " + json.dumps(status, ensure_ascii=False, sort_keys=True))
+if not status["node_available"]:
+    raise SystemExit("fail node is required for Playwright Android")
+if not status["helper_exists"]:
+    raise SystemExit("fail Playwright Android helper missing")
+if not status["package_installed"]:
+    raise SystemExit("fail playwright-core is not installed; run npm install")
+PY
 
 if command -v scrcpy >/dev/null 2>&1; then
   ok "scrcpy: $(scrcpy --version | head -1)"
 else
-  fail "scrcpy not found. Install with: brew install scrcpy"
+  warn "scrcpy not found; core adb tools still work, but mirror/video tools require scrcpy"
 fi
 
 ENV_FILE="${ANDROID_USE_ENV_FILE:-$HOME/.config/android-use/env}"
@@ -114,7 +124,7 @@ payload = json.loads(path.read_text())
 plugins = payload.get("plugins", [])
 matches = [item for item in plugins if isinstance(item, dict) and item.get("name") == name]
 assert matches, f"{name} not found in {path}"
-legacy = [item.get("name") for item in plugins if isinstance(item, dict) and item.get("name") in {"android-use", "xiaoluxue-android-use"}]
+legacy = [item.get("name") for item in plugins if isinstance(item, dict) and item.get("name") in {"android-use"}]
 assert not legacy, f"legacy android plugin entries still present in {path}: {legacy}"
 entry = matches[-1]
 assert entry.get("source", {}).get("path") == f"./plugins/{name}", entry

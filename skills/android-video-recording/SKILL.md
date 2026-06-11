@@ -1,6 +1,6 @@
 ---
 name: android-video-recording
-description: Immediately record an attached Android device screen to an MP4 with scrcpy when the user says "开始录制视频", "开始录屏", "停止录制视频", or "停止录屏".
+description: Handle Android video-recording requests through scrcpy-backed MP4 recording.
 ---
 
 # Android Video Recording
@@ -25,7 +25,7 @@ Default arguments:
 }
 ```
 
-After the tool returns, keep the reply short and include the `file_path` if useful. The tool returns without a fixed startup wait and includes `timing` plus a best-effort `start_anchor.path` screenshot that is captured in the background. The recording is active until stopped.
+If the tool returns a `file_path`, include it. If scrcpy is missing or recording fails, keep the reply short and report the concrete tool error.
 
 ## Stop Trigger
 
@@ -33,7 +33,7 @@ When the user asks to stop recording, immediately call `android_stop_video_recor
 
 Do not observe the screen first. Do not stop visible scrcpy windows. Do not run extra diagnostics unless stopping fails.
 
-After the tool returns, reply with the MP4 using Markdown video/image syntax and the absolute path returned by `file_path`:
+After the tool returns with a `file_path`, reply with the MP4 using Markdown video/image syntax and the absolute path:
 
 ```markdown
 ![android-video-recording](/absolute/path/to/video.mp4)
@@ -43,4 +43,4 @@ Also mention the duration or file size only if it is helpful. Keep the response 
 
 ## Distinction
 
-This skill records a real MP4 video through scrcpy. It is different from `android_start_recording`, which records deterministic Android tool actions into a JSON trace for recipe replay.
+This skill records a real MP4 video through scrcpy. Use `android_start_recording` separately when the user wants deterministic action traces instead of video.

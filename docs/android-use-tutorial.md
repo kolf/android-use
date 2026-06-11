@@ -6,7 +6,7 @@
 
 ## 1. 先拿到安装包
 
-从团队同事那里拿到 `android-use-plugins.zip`。
+从维护者那里拿到 `android-use-plugins.zip`。
 
 拿到后，把压缩包发给 Codex，然后说：
 
@@ -14,7 +14,7 @@
 请帮我解压 android-use-plugins.zip，安装 Android 插件，然后检查环境。
 ```
 
-安装脚本会自动准备电脑上缺失的必要组件。安装完成后，退出并重新打开 Codex，插件列表里应该能看到 `Android`。
+安装完成后，退出并重新打开 Codex，插件列表里应该能看到 `Android`。
 
 ## 2. 设置安卓设备
 
@@ -37,18 +37,11 @@
 
 ```text
 [@Android] 列出设备
-[@Android] 打开小鹿爱学
+[@Android] 打开设置
 [@Android] 截图
-[@Android] 退出到首页
-```
-
-小鹿爱学常用说法：
-
-```text
-[@Android] 首页 -> 数学 1.1.11 知识讲解 2x
-[@Android] 进入语文 1.5 题型突破
-[@Android] 进入直接练
-[@Android] 自动做题
+[@Android] 点击“登录”
+[@Android] 输入 123456
+[@Android] 按返回键
 ```
 
 每次让插件进入页面后，建议再说一句：
@@ -63,16 +56,24 @@
 
 Android 11 及以上设备支持无线调试。第一次配对时，需要电脑和平板在同一个 Wi-Fi 下。
 
+插件通过 adb 的 pairing/connect 和 mDNS 服务完成 Android 11+ 无线调试二维码或配对码流程。
+
 配对时，在安卓设备里打开：
 
 ```text
-设置 -> 开发者选项 -> 无线调试 -> 使用配对码配对设备
+设置 -> 开发者选项 -> 无线调试
 ```
 
-然后把页面上的 IP、端口和配对码告诉 Codex，例如：
+然后让 Codex 创建二维码：
 
 ```text
-[@Android] 无线配对 host=172.27.31.51 pair_port=42123 code=123456
+[@Android] 创建无线配对二维码
+```
+
+设备扫码后，再让 Codex 完成配对：
+
+```text
+[@Android] 完成无线配对
 ```
 
 以后可以直接说：
@@ -80,8 +81,6 @@ Android 11 及以上设备支持无线调试。第一次配对时，需要电脑
 ```text
 [@Android] 无线重连
 ```
-
-如果平板 IP 经常变化，建议让网络管理员在路由器上给平板固定 IP。
 
 ## 5. 常见问题
 
@@ -104,6 +103,6 @@ cd ~/plugins/android-use-plugins
 - 设备弹窗里已经点了「允许」；
 - 如果使用无线连接，电脑和平板在同一个网络。
 
-### 小鹿爱学链接打不开
+### scrcpy 没有窗口
 
-`stu.xiaoluxue.com` 和 `*.xiaoluxue.cn` 不要用普通浏览器打开。让 Android 插件通过小鹿爱学 App 打开。
+如果不需要实时镜像，让 Codex 调用 `android_start_screen_viewer` 可以用截图时间线展示 Android Use 的操作步骤；需要实时镜像时调用 `android_start_scrcpy`。

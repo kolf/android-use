@@ -265,7 +265,7 @@ def parse_adb_devices(output: str) -> list[dict[str, Any]]:
 
 
 def list_devices() -> list[dict[str, Any]]:
-    output = decode_bytes(run_command([adb_binary(), "devices", "-l"])[0])
+    output = decode_bytes(adb(["devices", "-l"]))
     return parse_adb_devices(output)
 
 
@@ -385,20 +385,32 @@ def parse_adb_mdns_services(
 
 def adb_mdns_connect_services(host: str | None = None) -> list[dict[str, Any]]:
     try:
-        stdout, _stderr = run_command([adb_binary(), "mdns", "services"], timeout=8)
+        output = decode_bytes(adb(["mdns", "services"], timeout=5))
     except AndroidUseError:
         return []
-    return parse_adb_mdns_services(decode_bytes(stdout), host=host)
+    services = parse_adb_mdns_services(output, host=host, service_type="_adb-tls-connect._tcp")
+    services.extend(parse_adb_mdns_services(output, host=host, service_type="_adb._tcp"))
+    return services
 
 
 def adb_connect_serial(host: str, port: int) -> dict[str, Any]:
     target = f"{host}:{int(port)}"
-    stdout, stderr = run_command([adb_binary(), "connect", target], timeout=15)
-    output = "\n".join(part for part in [decode_bytes(stdout), decode_bytes(stderr)] if part)
+    output = decode_bytes(adb(["connect", target], timeout=20))
     connected = any(device.get("serial") == target and device.get("state") == "device" for device in list_devices())
-    if not connected and not re.search(r"\bconnected to\b|\balready connected to\b", output, re.I):
-        raise AndroidUseError(f"adb connect did not authorize {target}\n{output}")
     return {"serial": target, "host": host, "port": int(port), "output": output, "connected": connected}
+
+
+def adb_pair_wireless(host: str, port: int, password: str, *, service_name: str | None = None) -> dict[str, Any]:
+    target = f"{host}:{int(port)}"
+    output = decode_bytes(adb(["pair", target, password], timeout=30))
+    return {
+        "target": target,
+        "host": host,
+        "port": int(port),
+        "service_name": service_name,
+        "output": output,
+        "paired": "successfully" in output.casefold() or "paired" in output.casefold(),
+    }
 
 
 def save_wireless_config(host: str, port: int, serial: str) -> None:
@@ -624,7 +636,6 @@ def shell(serial: str, command: str, timeout: int | float = DEFAULT_TIMEOUT) -> 
 
 WEBVIEW_SOCKET_PATTERN = re.compile(r"@?([A-Za-z0-9_.-]*webview_devtools_remote[^\s]*)")
 WEBVIEW_FORWARD_CACHE: dict[tuple[str, str], int] = {}
-XIAOLUXUE_PAGE_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
 
 
 def parse_webview_devtools_sockets(proc_net_unix: str) -> list[str]:

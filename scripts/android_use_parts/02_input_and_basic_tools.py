@@ -194,27 +194,10 @@ def webview_direct_input_expression(
 
 
 def candidate_webview_pages_for_input(serial: str) -> list[dict[str, Any]]:
-    candidates: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for page in (
-        XIAOLUXUE_PAGE_CACHE.get((serial, "exercise")),
-        XIAOLUXUE_PAGE_CACHE.get((serial, "course")),
-        XIAOLUXUE_PAGE_CACHE.get((serial, "any")),
-    ):
-        if page and page.get("webSocketDebuggerUrl"):
-            key = str(page.get("id") or page.get("webSocketDebuggerUrl") or "")
-            if key not in seen:
-                candidates.append(page)
-                seen.add(key)
     try:
-        pages = discover_webview_pages(serial)
-        page = select_webview_page(pages)
-        key = str(page.get("id") or page.get("webSocketDebuggerUrl") or "")
-        if key not in seen:
-            candidates.append(page)
+        return playwright_android_webview_pages(serial, timeout=3)
     except AndroidUseError:
-        pass
-    return candidates
+        return []
 
 
 def type_webview_text_fast(
@@ -230,7 +213,7 @@ def type_webview_text_fast(
             text,
             clear_first=clear_first,
             enter=enter,
-            prefer_answer_box=prefer_answer_box or xiaoluxue_url_kind(str(page.get("url") or "")) == "exercise",
+            prefer_answer_box=prefer_answer_box,
         )
         try:
             result = cdp_eval_value(page, expression, timeout=3)
@@ -407,24 +390,35 @@ def image_content(png: bytes) -> dict[str, str]:
 
 def check_dependencies(_args: dict[str, Any]) -> list[dict[str, Any]]:
     adb_path = shutil.which(adb_binary()) or adb_binary()
-    scrcpy_path = shutil.which(scrcpy_binary()) or scrcpy_binary()
     adb_available = shutil.which(adb_binary()) is not None or Path(adb_binary()).exists()
+    scrcpy_path = shutil.which(scrcpy_binary()) or scrcpy_binary()
     scrcpy_available = shutil.which(scrcpy_binary()) is not None or Path(scrcpy_binary()).exists()
+    playwright_status = playwright_android_status()
     wireless_host, wireless_port, wireless_serial = wireless_config_from_env()
     wireless_configs = wireless_configs_from_env()
     payload: dict[str, Any] = {
-        "ok": adb_available and scrcpy_available,
+        "ok": adb_available,
+        "transport": {
+            "mode": "adb",
+            "adb_required": True,
+            "webview_backend": "playwright-android",
+        },
         "adb": {
             "command": adb_binary(),
             "path": adb_path,
             "available": adb_available,
             "required": True,
+            "install_hint": "brew install android-platform-tools",
+        },
+        "playwright_android": {
+            **playwright_status,
+            "required_for_webview": True,
         },
         "scrcpy": {
             "command": scrcpy_binary(),
             "path": scrcpy_path,
             "available": scrcpy_available,
-            "required": True,
+            "required": False,
             "install_hint": "brew install scrcpy",
         },
         "vlm": {
@@ -458,25 +452,25 @@ def check_dependencies(_args: dict[str, Any]) -> list[dict[str, Any]]:
         payload["adb"]["version"] = version_text.splitlines()[0] if version_text else "unknown"
     except AndroidUseError as exc:
         payload["adb"]["error"] = str(exc)
+        payload["ok"] = False
     try:
         stdout, stderr = run_command([scrcpy_binary(), "--version"], timeout=5)
         version_text = decode_bytes(stdout or stderr)
         payload["scrcpy"]["version"] = version_text.splitlines()[0] if version_text else "unknown"
     except AndroidUseError as exc:
         payload["scrcpy"]["error"] = str(exc)
-    if adb_available:
-        try:
-            devices = list_devices()
-            connected = [device for device in devices if device.get("state") == "device"]
-            payload["devices"] = {
-                "items": devices,
-                "connected_count": len(connected),
-                "authorized": bool(connected),
-            }
-            if not connected:
-                payload["connection_help"] = android_connection_help(devices)
-        except AndroidUseError as exc:
-            payload["devices"] = {"error": str(exc)}
+    try:
+        devices = list_devices()
+        connected = [device for device in devices if device.get("state") == "device"]
+        payload["devices"] = {
+            "items": devices,
+            "connected_count": len(connected),
+            "authorized": bool(connected),
+        }
+        if not connected:
+            payload["connection_help"] = android_connection_help(devices)
+    except AndroidUseError as exc:
+        payload["devices"] = {"error": str(exc)}
     return [text_content(payload)]
 
 
@@ -511,8 +505,8 @@ def tool_wireless_pair(args: dict[str, Any]) -> list[dict[str, Any]]:
         raise AndroidUseError("code is required. It is the temporary Wireless debugging pairing code.")
 
     target = f"{host}:{pair_port}"
-    stdout, stderr = run_command([adb_binary(), "pair", target, code], timeout=30)
-    pair_output = "\n".join(part for part in [decode_bytes(stdout), decode_bytes(stderr)] if part)
+    pair_result = adb_pair_wireless(host, pair_port, code)
+    pair_output = str(pair_result.get("output") or "paired with adb")
     reconnect_result = wireless_reconnect(
         host=host,
         port=connect_port,
@@ -819,11 +813,6 @@ def tool_open_url(args: dict[str, Any]) -> list[dict[str, Any]]:
     if not url:
         raise AndroidUseError("url must not be empty.")
     before = capture_record_snapshot(serial) if active_recording(serial) else None
-    if is_xiaoluxue_app_only_url(url):
-        route_result = xiaoluxue_route_app_url(serial, url)
-        payload = action_result("open_url", serial, {"url": url, "routed": route_result})
-        append_recording_step(serial, "open_url", {"url": url, "xiaoluxue_app_route": True}, payload, before=before)
-        return [text_content(payload)]
     adb(
         ["shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", url],
         serial=serial,
@@ -868,24 +857,21 @@ def tool_shell(args: dict[str, Any]) -> list[dict[str, Any]]:
 
 def tool_webview_pages(args: dict[str, Any]) -> list[dict[str, Any]]:
     serial = choose_serial(args.get("serial"))
-    port = int(args["port"]) if args.get("port") is not None else None
-    pages = discover_webview_pages(serial, port=port)
-    return [text_content({"ok": True, "serial": serial, "pages": pages})]
+    pages = playwright_android_webview_pages(serial, timeout=float(args.get("timeout_sec", 10)))
+    return [text_content({"ok": True, "serial": serial, "backend": "playwright-android", "pages": pages})]
 
 
 def tool_webview_eval(args: dict[str, Any]) -> list[dict[str, Any]]:
     serial = choose_serial(args.get("serial"))
-    pages = discover_webview_pages(serial)
-    page = select_webview_page(
-        pages,
+    timeout = min(float(args.get("timeout_sec", 10)), 60)
+    result = playwright_android_webview_eval(
+        serial,
+        str(args["expression"]),
         page_id=str(args.get("page_id") or "") or None,
         url_contains=str(args.get("url_contains") or "") or None,
         title_contains=str(args.get("title_contains") or "") or None,
-    )
-    timeout = min(float(args.get("timeout_sec", 10)), 60)
-    evaluation = cdp_runtime_evaluate(
-        str(page["webSocketDebuggerUrl"]),
-        str(args["expression"]),
+        package=str(args.get("package") or "") or None,
+        socket_name=str(args.get("socket_name") or "") or None,
         await_promise=bool(args.get("await_promise", True)),
         return_by_value=bool(args.get("return_by_value", True)),
         timeout=timeout,
@@ -895,117 +881,9 @@ def tool_webview_eval(args: dict[str, Any]) -> list[dict[str, Any]]:
             {
                 "ok": True,
                 "serial": serial,
-                "page": {
-                    "id": page.get("id"),
-                    "title": page.get("title"),
-                    "url": page.get("url"),
-                    "socket": page.get("socket"),
-                    "forward": page.get("forward"),
-                },
-                "result": evaluation,
+                "backend": result.get("backend", "playwright-android"),
+                "page": result.get("page"),
+                "result": result.get("result"),
             }
         )
     ]
-
-
-XIAOLUXUE_SITE_URL_MARKER = "stu.xiaoluxue.com"
-XIAOLUXUE_COURSE_URL_MARKER = "stu.xiaoluxue.com/course"
-XIAOLUXUE_STUDENT_PACKAGE = "com.xiaoluxue.ai.student"
-XIAOLUXUE_STUDENT_LAUNCHER_COMPONENT = "com.xiaoluxue.ai.student/com.xiaoluxue.ai.student.LauncherActivity"
-XIAOLUXUE_CONFIG_PACKAGE = "com.xiaoluxue.ai.config"
-XIAOLUXUE_CONFIG_LAUNCHER_COMPONENT = "com.xiaoluxue.ai.config/com.xiaoluxue.ai.config.LauncherActivity"
-XIAOLUXUE_LOGIN_ACTIVITY = "com.xiaoluxue.ai.business.account.ui.LoginActivity"
-XIAOLUXUE_STUDY_SUBJECT_ACTIVITY = "com.xiaoluxue.ai.business.launcher.study.subject.StudySubjectActivity"
-XIAOLUXUE_LESSON_ACTIVITY = "com.xiaoluxue.ai.business.lesson.LessonActivity"
-XIAOLUXUE_SCHEME_PROXY_ACTIVITY = "com.xiaoluxue.ai.infra.framework.router.SchemeProxyActivity"
-XIAOLUXUE_STANDARD_BROWSER_ACTIVITY = "com.xiaoluxue.ai.infra.browser.vessel.StandardBrowserActivity"
-XIAOLUXUE_LEAK_ACTIVITY_MARKER = "leakcanary.internal.activity"
-XIAOLUXUE_VESSEL_WEBVIEW_ROUTE = "xlx://router/vessel/webview"
-XIAOLUXUE_STUDY_SUBJECT_ROUTE = "xlx://router/study/subject"
-XIAOLUXUE_GW_ORIGIN = "https://gw-stu.xiaoluxue.com"
-XIAOLUXUE_NATIVE_BASE_WIDTH = 2000
-XIAOLUXUE_NATIVE_BASE_HEIGHT = 1200
-XIAOLUXUE_NATIVE_MATH_CARD = (690, 280)
-XIAOLUXUE_NATIVE_GUIDE_BUBBLE = (770, 505)
-XIAOLUXUE_NATIVE_CONTINUE_BUTTON = (780, 815)
-XIAOLUXUE_NATIVE_PROGRESS_POPUP_CLOSE = (1515, 422)
-XIAOLUXUE_NATIVE_MAP_CACHE_PATH = SOURCE_MAP_DIR / "xiaoluxue-native-map-cache.json"
-XIAOLUXUE_NATIVE_MAP_CACHE: dict[str, Any] = {}
-XIAOLUXUE_SUBJECT_ALIASES: dict[str, int] = {
-    "语文": 1,
-    "中文": 1,
-    "数学": 2,
-    "英语": 3,
-    "英文": 3,
-    "物理": 4,
-    "化学": 5,
-    "生物": 6,
-}
-XIAOLUXUE_NATIVE_MAP_ROUTE_PRESETS: dict[int, dict[str, dict[str, tuple[int, int]]]] = {
-    1: {
-        "1.5": {
-            "index": (1508, 251),
-            "practise": (1116, 401),
-            "expand": (1314, 593),
-            "wrong": (926, 820),
-            "notebook": (1074, 820),
-            "report": (1000, 708),
-        }
-    }
-}
-XIAOLUXUE_MAP_MODULE_ENTRY_ACTIONS = {"practise", "expand"}
-XIAOLUXUE_NATIVE_SELECTED_MODULE_POINTS: dict[str, tuple[int, int]] = {
-    "practise": (1000, 392),
-    "expand": (1198, 501),
-}
-XIAOLUXUE_NATIVE_MODULE_CARD_ENTER_OFFSET_Y = 273
-XIAOLUXUE_NATIVE_EXPAND_CONFIRM_ENTER = (1312, 854)
-XIAOLUXUE_NATIVE_DIRECT_PRACTICE_ENTER = (468, 936)
-XIAOLUXUE_NATIVE_CURRENT_CARD_DIRECT_PRACTICE_ENTER = (955, 936)
-XIAOLUXUE_NATIVE_RIGHT_CARD_DIRECT_PRACTICE_ENTER = (1432, 936)
-XIAOLUXUE_NATIVE_ANSWER_CONTINUE = (1845, 1108)
-XIAOLUXUE_NATIVE_RESULT_FINISH = (1160, 856)
-XIAOLUXUE_NATIVE_TRANSITION_START = (1000, 1055)
-ANDROID_ANIMATION_SCALE_SETTINGS = (
-    "window_animation_scale",
-    "transition_animation_scale",
-    "animator_duration_scale",
-)
-XIAOLUXUE_MAP_FAST_KEYWORDS = (
-    "地图",
-    "题型突破",
-    "题型",
-    "突破",
-    "专属精练",
-    "专属练习",
-    "专属",
-    "精练",
-    "专练",
-    "巩固练习",
-    "巩固",
-    "错题",
-    "笔记",
-    "笔记本",
-    "学习任务",
-    "任务",
-    "薄弱知识",
-    "薄弱",
-    "看报告",
-    "报告",
-)
-XIAOLUXUE_CONFIG_URL_PATTERN = re.compile(r"https://gw-stu[^\s，,;]+")
-XIAOLUXUE_APP_ONLY_HOSTS = {"stu.xiaoluxue.com"}
-XIAOLUXUE_APP_ONLY_SUFFIXES = (".xiaoluxue.cn",)
-XIAOLUXUE_ENV_CHOICES: dict[str, dict[str, str]] = {
-    "prod": {"label": "生产环境-com", "url": "https://gw-stu.xiaoluxue.com"},
-    "prod-com": {"label": "生产环境-com", "url": "https://gw-stu.xiaoluxue.com"},
-    "production": {"label": "生产环境-com", "url": "https://gw-stu.xiaoluxue.com"},
-    "dev": {"label": "Dev环境", "url": "https://gw-stu.dev.xiaoluxue.cn/"},
-    "test": {"label": "Test环境", "url": "https://gw-stu.test.xiaoluxue.cn/"},
-    "test2": {"label": "Test2环境", "url": "https://gw-stu.test2.xiaoluxue.cn/"},
-    "test3": {"label": "Test3环境", "url": "https://gw-stu.test3.xiaoluxue.cn/"},
-    "test4": {"label": "Test4环境", "url": "https://gw-stu.test4.xiaoluxue.cn/"},
-    "test5": {"label": "Test5环境", "url": "https://gw-stu.test5.xiaoluxue.cn/"},
-    "test6": {"label": "Test6环境", "url": "https://gw-stu.test6.xiaoluxue.cn/"},
-    "kmtest": {"label": "Kmtest环境", "url": "https://gw-stu.kmtest.xiaoluxue.cn/"},
-}
