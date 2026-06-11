@@ -132,13 +132,22 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_appshot,
     },
     "android_observe": {
-        "description": "Observe the Android screen using UIAutomator, returning device state and visible UI nodes; optionally include screenshot/XML.",
+        "description": "Observe the Android screen. By default this tries a fast Playwright WebView DOM snapshot first, then falls back to UIAutomator; optionally include screenshot/XML.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "serial": {"type": "string"},
                 "include_screenshot": {"type": "boolean", "default": False},
                 "include_xml": {"type": "boolean", "default": False},
+                "prefer_webview": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Prefer a fast Playwright WebView DOM snapshot when a debuggable WebView is available. Set false to force UIAutomator.",
+                },
+                "include_webview": {
+                    "type": "boolean",
+                    "description": "Attach a Playwright WebView DOM snapshot to a UIAutomator observation when available. When omitted, follows prefer_webview.",
+                },
                 "limit": {"type": "integer", "default": 160},
             },
             "additionalProperties": False,
@@ -146,7 +155,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         "handler": tool_observe,
     },
     "android_tap_text": {
-        "description": "Tap a visible Android UI node by text or content description using UIAutomator, avoiding screenshot/VLM latency.",
+        "description": "Tap visible text. For debuggable WebViews this uses a fast Playwright DOM click first, then falls back to UIAutomator, avoiding screenshot/VLM latency.",
         "inputSchema": {
             "type": "object",
             "properties": {

@@ -274,6 +274,178 @@ class AndroidUseMcpTestsPart3(unittest.TestCase):
         self.assertEqual(captured["package"], "com.example")
         self.assertEqual(captured["expression"], "21 * 2")
 
+    def test_observe_prefers_webview_snapshot(self) -> None:
+        original_choose = mcp.choose_serial
+        original_snapshot = mcp.webview_snapshot_fast
+        original_observe_ui = mcp.observe_ui
+        original_device_state = mcp.device_state
+        try:
+            mcp.choose_serial = lambda serial=None: str(serial or "device-1")
+            mcp.device_state = lambda serial: {"serial": serial, "screen": {"width": 400, "height": 800}}
+            mcp.webview_snapshot_fast = lambda serial, *, limit=80, timeout=None: {
+                "backend": "playwright-android",
+                "page": {"id": "webview-1", "pkg": "com.example"},
+                "url": "https://example.test",
+                "title": "Example",
+                "elements": [
+                    {
+                        "tag": "button",
+                        "text": "继续",
+                        "aria": "",
+                        "id": "next",
+                        "interactive": True,
+                        "rect": {"left": 10, "top": 20, "right": 70, "bottom": 50, "x": 40, "y": 35},
+                    }
+                ],
+            }
+            mcp.observe_ui = lambda *args, **kwargs: self.fail("UIAutomator should not be used")
+
+            content = mcp.tool_observe({"serial": "device-1", "prefer_webview": True})
+        finally:
+            mcp.choose_serial = original_choose
+            mcp.webview_snapshot_fast = original_snapshot
+            mcp.observe_ui = original_observe_ui
+            mcp.device_state = original_device_state
+
+        payload = json.loads(content[0]["text"])
+        self.assertEqual(payload["source"], "webview_dom")
+        self.assertEqual(payload["ui"]["source"], "webview_dom")
+        self.assertEqual(payload["ui"]["coordinate_space"], "css_pixels")
+        self.assertEqual(payload["ui"]["nodes"][0]["text"], "继续")
+        self.assertEqual(payload["state"]["webview_url"], "https://example.test")
+
+    def test_tap_text_prefers_webview_dom_click(self) -> None:
+        original_choose = mcp.choose_serial
+        original_tap_webview = mcp.tap_webview_text_fast
+        original_observe_ui = mcp.observe_ui
+        original_active = mcp.active_recording
+        calls: list[tuple[str, str, bool]] = []
+        try:
+            mcp.choose_serial = lambda serial=None: str(serial or "device-1")
+            mcp.active_recording = lambda serial: None
+
+            def fake_tap(serial: str, query: str, *, exact: bool = True, timeout=None) -> dict[str, object]:
+                calls.append((serial, query, exact))
+                return {
+                    "backend": "playwright-android",
+                    "page": {"url": "https://example.test"},
+                    "match": {"text": "继续", "rect": {"x": 40, "y": 35}},
+                }
+
+            mcp.tap_webview_text_fast = fake_tap  # type: ignore[assignment]
+            mcp.observe_ui = lambda *args, **kwargs: self.fail("UIAutomator should not be used")
+
+            content = mcp.tool_tap_text({"serial": "device-1", "text": "继续"})
+        finally:
+            mcp.choose_serial = original_choose
+            mcp.tap_webview_text_fast = original_tap_webview
+            mcp.observe_ui = original_observe_ui
+            mcp.active_recording = original_active
+
+        payload = json.loads(content[0]["text"])
+        self.assertEqual(payload["source"], "webview_dom")
+        self.assertEqual(payload["backend"], "playwright-android")
+        self.assertEqual(payload["x"], 40)
+        self.assertEqual(calls, [("device-1", "继续", True)])
+
+    def test_tap_text_falls_back_to_uiautomator_when_webview_misses(self) -> None:
+        original_choose = mcp.choose_serial
+        original_tap_webview = mcp.tap_webview_text_fast
+        original_observe_ui = mcp.observe_ui
+        original_adb = mcp.adb
+        original_active = mcp.active_recording
+        adb_calls: list[list[str]] = []
+        try:
+            mcp.choose_serial = lambda serial=None: str(serial or "device-1")
+            mcp.active_recording = lambda serial: None
+            mcp.tap_webview_text_fast = lambda *args, **kwargs: None
+            mcp.observe_ui = lambda serial, **kwargs: {
+                "state": {"serial": serial},
+                "ui": {
+                    "nodes": [
+                        {
+                            "text": "继续",
+                            "content_desc": "",
+                            "resource_id": "",
+                            "center": {"x": 40, "y": 35},
+                        }
+                    ]
+                },
+            }
+            mcp.adb = lambda args, **kwargs: adb_calls.append(list(args)) or ""
+
+            content = mcp.tool_tap_text({"serial": "device-1", "text": "继续"})
+        finally:
+            mcp.choose_serial = original_choose
+            mcp.tap_webview_text_fast = original_tap_webview
+            mcp.observe_ui = original_observe_ui
+            mcp.adb = original_adb
+            mcp.active_recording = original_active
+
+        payload = json.loads(content[0]["text"])
+        self.assertEqual(payload["matched_node"]["text"], "继续")
+        self.assertEqual(adb_calls, [["shell", "input", "tap", "40", "35"]])
+
+    def test_agent_step_prefers_webview_action_in_hybrid(self) -> None:
+        original_choose = mcp.choose_serial
+        original_scrcpy = mcp.ensure_default_scrcpy_window
+        original_webview = mcp.fast_webview_action_from_instruction
+        original_uiautomator = mcp.fast_ui_action_from_instruction
+        original_observe_ui = mcp.observe_ui
+        try:
+            mcp.choose_serial = lambda serial=None: str(serial or "device-1")
+            mcp.ensure_default_scrcpy_window = lambda serial, args: {"ok": True, "skipped": "not-executing"}
+            mcp.fast_webview_action_from_instruction = lambda serial, instruction: {
+                "action": "tap_text",
+                "text": "继续",
+                "source": "webview_dom",
+            }
+            mcp.fast_ui_action_from_instruction = lambda *args, **kwargs: self.fail("UIAutomator should not be used")
+            mcp.observe_ui = lambda *args, **kwargs: self.fail("VLM grounding should not be used")
+
+            content = mcp.tool_agent_step({"serial": "device-1", "instruction": "点击继续", "execute": False})
+        finally:
+            mcp.choose_serial = original_choose
+            mcp.ensure_default_scrcpy_window = original_scrcpy
+            mcp.fast_webview_action_from_instruction = original_webview
+            mcp.fast_ui_action_from_instruction = original_uiautomator
+            mcp.observe_ui = original_observe_ui
+
+        payload = json.loads(content[0]["text"])
+        self.assertEqual(payload["proposed_action"]["source"], "webview_dom")
+        self.assertEqual(payload["proposed_action"]["text"], "继续")
+
+    def test_agent_run_stops_after_webview_fast_action(self) -> None:
+        original_choose = mcp.choose_serial
+        original_scrcpy = mcp.ensure_default_scrcpy_window
+        original_webview = mcp.fast_webview_action_from_instruction
+        original_execute = mcp.execute_action
+        calls: list[str] = []
+        try:
+            mcp.choose_serial = lambda serial=None: str(serial or "device-1")
+            mcp.ensure_default_scrcpy_window = lambda serial, args: {"ok": True, "skipped": "test"}
+
+            def fake_webview(serial: str, instruction: str) -> dict[str, object]:
+                calls.append(instruction)
+                return {"action": "tap_text", "text": "继续", "source": "webview_dom"}
+
+            mcp.fast_webview_action_from_instruction = fake_webview  # type: ignore[assignment]
+            mcp.execute_action = lambda serial, action: [mcp.text_content({"ok": True})]
+
+            content = mcp.tool_agent_run(
+                {"serial": "device-1", "instruction": "点击继续", "max_steps": 3, "delay_sec": 0}
+            )
+        finally:
+            mcp.choose_serial = original_choose
+            mcp.ensure_default_scrcpy_window = original_scrcpy
+            mcp.fast_webview_action_from_instruction = original_webview
+            mcp.execute_action = original_execute
+
+        payload = json.loads(content[0]["text"])
+        self.assertEqual(len(payload["steps"]), 1)
+        self.assertEqual(payload["steps"][0]["source"], "webview")
+        self.assertEqual(calls, ["点击继续"])
+
     def test_recipe_from_trace_prefers_selectors(self) -> None:
         trace = {
             "id": "trace-1",

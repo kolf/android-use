@@ -714,6 +714,15 @@ def execute_action(serial: str, action: dict[str, Any]) -> list[dict[str, Any]]:
         action_type = "tap"
     if action_type == "tap":
         return tool_tap({"serial": serial, "x": action["x"], "y": action["y"]})
+    if action_type == "tap_text":
+        return tool_tap_text(
+            {
+                "serial": serial,
+                "text": action["text"],
+                "exact": bool(action.get("exact", True)),
+                "include_resource_id": bool(action.get("include_resource_id", False)),
+            }
+        )
     if action_type == "double_tap":
         x = int(action["x"])
         y = int(action["y"])
@@ -774,6 +783,24 @@ def tool_agent_step(args: dict[str, Any]) -> list[dict[str, Any]]:
     mode = str(args.get("mode", "hybrid")).lower()
     history = args.get("history") if isinstance(args.get("history"), list) else []
     scrcpy_result = ensure_default_scrcpy_window(serial, args) if execute else {"ok": True, "skipped": "not-executing"}
+
+    if mode == "hybrid":
+        fast_action = fast_webview_action_from_instruction(serial, instruction)
+        if fast_action:
+            content = [
+                text_content(
+                    {
+                        "serial": serial,
+                        "proposed_action": fast_action,
+                        "execute": execute,
+                        "mode": mode,
+                        "scrcpy": scrcpy_result,
+                    }
+                )
+            ]
+            if execute:
+                content.extend(execute_action(serial, fast_action))
+            return content
 
     if mode in {"hybrid", "uiautomator", "accessibility"}:
         fast_action = fast_ui_action_from_instruction(serial, instruction)
@@ -839,9 +866,14 @@ def tool_agent_run(args: dict[str, Any]) -> list[dict[str, Any]]:
     for step_index in range(max_steps):
         action: dict[str, Any] | None = None
         source = "vlm"
-        if mode in {"hybrid", "uiautomator", "accessibility"}:
-            action = fast_ui_action_from_instruction(serial, instruction)
+        if mode == "hybrid":
+            action = fast_webview_action_from_instruction(serial, instruction)
             if action:
+                source = "webview"
+        if mode in {"hybrid", "uiautomator", "accessibility"}:
+            if not action:
+                action = fast_ui_action_from_instruction(serial, instruction)
+            if action and source != "webview":
                 source = "uiautomator"
             elif mode in {"uiautomator", "accessibility"}:
                 raise AndroidUseError(f"Could not satisfy instruction from Android UI tree alone: {instruction}")
@@ -867,7 +899,7 @@ def tool_agent_run(args: dict[str, Any]) -> list[dict[str, Any]]:
         if str(action.get("action", "")).lower() == "done":
             break
         execute_action(serial, action)
-        if source == "uiautomator":
+        if source in {"webview", "uiautomator"}:
             break
         time.sleep(delay_sec)
 

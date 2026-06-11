@@ -1,6 +1,6 @@
 # Android 插件小白安装说明
 
-`android-use-plugins` 是 Codex Android 通用控制插件。安装后，Codex 默认通过 adb、截图、UIAutomator 和 Playwright Android WebView 控制安卓设备。
+`android-use-plugins` 是 Codex Android 通用控制插件。安装后，Codex 默认通过 adb、截图、UIAutomator 和 Playwright Android WebView 控制安卓设备；对轻原生壳、主要内容在 WebView 里的 App，会优先尝试 Playwright WebView 快路径，再回退到 UIAutomator/adb。
 
 这份文档面向不熟悉命令行的同学。
 
@@ -176,6 +176,8 @@ cd ~/plugins/android-use-plugins
 
 ## 输入速度
 
+可调试 WebView 能被 Playwright Android 发现时，插件默认优先走 WebView DOM：`android_observe` 先取 DOM 快照，`android_tap_text` 先做 DOM 点击，`android_type_text` 先直接给当前输入框赋值。找不到可用 WebView 或 DOM 元素时，再回退到 UIAutomator、输入法或 adb。
+
 插件会自动选择更快的输入方式：
 
 - 可调试 WebView 页面：优先通过 Playwright Android 直接给当前输入框赋值，不走键盘输入，适合混合 App、表单页和富文本输入框；
@@ -187,6 +189,18 @@ cd ~/plugins/android-use-plugins
 
 ```bash
 ANDROID_USE_WEBVIEW_DIRECT_INPUT=0
+```
+
+如果不希望 observe、点击文字和 hybrid agent 默认优先尝试 WebView：
+
+```bash
+ANDROID_USE_WEBVIEW_FIRST=0
+```
+
+如果想调整 WebView 快路径的超时时间：
+
+```bash
+ANDROID_USE_WEBVIEW_FAST_TIMEOUT=3
 ```
 
 如果不希望插件自动切换输入法，可以在环境变量里写：

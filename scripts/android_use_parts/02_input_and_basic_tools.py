@@ -667,8 +667,16 @@ def tool_observe(args: dict[str, Any]) -> list[dict[str, Any]]:
     serial = choose_serial(args.get("serial"))
     include_screenshot = bool(args.get("include_screenshot", False))
     include_xml = bool(args.get("include_xml", False))
+    prefer_webview = bool(args.get("prefer_webview", webview_first_enabled()))
+    include_webview = bool(args.get("include_webview", prefer_webview))
     limit = max(20, min(int(args.get("limit", 160)), 500))
-    observation = observe_ui(serial, include_xml=include_xml, limit=limit)
+    webview_snapshot = webview_snapshot_fast(serial, limit=limit) if include_webview or (prefer_webview and not include_xml) else None
+    if prefer_webview and not include_xml and webview_snapshot:
+        observation = webview_observation_from_snapshot(serial, webview_snapshot)
+    else:
+        observation = observe_ui(serial, include_xml=include_xml, limit=limit)
+        if webview_snapshot:
+            observation["webview"] = webview_snapshot
     content = [text_content(observation)]
     if include_screenshot:
         png = screenshot_png(serial)
@@ -681,8 +689,35 @@ def tool_tap_text(args: dict[str, Any]) -> list[dict[str, Any]]:
     query = str(args["text"]).strip()
     exact = bool(args.get("exact", True))
     include_resource_id = bool(args.get("include_resource_id", False))
+    before = capture_record_snapshot(serial) if active_recording(serial) else None
+    webview_match = tap_webview_text_fast(serial, query, exact=exact)
+    if not webview_match and exact:
+        webview_match = tap_webview_text_fast(serial, query, exact=False)
+    if webview_match:
+        match = webview_match.get("match", {}) if isinstance(webview_match.get("match"), dict) else {}
+        rect = match.get("rect", {}) if isinstance(match.get("rect"), dict) else {}
+        payload = action_result(
+            "tap_text",
+            serial,
+            {
+                "text": query,
+                "source": "webview_dom",
+                "backend": webview_match.get("backend", "playwright-android"),
+                "page": webview_match.get("page"),
+                "matched_webview": match,
+                "x": rect.get("x"),
+                "y": rect.get("y"),
+            },
+        )
+        append_recording_step(
+            serial,
+            "tap_text",
+            {"text": query, "exact": exact, "include_resource_id": include_resource_id},
+            payload,
+            before=before,
+        )
+        return [text_content(payload)]
     observation = observe_ui(serial, limit=300)
-    before = snapshot_from_observation(observation) if active_recording(serial) else None
     nodes = observation["ui"]["nodes"]
     node = find_ui_node(nodes, query, exact=exact, include_resource_id=include_resource_id)
     if not node and exact:

@@ -6,7 +6,7 @@
 
 - 打开 Android App；
 - 查看和截图当前设备屏幕；
-- 通过 adb 查看和控制设备，WebView 操作用 Playwright Android；
+- 通过 adb 查看和控制设备，混合 App / WebView 优先走 Playwright Android；
 - 点击、滑动、输入文字、按返回键、执行设备 shell；
 - 调试 WebView；
 - 录制常用操作并复放；
@@ -298,6 +298,8 @@ ANDROID_USE_OPENAI_COMPUTER_MODEL=gpt-5.5
 
 ## 输入速度说明
 
+可调试 WebView 能被 Playwright Android 发现时，插件默认优先走 WebView DOM：`android_observe` 先取 DOM 快照，`android_tap_text` 先做 DOM 点击，`android_type_text` 先直接给当前输入框赋值。找不到可用 WebView 或 DOM 元素时，再回退到 UIAutomator、输入法或 adb。
+
 `android_type_text` 会自动选择更快的输入方式：
 
 - 可调试 WebView 页面会优先通过 Playwright Android 直接给当前输入框赋值，不走键盘输入，适合混合 App、表单页和富文本输入框；
@@ -309,6 +311,18 @@ ANDROID_USE_OPENAI_COMPUTER_MODEL=gpt-5.5
 
 ```bash
 ANDROID_USE_WEBVIEW_DIRECT_INPUT=0
+```
+
+如果不希望 observe、点击文字和 hybrid agent 默认优先尝试 WebView：
+
+```bash
+ANDROID_USE_WEBVIEW_FIRST=0
+```
+
+如果想调整 WebView 快路径的超时时间：
+
+```bash
+ANDROID_USE_WEBVIEW_FAST_TIMEOUT=3
 ```
 
 如果不希望插件自动切换输入法，可以在环境变量里关闭：
@@ -348,7 +362,7 @@ WebView / 混合 App 常用：
 
 - `android_open_url` 使用 Android 标准 `ACTION_VIEW` intent 打开 URL；
 - 对于只能在特定 App 内打开的业务深链，请使用对应 App 的包名、Activity 或可公开处理的 URI，不在插件内硬编码业务域名；
-- WebView 能在 Chrome `chrome://inspect/#devices` 里看到时，优先用插件的 `android_webview_pages` 和 `android_webview_eval`，而不是视觉模型；
+- WebView 能在 Chrome `chrome://inspect/#devices` 里看到时，插件会默认优先使用 Playwright Android 的 WebView DOM 快路径；需要显式调试时再用 `android_webview_pages` 和 `android_webview_eval`；
 - 任何业务 App 的页面跳转、登录、做题或播放逻辑，都应通过通用 UIAutomator、WebView、recipe 或项目外部自定义脚本组合完成。
 
 ## 录制和复放常用流程
