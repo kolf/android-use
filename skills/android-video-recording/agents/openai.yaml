@@ -1,0 +1,4 @@
+interface:
+  display_name: "Android Use: Android Video Recording"
+  short_description: "通过 scrcpy 录制 Android 屏幕视频"
+  default_prompt: "Use $android-video-recording to record Android screen video."

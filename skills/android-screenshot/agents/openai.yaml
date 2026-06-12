@@ -1,0 +1,4 @@
+interface:
+  display_name: "Android Use: Android Screenshot"
+  short_description: "说截图时立即截取并发送当前 Android 屏幕图片"
+  default_prompt: "Use $android-screenshot to capture and send the current Android screen immediately."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Android Use"
+  short_description: "通过 adb、截图、WebView 和 scrcpy 控制 Android 设备"
+  default_prompt: "Use $android-use to control an attached Android device."
