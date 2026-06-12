@@ -621,3 +621,229 @@ adb-ANMB9X5A10G00857      _adb-tls-connect._tcp  192.168.86.39:37123
         sockets = mcp.parse_webview_devtools_sockets(proc_net_unix)
 
         self.assertEqual(sockets, ["webview_devtools_remote_twe_32675", "webview_devtools_remote_123"])
+
+    def test_cdp_runtime_evaluate_reuses_session_and_increments_request_id(self) -> None:
+        original_connect = mcp.websocket_connect
+        original_send = mcp.websocket_send_text
+        original_recv = mcp.websocket_recv_text
+
+        class FakeSocket:
+            def __init__(self) -> None:
+                self.sent: list[dict[str, object]] = []
+                self.closed = False
+
+            def settimeout(self, _timeout: object) -> None:
+                pass
+
+            def sendall(self, _data: bytes) -> None:
+                pass
+
+            def close(self) -> None:
+                self.closed = True
+
+        sockets: list[FakeSocket] = []
+        try:
+            mcp.close_cdp_sessions()
+
+            def fake_connect(_ws_url: str, timeout: int | float = 10) -> FakeSocket:
+                socket = FakeSocket()
+                sockets.append(socket)
+                return socket
+
+            def fake_send(sock: FakeSocket, text: str) -> None:
+                sock.sent.append(json.loads(text))
+
+            def fake_recv(sock: FakeSocket) -> str:
+                request_id = sock.sent[-1]["id"]
+                return json.dumps({"id": request_id, "result": {"result": {"type": "number", "value": request_id}}})
+
+            mcp.websocket_connect = fake_connect  # type: ignore[assignment]
+            mcp.websocket_send_text = fake_send  # type: ignore[assignment]
+            mcp.websocket_recv_text = fake_recv  # type: ignore[assignment]
+
+            first = mcp.cdp_runtime_evaluate("ws://127.0.0.1/devtools/page/1", "1")
+            second = mcp.cdp_runtime_evaluate("ws://127.0.0.1/devtools/page/1", "2")
+        finally:
+            mcp.close_cdp_sessions()
+            mcp.websocket_connect = original_connect
+            mcp.websocket_send_text = original_send
+            mcp.websocket_recv_text = original_recv
+
+        self.assertEqual(first["value"], 1)
+        self.assertEqual(second["value"], 2)
+        self.assertEqual(len(sockets), 1)
+        self.assertEqual([request["id"] for request in sockets[0].sent], [1, 2])
+        self.assertTrue(sockets[0].closed)
+
+    def test_cdp_runtime_evaluate_clears_failed_session_and_reconnects_once(self) -> None:
+        original_connect = mcp.websocket_connect
+        original_send = mcp.websocket_send_text
+        original_recv = mcp.websocket_recv_text
+
+        class FakeSocket:
+            def __init__(self, name: str) -> None:
+                self.name = name
+                self.sent: list[dict[str, object]] = []
+                self.closed = False
+
+            def settimeout(self, _timeout: object) -> None:
+                pass
+
+            def sendall(self, _data: bytes) -> None:
+                pass
+
+            def close(self) -> None:
+                self.closed = True
+
+        sockets: list[FakeSocket] = []
+        try:
+            mcp.close_cdp_sessions()
+
+            def fake_connect(_ws_url: str, timeout: int | float = 10) -> FakeSocket:
+                socket = FakeSocket(f"socket-{len(sockets) + 1}")
+                sockets.append(socket)
+                return socket
+
+            def fake_send(sock: FakeSocket, text: str) -> None:
+                sock.sent.append(json.loads(text))
+
+            def fake_recv(sock: FakeSocket) -> str:
+                if sock.name == "socket-1":
+                    raise mcp.AndroidUseError("stale websocket")
+                request_id = sock.sent[-1]["id"]
+                return json.dumps({"id": request_id, "result": {"result": {"type": "string", "value": sock.name}}})
+
+            mcp.websocket_connect = fake_connect  # type: ignore[assignment]
+            mcp.websocket_send_text = fake_send  # type: ignore[assignment]
+            mcp.websocket_recv_text = fake_recv  # type: ignore[assignment]
+
+            result = mcp.cdp_runtime_evaluate("ws://127.0.0.1/devtools/page/2", "location.href")
+        finally:
+            mcp.close_cdp_sessions()
+            mcp.websocket_connect = original_connect
+            mcp.websocket_send_text = original_send
+            mcp.websocket_recv_text = original_recv
+
+        self.assertEqual(result["value"], "socket-2")
+        self.assertEqual(len(sockets), 2)
+        self.assertTrue(sockets[0].closed)
+        self.assertTrue(sockets[1].closed)
+        self.assertEqual([socket.sent[0]["id"] for socket in sockets], [1, 1])
+
+    def test_cdp_runtime_evaluate_clears_failed_session_without_retry_when_disabled(self) -> None:
+        original_connect = mcp.websocket_connect
+        original_send = mcp.websocket_send_text
+        original_recv = mcp.websocket_recv_text
+
+        class FakeSocket:
+            def __init__(self) -> None:
+                self.sent: list[dict[str, object]] = []
+                self.closed = False
+
+            def settimeout(self, _timeout: object) -> None:
+                pass
+
+            def sendall(self, _data: bytes) -> None:
+                pass
+
+            def close(self) -> None:
+                self.closed = True
+
+        sockets: list[FakeSocket] = []
+        try:
+            mcp.close_cdp_sessions()
+            mcp.websocket_connect = lambda _ws_url, timeout=10: sockets.append(FakeSocket()) or sockets[-1]
+            mcp.websocket_send_text = lambda sock, text: sock.sent.append(json.loads(text))  # type: ignore[union-attr]
+            mcp.websocket_recv_text = lambda _sock: (_ for _ in ()).throw(mcp.AndroidUseError("closed"))
+
+            with self.assertRaises(mcp.AndroidUseError):
+                mcp.cdp_runtime_evaluate(
+                    "ws://127.0.0.1/devtools/page/3",
+                    "1",
+                    reconnect_once=False,
+                )
+        finally:
+            cache_count = mcp.close_cdp_sessions()
+            mcp.websocket_connect = original_connect
+            mcp.websocket_send_text = original_send
+            mcp.websocket_recv_text = original_recv
+
+        self.assertEqual(cache_count, 0)
+        self.assertEqual(len(sockets), 1)
+        self.assertTrue(sockets[0].closed)
+
+    def test_cdp_session_explicit_close_and_ttl_expiry(self) -> None:
+        original_connect = mcp.websocket_connect
+        original_send = mcp.websocket_send_text
+        original_recv = mcp.websocket_recv_text
+        original_time = mcp.time.time
+
+        class FakeSocket:
+            def __init__(self, name: str) -> None:
+                self.name = name
+                self.sent: list[dict[str, object]] = []
+                self.closed = False
+
+            def settimeout(self, _timeout: object) -> None:
+                pass
+
+            def sendall(self, _data: bytes) -> None:
+                pass
+
+            def close(self) -> None:
+                self.closed = True
+
+        now = {"value": 100.0}
+        sockets: list[FakeSocket] = []
+        try:
+            mcp.close_cdp_sessions()
+
+            def fake_connect(_ws_url: str, timeout: int | float = 10) -> FakeSocket:
+                socket = FakeSocket(f"socket-{len(sockets) + 1}")
+                sockets.append(socket)
+                return socket
+
+            def fake_send(sock: FakeSocket, text: str) -> None:
+                sock.sent.append(json.loads(text))
+
+            def fake_recv(sock: FakeSocket) -> str:
+                request_id = sock.sent[-1]["id"]
+                return json.dumps({"id": request_id, "result": {"result": {"type": "string", "value": sock.name}}})
+
+            mcp.websocket_connect = fake_connect  # type: ignore[assignment]
+            mcp.websocket_send_text = fake_send  # type: ignore[assignment]
+            mcp.websocket_recv_text = fake_recv  # type: ignore[assignment]
+            mcp.time.time = lambda: now["value"]
+
+            first = mcp.cdp_runtime_evaluate(
+                "ws://127.0.0.1/devtools/page/4",
+                "1",
+                cache_idle_ttl_sec=1,
+            )
+            close_count = mcp.close_cdp_sessions("ws://127.0.0.1/devtools/page/4")
+            second = mcp.cdp_runtime_evaluate(
+                "ws://127.0.0.1/devtools/page/4",
+                "2",
+                cache_idle_ttl_sec=1,
+            )
+            now["value"] = 102.1
+            third = mcp.cdp_runtime_evaluate(
+                "ws://127.0.0.1/devtools/page/4",
+                "3",
+                cache_idle_ttl_sec=1,
+            )
+        finally:
+            mcp.close_cdp_sessions()
+            mcp.websocket_connect = original_connect
+            mcp.websocket_send_text = original_send
+            mcp.websocket_recv_text = original_recv
+            mcp.time.time = original_time
+
+        self.assertEqual(first["value"], "socket-1")
+        self.assertEqual(second["value"], "socket-2")
+        self.assertEqual(third["value"], "socket-3")
+        self.assertEqual(close_count, 1)
+        self.assertEqual(len(sockets), 3)
+        self.assertTrue(sockets[0].closed)
+        self.assertTrue(sockets[1].closed)
+        self.assertTrue(sockets[2].closed)

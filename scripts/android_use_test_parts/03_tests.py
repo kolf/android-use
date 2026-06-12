@@ -217,6 +217,91 @@ class AndroidUseMcpTestsPart3(unittest.TestCase):
         self.assertIn("android_start_video_recording", tool_names)
         self.assertIn("android_wireless_pair_qr", tool_names)
 
+    def test_playwright_webview_worker_disabled_uses_one_shot(self) -> None:
+        original_env = mcp.os.environ.get("ANDROID_USE_PLAYWRIGHT_WEBVIEW_WORKER")
+        original_worker = mcp.run_playwright_android_webview_worker
+        original_once = mcp.run_playwright_android_webview_once
+        calls: list[str] = []
+        try:
+            mcp.os.environ.pop("ANDROID_USE_PLAYWRIGHT_WEBVIEW_WORKER", None)
+            mcp.run_playwright_android_webview_worker = lambda *args, **kwargs: self.fail("worker should be disabled")
+
+            def fake_once(payload: dict[str, object], timeout: float = 10) -> dict[str, object]:
+                calls.append(str(payload["action"]))
+                return {"ok": True, "backend": "playwright-android", "pages": []}
+
+            mcp.run_playwright_android_webview_once = fake_once  # type: ignore[assignment]
+
+            result = mcp.run_playwright_android_webview({"action": "list"}, timeout=2)
+        finally:
+            mcp.run_playwright_android_webview_worker = original_worker  # type: ignore[assignment]
+            mcp.run_playwright_android_webview_once = original_once  # type: ignore[assignment]
+            if original_env is None:
+                mcp.os.environ.pop("ANDROID_USE_PLAYWRIGHT_WEBVIEW_WORKER", None)
+            else:
+                mcp.os.environ["ANDROID_USE_PLAYWRIGHT_WEBVIEW_WORKER"] = original_env
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(calls, ["list"])
+
+    def test_playwright_webview_worker_enabled_uses_worker(self) -> None:
+        original_env = mcp.os.environ.get("ANDROID_USE_PLAYWRIGHT_WEBVIEW_WORKER")
+        original_worker = mcp.run_playwright_android_webview_worker
+        original_once = mcp.run_playwright_android_webview_once
+        calls: list[str] = []
+        try:
+            mcp.os.environ["ANDROID_USE_PLAYWRIGHT_WEBVIEW_WORKER"] = "1"
+
+            def fake_worker(payload: dict[str, object], timeout: float = 10) -> dict[str, object]:
+                calls.append(str(payload["action"]))
+                return {"ok": True, "backend": "playwright-android", "worker": True, "pages": []}
+
+            mcp.run_playwright_android_webview_worker = fake_worker  # type: ignore[assignment]
+            mcp.run_playwright_android_webview_once = lambda *args, **kwargs: self.fail("one-shot should not be used")
+
+            result = mcp.run_playwright_android_webview({"action": "list"}, timeout=2)
+        finally:
+            mcp.run_playwright_android_webview_worker = original_worker  # type: ignore[assignment]
+            mcp.run_playwright_android_webview_once = original_once  # type: ignore[assignment]
+            if original_env is None:
+                mcp.os.environ.pop("ANDROID_USE_PLAYWRIGHT_WEBVIEW_WORKER", None)
+            else:
+                mcp.os.environ["ANDROID_USE_PLAYWRIGHT_WEBVIEW_WORKER"] = original_env
+
+        self.assertTrue(result["worker"])
+        self.assertEqual(calls, ["list"])
+
+    def test_playwright_webview_worker_failure_falls_back_to_one_shot(self) -> None:
+        original_env = mcp.os.environ.get("ANDROID_USE_PLAYWRIGHT_WEBVIEW_WORKER")
+        original_worker = mcp.run_playwright_android_webview_worker
+        original_once = mcp.run_playwright_android_webview_once
+        calls: list[str] = []
+        try:
+            mcp.os.environ["ANDROID_USE_PLAYWRIGHT_WEBVIEW_WORKER"] = "1"
+
+            def fake_worker(_payload: dict[str, object], timeout: float = 10) -> dict[str, object]:
+                calls.append("worker")
+                raise mcp.AndroidUseError("worker unavailable")
+
+            def fake_once(payload: dict[str, object], timeout: float = 10) -> dict[str, object]:
+                calls.append("one-shot")
+                return {"ok": True, "backend": "playwright-android", "pages": [{"id": "fallback"}]}
+
+            mcp.run_playwright_android_webview_worker = fake_worker  # type: ignore[assignment]
+            mcp.run_playwright_android_webview_once = fake_once  # type: ignore[assignment]
+
+            result = mcp.run_playwright_android_webview({"action": "list"}, timeout=2)
+        finally:
+            mcp.run_playwright_android_webview_worker = original_worker  # type: ignore[assignment]
+            mcp.run_playwright_android_webview_once = original_once  # type: ignore[assignment]
+            if original_env is None:
+                mcp.os.environ.pop("ANDROID_USE_PLAYWRIGHT_WEBVIEW_WORKER", None)
+            else:
+                mcp.os.environ["ANDROID_USE_PLAYWRIGHT_WEBVIEW_WORKER"] = original_env
+
+        self.assertEqual(calls, ["worker", "one-shot"])
+        self.assertEqual(result["pages"][0]["id"], "fallback")
+
     def test_webview_pages_uses_playwright_android(self) -> None:
         original_choose = mcp.choose_serial
         original_pages = mcp.playwright_android_webview_pages
@@ -238,6 +323,150 @@ class AndroidUseMcpTestsPart3(unittest.TestCase):
         self.assertEqual(payload["backend"], "playwright-android")
         self.assertEqual(payload["pages"][0]["pkg"], "com.example")
         self.assertEqual(calls, [("device-1", 4.0)])
+
+    def test_webview_pages_reuses_recent_cache_until_ttl(self) -> None:
+        original_run = mcp.run_playwright_android_webview
+        original_monotonic = mcp.time.monotonic
+        original_env = mcp.os.environ.get("ANDROID_USE_WEBVIEW_PAGE_CACHE_TTL")
+        now = [100.0]
+        calls: list[dict[str, object]] = []
+        try:
+            mcp.clear_webview_page_cache()
+            mcp.os.environ["ANDROID_USE_WEBVIEW_PAGE_CACHE_TTL"] = "2"
+            mcp.time.monotonic = lambda: now[0]
+
+            def fake_run(payload: dict[str, object], timeout: float = 10) -> dict[str, object]:
+                calls.append({"payload": dict(payload), "timeout": timeout})
+                return {
+                    "ok": True,
+                    "pages": [{"id": f"page-{len(calls)}", "ok": True, "url": "https://example.test"}],
+                }
+
+            mcp.run_playwright_android_webview = fake_run  # type: ignore[assignment]
+
+            first = mcp.playwright_android_webview_pages("device-1", timeout=3)
+            first[0]["id"] = "mutated"
+            second = mcp.playwright_android_webview_pages("device-1", timeout=3)
+            now[0] = 102.01
+            third = mcp.playwright_android_webview_pages("device-1", timeout=3)
+        finally:
+            mcp.run_playwright_android_webview = original_run
+            mcp.time.monotonic = original_monotonic
+            mcp.clear_webview_page_cache()
+            if original_env is None:
+                mcp.os.environ.pop("ANDROID_USE_WEBVIEW_PAGE_CACHE_TTL", None)
+            else:
+                mcp.os.environ["ANDROID_USE_WEBVIEW_PAGE_CACHE_TTL"] = original_env
+
+        self.assertEqual(second[0]["id"], "page-1")
+        self.assertEqual(third[0]["id"], "page-2")
+        self.assertEqual(len(calls), 2)
+
+    def test_webview_pages_failure_clears_stale_cache(self) -> None:
+        original_run = mcp.run_playwright_android_webview
+        original_monotonic = mcp.time.monotonic
+        original_env = mcp.os.environ.get("ANDROID_USE_WEBVIEW_PAGE_CACHE_TTL")
+        now = [100.0]
+        calls: list[dict[str, object]] = []
+        try:
+            mcp.clear_webview_page_cache()
+            mcp.os.environ["ANDROID_USE_WEBVIEW_PAGE_CACHE_TTL"] = "2"
+            mcp.time.monotonic = lambda: now[0]
+
+            def fake_run(payload: dict[str, object], timeout: float = 10) -> dict[str, object]:
+                calls.append({"payload": dict(payload), "timeout": timeout})
+                if len(calls) == 2:
+                    raise mcp.AndroidUseError("discovery failed")
+                return {
+                    "ok": True,
+                    "pages": [{"id": f"page-{len(calls)}", "ok": True, "url": "https://example.test"}],
+                }
+
+            mcp.run_playwright_android_webview = fake_run  # type: ignore[assignment]
+
+            first = mcp.playwright_android_webview_pages("device-1", timeout=3)
+            now[0] = 103.0
+            with self.assertRaises(mcp.AndroidUseError):
+                mcp.playwright_android_webview_pages("device-1", timeout=3)
+            now[0] = 103.1
+            fresh = mcp.playwright_android_webview_pages("device-1", timeout=3)
+        finally:
+            mcp.run_playwright_android_webview = original_run
+            mcp.time.monotonic = original_monotonic
+            mcp.clear_webview_page_cache()
+            if original_env is None:
+                mcp.os.environ.pop("ANDROID_USE_WEBVIEW_PAGE_CACHE_TTL", None)
+            else:
+                mcp.os.environ["ANDROID_USE_WEBVIEW_PAGE_CACHE_TTL"] = original_env
+
+        self.assertEqual(first[0]["id"], "page-1")
+        self.assertEqual(fresh[0]["id"], "page-3")
+        self.assertEqual(len(calls), 3)
+
+    def test_webview_snapshot_eval_failure_clears_cached_pages(self) -> None:
+        original_run = mcp.run_playwright_android_webview
+        original_eval = mcp.playwright_android_webview_eval
+        original_monotonic = mcp.time.monotonic
+        original_env = mcp.os.environ.get("ANDROID_USE_WEBVIEW_PAGE_CACHE_TTL")
+        now = [100.0]
+        list_calls: list[dict[str, object]] = []
+        eval_calls: list[str | None] = []
+        try:
+            mcp.clear_webview_page_cache()
+            mcp.os.environ["ANDROID_USE_WEBVIEW_PAGE_CACHE_TTL"] = "10"
+            mcp.time.monotonic = lambda: now[0]
+
+            def fake_run(payload: dict[str, object], timeout: float = 10) -> dict[str, object]:
+                list_calls.append({"payload": dict(payload), "timeout": timeout})
+                return {
+                    "ok": True,
+                    "pages": [
+                        {
+                            "id": f"page-{len(list_calls)}",
+                            "ok": True,
+                            "url": "https://example.test",
+                        }
+                    ],
+                }
+
+            def fake_eval(serial: str, expression: str, **kwargs: object) -> dict[str, object]:
+                page_id = kwargs.get("page_id")
+                eval_calls.append(str(page_id) if page_id is not None else None)
+                if len(eval_calls) == 1:
+                    raise mcp.AndroidUseError("stale page")
+                return {
+                    "backend": "playwright-android",
+                    "page": {"id": page_id, "url": "https://example.test"},
+                    "result": {
+                        "type": "object",
+                        "value": {
+                            "ok": True,
+                            "url": "https://example.test",
+                            "title": "Example",
+                            "elements": [],
+                        },
+                    },
+                }
+
+            mcp.run_playwright_android_webview = fake_run  # type: ignore[assignment]
+            mcp.playwright_android_webview_eval = fake_eval  # type: ignore[assignment]
+
+            missed = mcp.webview_snapshot_fast("device-1", limit=3)
+            recovered = mcp.webview_snapshot_fast("device-1", limit=3)
+        finally:
+            mcp.run_playwright_android_webview = original_run
+            mcp.playwright_android_webview_eval = original_eval
+            mcp.time.monotonic = original_monotonic
+            mcp.clear_webview_page_cache()
+            if original_env is None:
+                mcp.os.environ.pop("ANDROID_USE_WEBVIEW_PAGE_CACHE_TTL", None)
+            else:
+                mcp.os.environ["ANDROID_USE_WEBVIEW_PAGE_CACHE_TTL"] = original_env
+
+        self.assertIsNone(missed)
+        self.assertIsNotNone(recovered)
+        self.assertEqual(eval_calls, ["page-1", "page-2"])
+        self.assertEqual(len(list_calls), 2)
 
     def test_webview_eval_uses_playwright_android(self) -> None:
         original_choose = mcp.choose_serial

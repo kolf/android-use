@@ -1,0 +1,5 @@
+[     208ms] [ERROR] Failed to load resource: the server responded with a status of 404 (File not found) @ http://127.0.0.1:52104/favicon.ico:0
+[  239095ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:52104/assets/4dfceeecc4-1780305539034-screen_change.png:0
+[ 1475091ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:52104/assets/2cef9f90cc-1780305540044-screen_change.png:0
+[ 1475705ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:52104/assets/3d047fa05e-1780305548044-screen_change.png:0
+[ 1475737ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://127.0.0.1:52104/assets/7a16508399-1780305554064-screen_change.png:0

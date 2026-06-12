@@ -1,5 +1,13 @@
 # Loaded by scripts/android_use_mcp.py. Keep this file below 2000 lines.
 
+import atexit
+import select
+
+
+PLAYWRIGHT_ANDROID_WEBVIEW_WORKER: subprocess.Popen[bytes] | None = None
+PLAYWRIGHT_ANDROID_WEBVIEW_WORKER_LOCK = threading.Lock()
+PLAYWRIGHT_ANDROID_WEBVIEW_WORKER_REQUEST_ID = 0
+
 
 def node_binary() -> str:
     return os.environ.get("ANDROID_USE_NODE", "node")
@@ -9,9 +17,18 @@ def playwright_android_helper_path() -> Path:
     return PLUGIN_ROOT / "scripts" / "playwright_android_webview.js"
 
 
+def playwright_android_worker_helper_path() -> Path:
+    return PLUGIN_ROOT / "scripts" / "playwright_android_webview_worker.js"
+
+
+def playwright_android_worker_enabled() -> bool:
+    return env_flag("ANDROID_USE_PLAYWRIGHT_WEBVIEW_WORKER", False)
+
+
 def playwright_android_status() -> dict[str, Any]:
     node_path = shutil.which(node_binary()) or node_binary()
     helper = playwright_android_helper_path()
+    worker_helper = playwright_android_worker_helper_path()
     status: dict[str, Any] = {
         "backend": "playwright-android",
         "node_command": node_binary(),
@@ -19,6 +36,9 @@ def playwright_android_status() -> dict[str, Any]:
         "node_available": shutil.which(node_binary()) is not None or Path(node_binary()).exists(),
         "helper": str(helper),
         "helper_exists": helper.exists(),
+        "worker_enabled": playwright_android_worker_enabled(),
+        "worker_helper": str(worker_helper),
+        "worker_helper_exists": worker_helper.exists(),
         "package_installed": False,
     }
     if not status["node_available"] or not status["helper_exists"]:
@@ -56,7 +76,7 @@ def playwright_android_status() -> dict[str, Any]:
     return status
 
 
-def run_playwright_android_webview(payload: dict[str, Any], timeout: int | float = 10) -> dict[str, Any]:
+def run_playwright_android_webview_once(payload: dict[str, Any], timeout: int | float = 10) -> dict[str, Any]:
     helper = playwright_android_helper_path()
     if not helper.exists():
         raise AndroidUseError(f"Playwright Android helper is missing: {helper}")
@@ -88,17 +108,179 @@ def run_playwright_android_webview(payload: dict[str, Any], timeout: int | float
     return response
 
 
+def stop_playwright_android_webview_worker() -> None:
+    global PLAYWRIGHT_ANDROID_WEBVIEW_WORKER
+    proc = PLAYWRIGHT_ANDROID_WEBVIEW_WORKER
+    PLAYWRIGHT_ANDROID_WEBVIEW_WORKER = None
+    if not proc or proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=2)
+    except OSError:
+        return
+
+
+def start_playwright_android_webview_worker() -> subprocess.Popen[bytes]:
+    global PLAYWRIGHT_ANDROID_WEBVIEW_WORKER
+    proc = PLAYWRIGHT_ANDROID_WEBVIEW_WORKER
+    if proc and proc.poll() is None and proc.stdin and proc.stdout:
+        return proc
+    helper = playwright_android_worker_helper_path()
+    if not helper.exists():
+        raise AndroidUseError(f"Playwright Android worker helper is missing: {helper}")
+    try:
+        proc = subprocess.Popen(
+            [node_binary(), str(helper)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=str(PLUGIN_ROOT),
+            env=tool_env(),
+        )
+    except FileNotFoundError as exc:
+        raise AndroidUseError("Node.js is required for Playwright Android WebView worker support.") from exc
+    PLAYWRIGHT_ANDROID_WEBVIEW_WORKER = proc
+    return proc
+
+
+def run_playwright_android_webview_worker(payload: dict[str, Any], timeout: int | float = 10) -> dict[str, Any]:
+    global PLAYWRIGHT_ANDROID_WEBVIEW_WORKER_REQUEST_ID
+    with PLAYWRIGHT_ANDROID_WEBVIEW_WORKER_LOCK:
+        proc = start_playwright_android_webview_worker()
+        if not proc.stdin or not proc.stdout:
+            stop_playwright_android_webview_worker()
+            raise AndroidUseError("Playwright Android worker stdio is unavailable.")
+        PLAYWRIGHT_ANDROID_WEBVIEW_WORKER_REQUEST_ID += 1
+        request_id = PLAYWRIGHT_ANDROID_WEBVIEW_WORKER_REQUEST_ID
+        request = {**payload, "id": request_id}
+        try:
+            proc.stdin.write(json.dumps(request, ensure_ascii=False).encode("utf-8") + b"\n")
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            stop_playwright_android_webview_worker()
+            raise AndroidUseError("Playwright Android worker stopped before accepting the request.") from exc
+
+        wait_timeout = max(float(timeout), 1.0) + 5
+        ready, _write_ready, _errors = select.select([proc.stdout], [], [], wait_timeout)
+        if not ready:
+            stop_playwright_android_webview_worker()
+            raise AndroidUseError(f"Playwright Android worker timed out after {timeout}s.")
+        line = proc.stdout.readline()
+        if not line:
+            stderr = decode_bytes(proc.stderr.read() if proc.stderr else b"")
+            stop_playwright_android_webview_worker()
+            detail = stderr or f"exit code {proc.poll()}"
+            raise AndroidUseError(f"Playwright Android worker exited without a response: {detail}")
+        stdout = decode_bytes(line)
+        try:
+            response = json.loads(stdout or "{}")
+        except json.JSONDecodeError as exc:
+            stop_playwright_android_webview_worker()
+            raise AndroidUseError(f"Playwright Android worker returned invalid JSON: {stdout[:800]}") from exc
+        if response.get("id") != request_id:
+            stop_playwright_android_webview_worker()
+            raise AndroidUseError(
+                f"Playwright Android worker response id mismatch: expected {request_id}, got {response.get('id')}"
+            )
+        response.pop("id", None)
+        if not response.get("ok"):
+            detail = response.get("error") or stdout
+            raise AndroidUseError(f"Playwright Android worker operation failed: {detail}")
+        return response
+
+
+def run_playwright_android_webview(payload: dict[str, Any], timeout: int | float = 10) -> dict[str, Any]:
+    worker_error: AndroidUseError | None = None
+    if playwright_android_worker_enabled():
+        try:
+            return run_playwright_android_webview_worker(payload, timeout=timeout)
+        except AndroidUseError as exc:
+            worker_error = exc
+    try:
+        return run_playwright_android_webview_once(payload, timeout=timeout)
+    except AndroidUseError as exc:
+        if worker_error:
+            raise AndroidUseError(f"{exc}\nWorker fallback reason: {worker_error}") from exc
+        raise
+
+
+atexit.register(stop_playwright_android_webview_worker)
+
+
+_WEBVIEW_PAGE_CACHE: dict[str, dict[str, Any]] = {}
+
+
+def webview_page_cache_ttl() -> float:
+    ttl = env_float("ANDROID_USE_WEBVIEW_PAGE_CACHE_TTL", 2.0)
+    if ttl <= 0:
+        return 0.0
+    return min(ttl, 30.0)
+
+
+def clone_webview_pages(pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [dict(page) if isinstance(page, dict) else page for page in pages]
+
+
+def clear_webview_page_cache(serial: str | None = None) -> None:
+    if serial is None:
+        _WEBVIEW_PAGE_CACHE.clear()
+    else:
+        _WEBVIEW_PAGE_CACHE.pop(serial, None)
+
+
+def cached_webview_pages(serial: str, ttl: float) -> list[dict[str, Any]] | None:
+    if ttl <= 0:
+        clear_webview_page_cache(serial)
+        return None
+    entry = _WEBVIEW_PAGE_CACHE.get(serial)
+    if not entry:
+        return None
+    expires_at = float(entry.get("expires_at") or 0)
+    if time.monotonic() >= expires_at:
+        clear_webview_page_cache(serial)
+        return None
+    pages = entry.get("pages")
+    return clone_webview_pages(pages) if isinstance(pages, list) else None
+
+
+def remember_webview_pages(serial: str, pages: list[dict[str, Any]], ttl: float) -> None:
+    if ttl <= 0:
+        return
+    _WEBVIEW_PAGE_CACHE[serial] = {
+        "expires_at": time.monotonic() + ttl,
+        "pages": clone_webview_pages(pages),
+    }
+
+
 def playwright_android_webview_pages(serial: str, *, timeout: int | float = 10) -> list[dict[str, Any]]:
-    response = run_playwright_android_webview(
-        {
-            "action": "list",
-            "serial": serial,
-            "timeout_sec": float(timeout),
-        },
-        timeout=timeout,
-    )
+    ttl = webview_page_cache_ttl()
+    cached = cached_webview_pages(serial, ttl)
+    if cached is not None:
+        return cached
+    try:
+        response = run_playwright_android_webview(
+            {
+                "action": "list",
+                "serial": serial,
+                "timeout_sec": float(timeout),
+            },
+            timeout=timeout,
+        )
+    except AndroidUseError:
+        clear_webview_page_cache(serial)
+        raise
     pages = response.get("pages")
-    return pages if isinstance(pages, list) else []
+    result = pages if isinstance(pages, list) else []
+    remember_webview_pages(serial, result, ttl)
+    return clone_webview_pages(result)
+
+
+def clear_webview_page_cache_after_failure(serial: str) -> None:
+    clear_webview_page_cache(serial)
 
 
 def playwright_android_webview_eval(
@@ -347,6 +529,7 @@ def webview_snapshot_fast(serial: str, *, limit: int = 80, timeout: int | float 
                 timeout=deadline,
             )
         except AndroidUseError:
+            clear_webview_page_cache_after_failure(serial)
             continue
         value = response.get("result", {}).get("value") if isinstance(response.get("result"), dict) else None
         if isinstance(value, dict) and value.get("ok"):
@@ -386,6 +569,7 @@ def tap_webview_text_fast(
                 timeout=deadline,
             )
         except AndroidUseError:
+            clear_webview_page_cache_after_failure(serial)
             continue
         value = response.get("result", {}).get("value") if isinstance(response.get("result"), dict) else None
         if isinstance(value, dict) and value.get("ok"):
@@ -504,14 +688,18 @@ def cdp_eval_value(page: dict[str, Any], expression: str, timeout: int | float =
     serial = str(page.get("serial") or configured_serial() or "")
     if not serial:
         raise AndroidUseError("WebView page does not include a serial.")
-    result = playwright_android_webview_eval(
-        serial,
-        expression,
-        url_contains=str(page.get("url") or "") or None,
-        title_contains=str(page.get("title") or "") or None,
-        package=str(page.get("pkg") or page.get("package") or "") or None,
-        socket_name=str(page.get("socket") or page.get("socketName") or "") or None,
-        timeout=timeout,
-    )
+    try:
+        result = playwright_android_webview_eval(
+            serial,
+            expression,
+            url_contains=str(page.get("url") or "") or None,
+            title_contains=str(page.get("title") or "") or None,
+            package=str(page.get("pkg") or page.get("package") or "") or None,
+            socket_name=str(page.get("socket") or page.get("socketName") or "") or None,
+            timeout=timeout,
+        )
+    except AndroidUseError:
+        clear_webview_page_cache_after_failure(serial)
+        raise
     remote = result.get("result") if isinstance(result.get("result"), dict) else {}
     return remote.get("value")

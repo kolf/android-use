@@ -50,6 +50,7 @@ SOURCE_MAP_DIR = ANDROID_USE_DIR / "app-maps"
 SCREEN_DIR = PLUGIN_ROOT / ".screen"
 VIDEO_RECORDINGS_DIR = SCREEN_DIR / "video-recordings"
 OPENAI_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_CDP_SESSION_IDLE_TTL_SEC = 30.0
 
 SCRCPY_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
 SCRCPY_LOCK_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
@@ -58,6 +59,8 @@ SCREEN_VIEWER_SESSIONS: dict[str, dict[str, Any]] = {}
 ACTIVE_RECORDINGS: dict[str, dict[str, Any]] = {}
 SCRCPY_VIDEO_RECORDING_PROCESSES: dict[str, subprocess.Popen[bytes]] = {}
 SCRCPY_VIDEO_RECORDINGS: dict[str, dict[str, Any]] = {}
+CDP_SESSION_CACHE: dict[str, "CDPSession"] = {}
+CDP_SESSION_CACHE_LOCK = threading.Lock()
 SCRCPY_RESIDENT_THREAD: threading.Thread | None = None
 SCRCPY_RESIDENT_LOCK = threading.Lock()
 SCRCPY_RESIDENT_LOCK_HANDLE: Any | None = None
@@ -870,6 +873,17 @@ def websocket_connect(ws_url: str, timeout: int | float = 10) -> socket.socket:
     return sock
 
 
+def websocket_close(sock: socket.socket) -> None:
+    try:
+        sock.sendall(websocket_frame(0x8, b""))
+    except Exception:
+        pass
+    try:
+        sock.close()
+    except Exception:
+        pass
+
+
 def cdp_call(ws_url: str, method: str, params: dict[str, Any] | None = None, timeout: int | float = 10) -> dict[str, Any]:
     sock = websocket_connect(ws_url, timeout=timeout)
     request_id = 1
@@ -887,11 +901,147 @@ def cdp_call(ws_url: str, method: str, params: dict[str, Any] | None = None, tim
             result = message.get("result")
             return result if isinstance(result, dict) else {}
     finally:
+        websocket_close(sock)
+
+
+class CDPSession:
+    def __init__(self, ws_url: str, *, timeout: int | float = 10) -> None:
+        self.ws_url = ws_url
+        self.sock = websocket_connect(ws_url, timeout=timeout)
+        self.next_request_id = 1
+        self.last_used_at = time.time()
+        self.closed = False
+        self.lock = threading.Lock()
+
+    def close(self) -> None:
+        with self.lock:
+            if self.closed:
+                return
+            self.closed = True
+            websocket_close(self.sock)
+
+    def call(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        *,
+        timeout: int | float = 10,
+    ) -> dict[str, Any]:
+        with self.lock:
+            if self.closed:
+                raise AndroidUseError(f"CDP session is closed: {self.ws_url}")
+            try:
+                self.sock.settimeout(timeout)
+            except Exception:
+                pass
+            request_id = self.next_request_id
+            self.next_request_id += 1
+            websocket_send_text(self.sock, json.dumps({"id": request_id, "method": method, "params": params or {}}))
+            deadline = time.time() + float(timeout)
+            while True:
+                if time.time() > deadline:
+                    raise AndroidUseError(f"Timed out waiting for CDP response: {method}")
+                message = json.loads(websocket_recv_text(self.sock))
+                if message.get("id") != request_id:
+                    continue
+                if message.get("error"):
+                    raise AndroidUseError(f"CDP {method} failed: {message['error']}")
+                result = message.get("result")
+                self.last_used_at = time.time()
+                return result if isinstance(result, dict) else {}
+
+
+def cdp_session_idle_ttl(cache_idle_ttl_sec: int | float | None = None) -> float:
+    if cache_idle_ttl_sec is not None:
         try:
-            sock.sendall(websocket_frame(0x8, b""))
+            return max(0.0, float(cache_idle_ttl_sec))
+        except (TypeError, ValueError):
+            return DEFAULT_CDP_SESSION_IDLE_TTL_SEC
+    raw = os.environ.get("ANDROID_USE_CDP_SESSION_IDLE_TTL_SEC")
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            return DEFAULT_CDP_SESSION_IDLE_TTL_SEC
+    return DEFAULT_CDP_SESSION_IDLE_TTL_SEC
+
+
+def close_cdp_sessions(ws_url: str | None = None) -> int:
+    with CDP_SESSION_CACHE_LOCK:
+        if ws_url is None:
+            sessions = list(CDP_SESSION_CACHE.values())
+            CDP_SESSION_CACHE.clear()
+        else:
+            session = CDP_SESSION_CACHE.pop(ws_url, None)
+            sessions = [session] if session else []
+    for session in sessions:
+        session.close()
+    return len(sessions)
+
+
+def cached_cdp_session(
+    ws_url: str,
+    *,
+    timeout: int | float = 10,
+    cache_idle_ttl_sec: int | float | None = None,
+) -> CDPSession:
+    ttl = cdp_session_idle_ttl(cache_idle_ttl_sec)
+    now = time.time()
+    stale_session: CDPSession | None = None
+    with CDP_SESSION_CACHE_LOCK:
+        session = CDP_SESSION_CACHE.get(ws_url)
+        if session and (session.closed or now - session.last_used_at > ttl):
+            stale_session = CDP_SESSION_CACHE.pop(ws_url)
+            session = None
+        if session:
+            return session
+    if stale_session:
+        stale_session.close()
+    session = CDPSession(ws_url, timeout=timeout)
+    with CDP_SESSION_CACHE_LOCK:
+        existing = CDP_SESSION_CACHE.get(ws_url)
+        if existing and not existing.closed and time.time() - existing.last_used_at <= ttl:
+            session.close()
+            return existing
+        if existing:
+            existing.close()
+        CDP_SESSION_CACHE[ws_url] = session
+        return session
+
+
+def invalidate_cdp_session(ws_url: str, session: CDPSession | None = None) -> None:
+    with CDP_SESSION_CACHE_LOCK:
+        cached = CDP_SESSION_CACHE.get(ws_url)
+        if cached is None:
+            cached = session
+        elif session is None or cached is session:
+            CDP_SESSION_CACHE.pop(ws_url, None)
+        else:
+            cached = session
+    if cached:
+        cached.close()
+
+
+def cdp_session_call(
+    ws_url: str,
+    method: str,
+    params: dict[str, Any] | None = None,
+    *,
+    timeout: int | float = 10,
+    cache_idle_ttl_sec: int | float | None = None,
+    reconnect_once: bool = True,
+) -> dict[str, Any]:
+    attempts = 2 if reconnect_once else 1
+    for attempt in range(attempts):
+        session: CDPSession | None = None
+        try:
+            session = cached_cdp_session(ws_url, timeout=timeout, cache_idle_ttl_sec=cache_idle_ttl_sec)
+            return session.call(method, params, timeout=timeout)
         except Exception:
-            pass
-        sock.close()
+            invalidate_cdp_session(ws_url, session)
+            if attempt + 1 >= attempts:
+                raise
+    raise AndroidUseError(f"CDP {method} failed after reconnect: {ws_url}")
 
 
 def cdp_runtime_evaluate(
@@ -901,18 +1051,27 @@ def cdp_runtime_evaluate(
     await_promise: bool = True,
     return_by_value: bool = True,
     timeout: int | float = 10,
+    use_session_cache: bool = True,
+    cache_idle_ttl_sec: int | float | None = None,
+    reconnect_once: bool = True,
 ) -> dict[str, Any]:
-    result = cdp_call(
-        ws_url,
-        "Runtime.evaluate",
-        {
-            "expression": expression,
-            "awaitPromise": await_promise,
-            "returnByValue": return_by_value,
-            "userGesture": True,
-        },
-        timeout=timeout,
-    )
+    params = {
+        "expression": expression,
+        "awaitPromise": await_promise,
+        "returnByValue": return_by_value,
+        "userGesture": True,
+    }
+    if use_session_cache:
+        result = cdp_session_call(
+            ws_url,
+            "Runtime.evaluate",
+            params,
+            timeout=timeout,
+            cache_idle_ttl_sec=cache_idle_ttl_sec,
+            reconnect_once=reconnect_once,
+        )
+    else:
+        result = cdp_call(ws_url, "Runtime.evaluate", params, timeout=timeout)
     if result.get("exceptionDetails"):
         raise AndroidUseError(f"Runtime.evaluate exception: {json.dumps(result['exceptionDetails'], ensure_ascii=False)[:1200]}")
     remote = result.get("result")
