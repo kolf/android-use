@@ -22,7 +22,7 @@ def playwright_android_worker_helper_path() -> Path:
 
 
 def playwright_android_worker_enabled() -> bool:
-    return env_flag("ANDROID_USE_PLAYWRIGHT_WEBVIEW_WORKER", False)
+    return env_flag("ANDROID_USE_PLAYWRIGHT_WEBVIEW_WORKER", True)
 
 
 def playwright_android_status() -> dict[str, Any]:
@@ -122,6 +122,11 @@ def stop_playwright_android_webview_worker() -> None:
         proc.wait(timeout=2)
     except OSError:
         return
+
+
+def playwright_android_webview_worker_running() -> bool:
+    proc = PLAYWRIGHT_ANDROID_WEBVIEW_WORKER
+    return bool(proc and proc.poll() is None and proc.stdin and proc.stdout)
 
 
 def start_playwright_android_webview_worker() -> subprocess.Popen[bytes]:
@@ -232,6 +237,18 @@ def clear_webview_page_cache(serial: str | None = None) -> None:
         _WEBVIEW_PAGE_CACHE.pop(serial, None)
 
 
+def webview_page_cache_count(serial: str | None = None) -> int:
+    if serial is None:
+        return sum(
+            len(entry.get("pages"))
+            for entry in _WEBVIEW_PAGE_CACHE.values()
+            if isinstance(entry.get("pages"), list)
+        )
+    entry = _WEBVIEW_PAGE_CACHE.get(serial)
+    pages = entry.get("pages") if isinstance(entry, dict) else None
+    return len(pages) if isinstance(pages, list) else 0
+
+
 def cached_webview_pages(serial: str, ttl: float) -> list[dict[str, Any]] | None:
     if ttl <= 0:
         clear_webview_page_cache(serial)
@@ -283,6 +300,69 @@ def clear_webview_page_cache_after_failure(serial: str) -> None:
     clear_webview_page_cache(serial)
 
 
+def playwright_android_webview_runtime_status(serial: str | None = None) -> dict[str, Any]:
+    status = playwright_android_status()
+    proc = PLAYWRIGHT_ANDROID_WEBVIEW_WORKER
+    worker_running = playwright_android_webview_worker_running()
+    status.update(
+        {
+            "worker_running": worker_running,
+            "worker_pid": proc.pid if worker_running and proc else None,
+            "page_cache_ttl_sec": webview_page_cache_ttl(),
+            "python_cached_pages": webview_page_cache_count(serial),
+        }
+    )
+    if worker_running:
+        try:
+            worker_status = run_playwright_android_webview_worker(
+                {"action": "status", "serial": serial},
+                timeout=3,
+            )
+            worker_status.pop("ok", None)
+            status["worker_status"] = worker_status
+        except AndroidUseError as exc:
+            status["worker_status_error"] = str(exc)
+    return status
+
+
+def clear_playwright_android_webview_runtime(serial: str | None = None) -> dict[str, Any]:
+    clear_webview_page_cache(serial)
+    payload: dict[str, Any] = {
+        "ok": True,
+        "action": "clear",
+        "serial": serial,
+        "python_cached_pages": webview_page_cache_count(serial),
+        "worker_running": playwright_android_webview_worker_running(),
+    }
+    if payload["worker_running"]:
+        try:
+            worker_result = run_playwright_android_webview_worker(
+                {"action": "clear", "serial": serial},
+                timeout=3,
+            )
+            worker_result.pop("ok", None)
+            payload["worker_result"] = worker_result
+        except AndroidUseError as exc:
+            payload["worker_error"] = str(exc)
+    return payload
+
+
+def close_playwright_android_webview_runtime() -> dict[str, Any]:
+    clear_webview_page_cache()
+    worker_running = playwright_android_webview_worker_running()
+    payload: dict[str, Any] = {"ok": True, "action": "close", "worker_running": worker_running}
+    if worker_running:
+        try:
+            worker_result = run_playwright_android_webview_worker({"action": "close"}, timeout=3)
+            worker_result.pop("ok", None)
+            payload["worker_result"] = worker_result
+        except AndroidUseError as exc:
+            payload["worker_error"] = str(exc)
+    stop_playwright_android_webview_worker()
+    payload["worker_running_after"] = playwright_android_webview_worker_running()
+    return payload
+
+
 def playwright_android_webview_eval(
     serial: str,
     expression: str,
@@ -308,6 +388,35 @@ def playwright_android_webview_eval(
             "expression": expression,
             "await_promise": await_promise,
             "return_by_value": return_by_value,
+            "timeout_sec": float(timeout),
+        },
+        timeout=timeout,
+    )
+
+
+def playwright_android_webview_cdp(
+    serial: str,
+    method: str,
+    *,
+    params: dict[str, Any] | None = None,
+    page_id: str | None = None,
+    url_contains: str | None = None,
+    title_contains: str | None = None,
+    package: str | None = None,
+    socket_name: str | None = None,
+    timeout: int | float = 10,
+) -> dict[str, Any]:
+    return run_playwright_android_webview(
+        {
+            "action": "cdp",
+            "serial": serial,
+            "page_id": page_id,
+            "url_contains": url_contains,
+            "title_contains": title_contains,
+            "package": package,
+            "socket_name": socket_name,
+            "method": method,
+            "params": params or {},
             "timeout_sec": float(timeout),
         },
         timeout=timeout,

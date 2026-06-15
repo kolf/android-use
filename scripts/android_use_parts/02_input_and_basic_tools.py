@@ -380,6 +380,25 @@ def text_content(payload: Any) -> dict[str, str]:
     return {"type": "text", "text": text}
 
 
+def truncate_webview_eval_result(value: Any, max_chars: int) -> Any:
+    if max_chars <= 0:
+        return value
+    if isinstance(value, str):
+        if len(value) <= max_chars:
+            return value
+        return {
+            "text": value[:max_chars],
+            "truncated": True,
+            "original_length": len(value),
+            "max_chars": max_chars,
+        }
+    if isinstance(value, list):
+        return [truncate_webview_eval_result(item, max_chars) for item in value]
+    if isinstance(value, dict):
+        return {key: truncate_webview_eval_result(item, max_chars) for key, item in value.items()}
+    return value
+
+
 def image_content(png: bytes) -> dict[str, str]:
     return {
         "type": "image",
@@ -896,9 +915,26 @@ def tool_webview_pages(args: dict[str, Any]) -> list[dict[str, Any]]:
     return [text_content({"ok": True, "serial": serial, "backend": "playwright-android", "pages": pages})]
 
 
+def tool_webview_runtime(args: dict[str, Any]) -> list[dict[str, Any]]:
+    action = str(args.get("action", "status")).strip().lower()
+    serial = choose_serial(args.get("serial")) if args.get("serial") else None
+    if action == "status":
+        payload = playwright_android_webview_runtime_status(serial)
+    elif action == "clear":
+        payload = clear_playwright_android_webview_runtime(serial)
+    elif action == "close":
+        payload = close_playwright_android_webview_runtime()
+    else:
+        raise AndroidUseError("action must be one of: status, clear, close.")
+    payload.setdefault("ok", True)
+    payload["action"] = action
+    return [text_content(payload)]
+
+
 def tool_webview_eval(args: dict[str, Any]) -> list[dict[str, Any]]:
     serial = choose_serial(args.get("serial"))
     timeout = min(float(args.get("timeout_sec", 10)), 60)
+    max_result_chars = int(args.get("max_result_chars", 500))
     result = playwright_android_webview_eval(
         serial,
         str(args["expression"]),
@@ -911,6 +947,7 @@ def tool_webview_eval(args: dict[str, Any]) -> list[dict[str, Any]]:
         return_by_value=bool(args.get("return_by_value", True)),
         timeout=timeout,
     )
+    eval_result = truncate_webview_eval_result(result.get("result"), max_result_chars)
     return [
         text_content(
             {
@@ -918,7 +955,46 @@ def tool_webview_eval(args: dict[str, Any]) -> list[dict[str, Any]]:
                 "serial": serial,
                 "backend": result.get("backend", "playwright-android"),
                 "page": result.get("page"),
-                "result": result.get("result"),
+                "result": eval_result,
+                "max_result_chars": max_result_chars,
+            }
+        )
+    ]
+
+
+def tool_webview_cdp(args: dict[str, Any]) -> list[dict[str, Any]]:
+    serial = choose_serial(args.get("serial"))
+    timeout = min(float(args.get("timeout_sec", 10)), 60)
+    max_result_chars = int(args.get("max_result_chars", 500))
+    params = args.get("params") or {}
+    if not isinstance(params, dict):
+        raise AndroidUseError("params must be an object when provided.")
+    result = playwright_android_webview_cdp(
+        serial,
+        str(args["method"]),
+        params=params,
+        page_id=str(args.get("page_id") or "") or None,
+        url_contains=str(args.get("url_contains") or "") or None,
+        title_contains=str(args.get("title_contains") or "") or None,
+        package=str(args.get("package") or "") or None,
+        socket_name=str(args.get("socket_name") or "") or None,
+        timeout=timeout,
+    )
+    cdp_result = result.get("cdp")
+    if isinstance(cdp_result, dict):
+        cdp_result = {
+            **cdp_result,
+            "result": truncate_webview_eval_result(cdp_result.get("result"), max_result_chars),
+        }
+    return [
+        text_content(
+            {
+                "ok": True,
+                "serial": serial,
+                "backend": result.get("backend", "playwright-android"),
+                "page": result.get("page"),
+                "cdp": cdp_result,
+                "max_result_chars": max_result_chars,
             }
         )
     ]

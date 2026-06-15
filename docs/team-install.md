@@ -178,6 +178,12 @@ cd ~/plugins/android-use-plugins
 
 可调试 WebView 能被 Playwright Android 发现时，插件默认优先走 WebView DOM：`android_observe` 先取 DOM 快照，`android_tap_text` 先做 DOM 点击，`android_type_text` 先直接给当前输入框赋值。找不到可用 WebView 或 DOM 元素时，再回退到 UIAutomator、输入法或 adb。
 
+WebView 调试默认走常驻 Playwright worker，同一个 MCP server 生命周期内会尽量复用设备、页面和 CDP session，不需要额外安装或启动 CDP MCP。需要检查或清理 worker 状态时使用 `android_webview_runtime`；只有排查 one-shot 兼容路径时才需要关闭：
+
+```bash
+ANDROID_USE_PLAYWRIGHT_WEBVIEW_WORKER=0
+```
+
 插件会自动选择更快的输入方式：
 
 - 可调试 WebView 页面：优先通过 Playwright Android 直接给当前输入框赋值，不走键盘输入，适合混合 App、表单页和富文本输入框；

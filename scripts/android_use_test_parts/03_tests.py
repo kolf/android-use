@@ -210,20 +210,33 @@ class AndroidUseMcpTestsPart3(unittest.TestCase):
         self.assertIn("android_list_devices", tool_names)
         self.assertIn("android_open_url", tool_names)
         self.assertIn("android_webview_pages", tool_names)
+        self.assertIn("android_webview_runtime", tool_names)
         self.assertIn("android_webview_eval", tool_names)
+        self.assertIn("android_webview_cdp", tool_names)
         self.assertIn("android_start_recording", tool_names)
         self.assertIn("android_replay_recipe", tool_names)
         self.assertIn("android_start_screen_viewer", tool_names)
         self.assertIn("android_start_video_recording", tool_names)
         self.assertIn("android_wireless_pair_qr", tool_names)
 
-    def test_playwright_webview_worker_disabled_uses_one_shot(self) -> None:
+    def test_playwright_webview_worker_enabled_by_default(self) -> None:
+        original_env = mcp.os.environ.get("ANDROID_USE_PLAYWRIGHT_WEBVIEW_WORKER")
+        try:
+            mcp.os.environ.pop("ANDROID_USE_PLAYWRIGHT_WEBVIEW_WORKER", None)
+            self.assertTrue(mcp.playwright_android_worker_enabled())
+        finally:
+            if original_env is None:
+                mcp.os.environ.pop("ANDROID_USE_PLAYWRIGHT_WEBVIEW_WORKER", None)
+            else:
+                mcp.os.environ["ANDROID_USE_PLAYWRIGHT_WEBVIEW_WORKER"] = original_env
+
+    def test_playwright_webview_worker_explicitly_disabled_uses_one_shot(self) -> None:
         original_env = mcp.os.environ.get("ANDROID_USE_PLAYWRIGHT_WEBVIEW_WORKER")
         original_worker = mcp.run_playwright_android_webview_worker
         original_once = mcp.run_playwright_android_webview_once
         calls: list[str] = []
         try:
-            mcp.os.environ.pop("ANDROID_USE_PLAYWRIGHT_WEBVIEW_WORKER", None)
+            mcp.os.environ["ANDROID_USE_PLAYWRIGHT_WEBVIEW_WORKER"] = "0"
             mcp.run_playwright_android_webview_worker = lambda *args, **kwargs: self.fail("worker should be disabled")
 
             def fake_once(payload: dict[str, object], timeout: float = 10) -> dict[str, object]:
@@ -323,6 +336,55 @@ class AndroidUseMcpTestsPart3(unittest.TestCase):
         self.assertEqual(payload["backend"], "playwright-android")
         self.assertEqual(payload["pages"][0]["pkg"], "com.example")
         self.assertEqual(calls, [("device-1", 4.0)])
+
+    def test_webview_runtime_status_uses_optional_serial(self) -> None:
+        original_choose = mcp.choose_serial
+        original_status = mcp.playwright_android_webview_runtime_status
+        captured: list[str | None] = []
+        try:
+            mcp.choose_serial = lambda serial=None: str(serial or "device-1")
+
+            def fake_status(serial: str | None = None) -> dict[str, object]:
+                captured.append(serial)
+                return {
+                    "ok": True,
+                    "backend": "playwright-android",
+                    "worker_enabled": True,
+                    "worker_running": False,
+                }
+
+            mcp.playwright_android_webview_runtime_status = fake_status  # type: ignore[assignment]
+            content = mcp.tool_webview_runtime({"action": "status", "serial": "device-1"})
+        finally:
+            mcp.choose_serial = original_choose
+            mcp.playwright_android_webview_runtime_status = original_status  # type: ignore[assignment]
+
+        payload = json.loads(content[0]["text"])
+        self.assertTrue(payload["worker_enabled"])
+        self.assertEqual(payload["action"], "status")
+        self.assertEqual(captured, ["device-1"])
+
+    def test_webview_runtime_clear_without_serial_does_not_choose_device(self) -> None:
+        original_choose = mcp.choose_serial
+        original_clear = mcp.clear_playwright_android_webview_runtime
+        captured: list[str | None] = []
+        try:
+            mcp.choose_serial = lambda serial=None: self.fail("serial should be optional for global clear")
+
+            def fake_clear(serial: str | None = None) -> dict[str, object]:
+                captured.append(serial)
+                return {"ok": True, "cleared": True, "worker_running": False}
+
+            mcp.clear_playwright_android_webview_runtime = fake_clear  # type: ignore[assignment]
+            content = mcp.tool_webview_runtime({"action": "clear"})
+        finally:
+            mcp.choose_serial = original_choose
+            mcp.clear_playwright_android_webview_runtime = original_clear  # type: ignore[assignment]
+
+        payload = json.loads(content[0]["text"])
+        self.assertTrue(payload["cleared"])
+        self.assertEqual(payload["action"], "clear")
+        self.assertEqual(captured, [None])
 
     def test_webview_pages_reuses_recent_cache_until_ttl(self) -> None:
         original_run = mcp.run_playwright_android_webview
@@ -502,6 +564,94 @@ class AndroidUseMcpTestsPart3(unittest.TestCase):
         self.assertEqual(captured["serial"], "device-1")
         self.assertEqual(captured["package"], "com.example")
         self.assertEqual(captured["expression"], "21 * 2")
+
+    def test_webview_cdp_uses_playwright_android(self) -> None:
+        original_choose = mcp.choose_serial
+        original_cdp = mcp.playwright_android_webview_cdp
+        captured: dict[str, object] = {}
+        try:
+            mcp.choose_serial = lambda serial=None: str(serial or "device-1")
+
+            def fake_cdp(serial: str, method: str, **kwargs: object) -> dict[str, object]:
+                captured.update({"serial": serial, "method": method, **kwargs})
+                return {
+                    "backend": "playwright-android",
+                    "page": {"id": "com.example:123", "url": "https://example.test"},
+                    "cdp": {"method": method, "result": {"value": "x" * 600}},
+                }
+
+            mcp.playwright_android_webview_cdp = fake_cdp  # type: ignore[assignment]
+            content = mcp.tool_webview_cdp(
+                {
+                    "serial": "device-1",
+                    "package": "com.example",
+                    "method": "Runtime.evaluate",
+                    "params": {"expression": "location.href"},
+                    "timeout_sec": 3,
+                }
+            )
+        finally:
+            mcp.choose_serial = original_choose
+            mcp.playwright_android_webview_cdp = original_cdp  # type: ignore[assignment]
+
+        payload = json.loads(content[0]["text"])
+        self.assertEqual(payload["backend"], "playwright-android")
+        self.assertEqual(payload["cdp"]["method"], "Runtime.evaluate")
+        self.assertTrue(payload["cdp"]["result"]["value"]["truncated"])
+        self.assertEqual(captured["serial"], "device-1")
+        self.assertEqual(captured["package"], "com.example")
+        self.assertEqual(captured["params"], {"expression": "location.href"})
+
+    def test_webview_eval_truncates_large_string_results_by_default(self) -> None:
+        original_choose = mcp.choose_serial
+        original_eval = mcp.playwright_android_webview_eval
+        try:
+            mcp.choose_serial = lambda serial=None: str(serial or "device-1")
+
+            def fake_eval(serial: str, expression: str, **kwargs: object) -> dict[str, object]:
+                return {
+                    "backend": "playwright-android",
+                    "page": {"id": "com.example:123", "url": "https://example.test"},
+                    "result": {"type": "string", "value": "x" * 600},
+                }
+
+            mcp.playwright_android_webview_eval = fake_eval  # type: ignore[assignment]
+            content = mcp.tool_webview_eval({"serial": "device-1", "expression": "document.body.innerText"})
+        finally:
+            mcp.choose_serial = original_choose
+            mcp.playwright_android_webview_eval = original_eval  # type: ignore[assignment]
+
+        payload = json.loads(content[0]["text"])
+        value = payload["result"]["value"]
+        self.assertTrue(value["truncated"])
+        self.assertEqual(len(value["text"]), 500)
+        self.assertEqual(value["original_length"], 600)
+        self.assertEqual(payload["max_result_chars"], 500)
+
+    def test_webview_eval_allows_disabling_result_truncation(self) -> None:
+        original_choose = mcp.choose_serial
+        original_eval = mcp.playwright_android_webview_eval
+        try:
+            mcp.choose_serial = lambda serial=None: str(serial or "device-1")
+
+            def fake_eval(serial: str, expression: str, **kwargs: object) -> dict[str, object]:
+                return {
+                    "backend": "playwright-android",
+                    "page": {"id": "com.example:123", "url": "https://example.test"},
+                    "result": {"type": "string", "value": "x" * 600},
+                }
+
+            mcp.playwright_android_webview_eval = fake_eval  # type: ignore[assignment]
+            content = mcp.tool_webview_eval(
+                {"serial": "device-1", "expression": "document.body.innerText", "max_result_chars": 0}
+            )
+        finally:
+            mcp.choose_serial = original_choose
+            mcp.playwright_android_webview_eval = original_eval  # type: ignore[assignment]
+
+        payload = json.loads(content[0]["text"])
+        self.assertEqual(payload["result"]["value"], "x" * 600)
+        self.assertEqual(payload["max_result_chars"], 0)
 
     def test_observe_prefers_webview_snapshot(self) -> None:
         original_choose = mcp.choose_serial

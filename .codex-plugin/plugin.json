@@ -5,7 +5,7 @@
   "icon": "./assets/android.png",
   "composerIcon": "./assets/android.png",
   "logo": "./assets/android.png",
-  "description": "在 Codex 中通过 adb、Playwright Android、截图、WebView 和可选视觉模型控制已连接的 Android 设备。",
+  "description": "在 Codex 中通过 adb、Playwright Android、截图、WebView、真机复现和可选视觉模型控制已连接的 Android 设备。",
   "author": {
     "name": "Android Use Maintainers"
   },
@@ -25,7 +25,7 @@
   "interface": {
     "displayName": "Android",
     "shortDescription": "在 Codex 中控制 Android 设备",
-    "longDescription": "Android Use 让 Codex 通过 adb、Playwright Android、截图、输入事件、scrcpy 和可选 OpenAI-compatible 视觉模型操作已连接的 Android 手机、平板或模拟器。插件不包含任何特定业务 App 快路径。",
+    "longDescription": "Android Use 让 Codex 通过 adb、Playwright Android、截图、输入事件、scrcpy 和可选 OpenAI-compatible 视觉模型操作已连接的 Android 手机、平板或模拟器，并支持真机问题复现、日志采集和性能证据分析。插件不包含任何特定业务 App 快路径。",
     "developerName": "Android Use Maintainers",
     "category": "Developer Tools",
     "capabilities": [
@@ -34,6 +34,8 @@
       "scrcpy 镜像",
       "截图观察",
       "Playwright Android WebView",
+      "真机问题复现",
+      "性能证据采集",
       "视觉模型动作规划"
     ],
     "websiteURL": "",
@@ -42,6 +44,8 @@
     "defaultPrompt": [
       "显示已连接 Android 设备状态",
       "截图并判断下一步操作",
+      "在真机上复现这个 Android 问题并采集日志",
+      "在真机上分析这个 Android 流程的性能",
       "为我的手机打开 scrcpy 窗口"
     ],
     "brandColor": "#16A34A",

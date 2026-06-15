@@ -166,6 +166,15 @@ async function selectWebView(device, input) {
   return candidates[0];
 }
 
+async function cdpSessionFor(page, input) {
+  const timeoutMs = Math.max(100, Number(input.timeout_sec || 10) * 1000);
+  const context = typeof page.context === "function" ? page.context() : null;
+  if (!context || typeof context.newCDPSession !== "function") {
+    throw new Error("Playwright CDP sessions are not available for this Android WebView page.");
+  }
+  return await withTimeout(context.newCDPSession(page), timeoutMs, "context.newCDPSession()");
+}
+
 async function run() {
   const input = JSON.parse(await readStdin() || "{}");
   const { android, packageName } = loadPlaywrightAndroid();
@@ -198,6 +207,30 @@ async function run() {
         result: {
           type: valueType(value),
           value,
+        },
+      };
+    }
+    if (input.action === "cdp") {
+      const selected = await selectWebView(device, input);
+      const method = String(input.method || "").trim();
+      if (!method) {
+        throw new Error("CDP method must not be empty.");
+      }
+      const params = input.params && typeof input.params === "object" && !Array.isArray(input.params)
+        ? input.params
+        : {};
+      const session = await cdpSessionFor(selected.page, input);
+      const timeoutMs = Math.max(100, Number(input.timeout_sec || 10) * 1000);
+      const result = await withTimeout(session.send(method, params), timeoutMs, `CDP ${method}`);
+      return {
+        ok: true,
+        backend: "playwright-android",
+        package: packageName,
+        serial: serialOf(device),
+        page: selected.item,
+        cdp: {
+          method,
+          result,
         },
       };
     }

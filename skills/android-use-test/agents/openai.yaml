@@ -1,0 +1,13 @@
+interface:
+  display_name: "Android Use: Test"
+  short_description: "在真机上复现 Android 问题并采集截图、UI、日志和录屏证据"
+  default_prompt: "Use $android-use-test to reproduce an Android app issue on a physical device and collect focused evidence."
+
+dependencies:
+  tools:
+    - type: "cli"
+      value: "adb"
+      description: "Android Debug Bridge for device/app control and log capture"
+    - type: "cli"
+      value: "python3"
+      description: "Run bundled UI tree helper scripts when using adb fallback"

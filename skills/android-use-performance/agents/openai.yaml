@@ -1,0 +1,13 @@
+interface:
+  display_name: "Android Use: Performance"
+  short_description: "在真机上采集 Android CPU、帧率、启动、内存和泄漏性能证据"
+  default_prompt: "Use $android-use-performance to profile a focused Android app flow on a physical device and summarize CPU, frame, memory, or trace evidence."
+
+dependencies:
+  tools:
+    - type: "cli"
+      value: "adb"
+      description: "Android Debug Bridge for device control and trace capture"
+    - type: "cli"
+      value: "python3"
+      description: "Run local helper scripts when needed"

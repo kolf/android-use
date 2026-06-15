@@ -100,6 +100,7 @@ class AndroidWebViewWorker {
     this.packageName = null;
     this.deviceCache = new Map();
     this.pageCache = new Map();
+    this.cdpSessionCache = new WeakMap();
   }
 
   load() {
@@ -114,6 +115,7 @@ class AndroidWebViewWorker {
     const devices = [...this.deviceCache.values()];
     this.deviceCache.clear();
     this.pageCache.clear();
+    this.cdpSessionCache = new WeakMap();
     for (const device of devices) {
       if (device && typeof device.close === "function") {
         await device.close().catch(() => {});
@@ -128,6 +130,7 @@ class AndroidWebViewWorker {
       device.close().catch(() => {});
     }
     this.deviceCache.delete(serial);
+    this.cdpSessionCache = new WeakMap();
     for (const key of [...this.pageCache.keys()]) {
       if (key.startsWith(`${serial}|`)) {
         this.pageCache.delete(key);
@@ -193,7 +196,7 @@ class AndroidWebViewWorker {
     const records = [];
     const seen = new Set();
     for (const record of this.pageCache.values()) {
-      if (record.serial !== serial) continue;
+      if (serial && record.serial !== serial) continue;
       const key = `${record.item.id}|${record.item.pid}|${record.item.pkg}`;
       if (seen.has(key)) continue;
       seen.add(key);
@@ -286,6 +289,22 @@ class AndroidWebViewWorker {
     throw new Error("No matching Android WebView was found through Playwright Android.");
   }
 
+  async cdpSessionFor(page, input) {
+    const cached = this.cdpSessionCache.get(page);
+    if (cached) return cached;
+    const context = typeof page.context === "function" ? page.context() : null;
+    if (!context || typeof context.newCDPSession !== "function") {
+      throw new Error("Playwright CDP sessions are not available for this Android WebView page.");
+    }
+    const session = await withTimeout(
+      context.newCDPSession(page),
+      timeoutMs(input),
+      "context.newCDPSession()",
+    );
+    this.cdpSessionCache.set(page, session);
+    return session;
+  }
+
   async dispatch(input, forceRefresh) {
     if (input.action === "status") {
       return {
@@ -294,13 +313,28 @@ class AndroidWebViewWorker {
         worker: true,
         cached_devices: this.deviceCache.size,
         cached_pages: this.cachedRecords(String(input.serial || "")).length,
+        cached_pages_total: this.cachedRecords("").length,
+      };
+    }
+    if (input.action === "clear") {
+      if (input.serial) {
+        this.clearSerial(String(input.serial));
+      } else {
+        await this.close();
+      }
+      return {
+        ok: true,
+        backend: "playwright-android",
+        worker: true,
+        cleared: true,
+        serial: input.serial || null,
       };
     }
     if (input.action === "close") {
       await this.close();
       return { ok: true, backend: "playwright-android", worker: true, closed: true };
     }
-    if (!["list", "eval"].includes(input.action)) {
+    if (!["list", "eval", "cdp"].includes(input.action)) {
       throw new Error(`Unsupported action: ${input.action}`);
     }
 
@@ -322,6 +356,30 @@ class AndroidWebViewWorker {
     }
 
     const selected = await this.selectWebView(device, serial, input);
+    if (input.action === "cdp") {
+      const method = String(input.method || "").trim();
+      if (!method) {
+        throw new Error("CDP method must not be empty.");
+      }
+      const params = input.params && typeof input.params === "object" && !Array.isArray(input.params)
+        ? input.params
+        : {};
+      const session = await this.cdpSessionFor(selected.page, input);
+      const result = await withTimeout(session.send(method, params), timeoutMs(input), `CDP ${method}`);
+      return {
+        ok: true,
+        backend: "playwright-android",
+        worker: true,
+        package: this.packageName,
+        serial,
+        page: selected.item,
+        cdp: {
+          method,
+          result,
+        },
+      };
+    }
+
     const expression = String(input.expression || "");
     const value = await withTimeout(
       selected.page.evaluate(
@@ -353,7 +411,7 @@ class AndroidWebViewWorker {
       return await this.dispatch(input, false);
     } catch (error) {
       const serial = String(input.serial || "");
-      if (["list", "eval"].includes(input.action)) {
+      if (["list", "eval", "cdp"].includes(input.action)) {
         this.clearSerial(serial);
         try {
           return await this.dispatch(input, true);

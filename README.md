@@ -302,6 +302,12 @@ ANDROID_USE_OPENAI_COMPUTER_MODEL=gpt-5.5
 
 可调试 WebView 能被 Playwright Android 发现时，插件默认优先走 WebView DOM：`android_observe` 先取 DOM 快照，`android_tap_text` 先做 DOM 点击，`android_type_text` 先直接给当前输入框赋值。找不到可用 WebView 或 DOM 元素时，再回退到 UIAutomator、输入法或 adb。
 
+Playwright Android WebView 默认通过常驻 worker 复用连接，同一个 MCP server 生命周期内会尽量复用已发现的设备、页面和 CDP session，避免每次 WebView 操作都重新启动 Node 或重新连接 DevTools。需要排查 worker 状态时可以使用 `android_webview_runtime`；只有调试 one-shot 兼容路径时才需要设置：
+
+```bash
+ANDROID_USE_PLAYWRIGHT_WEBVIEW_WORKER=0
+```
+
 `android_type_text` 会自动选择更快的输入方式：
 
 - 可调试 WebView 页面会优先通过 Playwright Android 直接给当前输入框赋值，不走键盘输入，适合混合 App、表单页和富文本输入框；
@@ -357,6 +363,8 @@ WebView / 混合 App 常用：
 ```text
 [@Android] 列出 WebView 页面
 [@Android] 在当前 WebView 执行 document.title
+[@Android] 查看 WebView worker 状态
+[@Android] 对当前 WebView 发送 Runtime.evaluate CDP 命令
 [@Android] 打开 https://example.com
 ```
 
@@ -364,7 +372,7 @@ WebView / 混合 App 常用：
 
 - `android_open_url` 使用 Android 标准 `ACTION_VIEW` intent 打开 URL；
 - 对于只能在特定 App 内打开的业务深链，请使用对应 App 的包名、Activity 或可公开处理的 URI，不在插件内硬编码业务域名；
-- WebView 能在 Chrome `chrome://inspect/#devices` 里看到时，插件会默认优先使用 Playwright Android 的 WebView DOM 快路径；需要显式调试时再用 `android_webview_pages` 和 `android_webview_eval`；
+- WebView 能在 Chrome `chrome://inspect/#devices` 里看到时，插件会默认优先使用 Playwright Android 的 WebView DOM 快路径；需要显式调试时再用 `android_webview_pages`、`android_webview_eval`、`android_webview_cdp` 和 `android_webview_runtime`；
 - 任何业务 App 的页面跳转、登录、做题或播放逻辑，都应通过通用 UIAutomator、WebView、recipe 或项目外部自定义脚本组合完成。
 
 ## 录制和复放常用流程

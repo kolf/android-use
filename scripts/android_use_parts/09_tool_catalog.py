@@ -297,6 +297,26 @@ TOOLS: dict[str, dict[str, Any]] = {
         },
         "handler": tool_webview_pages,
     },
+    "android_webview_runtime": {
+        "description": "Inspect or manage the persistent Playwright Android WebView worker and caches.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["status", "clear", "close"],
+                    "default": "status",
+                    "description": "status inspects caches, clear drops cached pages/devices, close stops the worker process.",
+                },
+                "serial": {
+                    "type": "string",
+                    "description": "Optional serial to scope status or clear to one Android device.",
+                },
+            },
+            "additionalProperties": False,
+        },
+        "handler": tool_webview_runtime,
+    },
     "android_webview_eval": {
         "description": "Evaluate JavaScript in a debuggable Android WebView through Playwright Android.",
         "inputSchema": {
@@ -311,12 +331,49 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "expression": {"type": "string"},
                 "await_promise": {"type": "boolean", "default": True},
                 "return_by_value": {"type": "boolean", "default": True},
+                "max_result_chars": {
+                    "type": "integer",
+                    "default": 500,
+                    "description": "Maximum characters for each string in the returned result. Use 0 to disable truncation.",
+                },
                 "timeout_sec": {"type": "number", "default": 10},
             },
             "required": ["expression"],
             "additionalProperties": False,
         },
         "handler": tool_webview_eval,
+    },
+    "android_webview_cdp": {
+        "description": "Send a raw Chrome DevTools Protocol command to a debuggable Android WebView through the persistent Playwright worker.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "serial": {"type": "string"},
+                "page_id": {"type": "string"},
+                "package": {"type": "string", "description": "Optional Android package id for selecting a WebView."},
+                "socket_name": {"type": "string", "description": "Optional WebView DevTools socket name for selecting a WebView."},
+                "url_contains": {"type": "string"},
+                "title_contains": {"type": "string"},
+                "method": {
+                    "type": "string",
+                    "description": "CDP method name, for example Runtime.evaluate or Network.enable.",
+                },
+                "params": {
+                    "type": "object",
+                    "description": "CDP command parameters.",
+                    "additionalProperties": True,
+                },
+                "max_result_chars": {
+                    "type": "integer",
+                    "default": 500,
+                    "description": "Maximum characters for each string in the returned result. Use 0 to disable truncation.",
+                },
+                "timeout_sec": {"type": "number", "default": 10},
+            },
+            "required": ["method"],
+            "additionalProperties": False,
+        },
+        "handler": tool_webview_cdp,
     },
     "android_start_recording": {
         "description": "Start recording deterministic Android actions into a trace for later recipe generation.",
